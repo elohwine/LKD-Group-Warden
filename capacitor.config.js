@@ -11,7 +11,7 @@ if (backendBase) {
 
 module.exports = {
   appId: 'com.ldk.warden',
-  appName: 'LDK Warden',
+  appName: 'LKD Group Warden',
   webDir: 'out',
   bundledWebRuntime: false,
   server: {

@@ -1,7 +1,7 @@
 {
-  "name": "LDK Warden",
-  "short_name": "Warden",
-  "description": "Mobile enforcement app for parking wardens.",
+  "name": "LKD Group Warden",
+  "short_name": "LKD Warden",
+  "description": "LKD Group mobile enforcement app for parking wardens.",
   "start_url": "/login",
   "scope": "/",
   "lang": "en-GB",

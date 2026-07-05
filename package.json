@@ -1,8 +1,8 @@
 {
-  "name": "ldk-warden-app",
+  "name": "lkd-group-warden",
   "version": "1.0.0",
   "private": true,
-  "description": "LDK Warden mobile enforcement application",
+  "description": "LKD Group Warden mobile enforcement application",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
