@@ -8,7 +8,7 @@ import { signOutFromWardenApp } from '../lib/auth';
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
-import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
+import { createQueueItem, secureDeleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
 import AppShell from '../components/AppShell';
 import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
@@ -342,7 +342,8 @@ export default function DashboardPage() {
         body: breachPayload
       });
 
-      await deleteQueueItem(itemId);
+      // FRD §4.2: securely clear local image blobs before removing the record
+      await secureDeleteQueueItem(itemId);
       setMessage(`Breach queued successfully: ${breachResult?.id || vrm}`);
       setSelectedVrm('');
       setFiles([]);
