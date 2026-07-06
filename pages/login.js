@@ -4,8 +4,8 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../lib/firebase-client.js';
 import { signInToWardenApp } from '../lib/auth';
 import { loadSession } from '../lib/session';
-import LoadingSpinner from '../../components/LoadingSpinner.js';
-import LicensePlate from '../../components/LicensePlate.js';
+import LoadingSpinner from '../components/LoadingSpinner.js';
+import LicensePlate from '../components/LicensePlate.js';
 
 export default function LoginPage() {
   const router = useRouter();

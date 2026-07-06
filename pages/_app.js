@@ -1,5 +1,5 @@
 import Head from 'next/head';
-import ErrorBoundary from '../../components/ErrorBoundary.js';
+import ErrorBoundary from '../components/ErrorBoundary.js';
 import '../styles/globals.css';
 
 export default function WardenApp({ Component, pageProps }) {

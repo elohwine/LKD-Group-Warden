@@ -7,10 +7,11 @@ import { clearSession, loadSession, saveSession, saveStoredSiteId } from '../lib
 import { signOutFromWardenApp } from '../lib/auth';
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
+import { buildApiUrl } from '../lib/api';
 import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
 import AppShell from '../components/AppShell';
-import LoadingSpinner from '../../components/LoadingSpinner.js';
-import LicensePlate from '../../components/LicensePlate.js';
+import LoadingSpinner from '../components/LoadingSpinner.js';
+import LicensePlate from '../components/LicensePlate.js';
 
 function formatCountdown(targetIso) {
   const diff = new Date(targetIso).getTime() - Date.now();
@@ -207,7 +208,7 @@ export default function DashboardPage() {
       formData.append('siteId', selectedSiteId);
       formData.append('manualVrm', selectedVrm);
 
-      const response = await fetch('/api/warden/uploadevidence', {
+      const response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
         body: formData
@@ -311,7 +312,7 @@ export default function DashboardPage() {
       formData.append('siteId', queuedItem.payload.siteId);
       formData.append('manualVrm', queuedItem.payload.vrm);
 
-      const evidenceResponse = await fetch('/api/warden/uploadevidence', {
+      const evidenceResponse = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
         body: formData
