@@ -1,39 +1,69 @@
 /**
- * Local dev stub for pages/api/breaches/wardencapture
- *
- * Same pattern as uploadevidence stub: proxy or mock depending on env.
+ * POST /api/breaches/wardencapture (Warden App Wrapper)
+ * 
+ * In PRODUCTION (APK mode):
+ *   Forwards JSON body to backend at https://ldkgroup.co.uk/api/breaches/wardencapture
+ * 
+ * In DEV (next dev):
+ *   Returns mock response with test breach ID
+ * 
+ * This layer allows the Warden app to work offline in dev mode while forwarding
+ * to the real backend in production.
  */
 
+function getBackendUrl() {
+  // Production: use backend at ldkgroup.co.uk
+  // Dev: return null to trigger mock mode
+  if (process.env.NEXT_PUBLIC_API_BASE_URL) {
+    return `${process.env.NEXT_PUBLIC_API_BASE_URL}/api/breaches/wardencapture`;
+  }
+  if (process.env.NODE_ENV === 'production' || process.env.NEXT_BUILD === 'true') {
+    // APK mode: use production backend
+    return 'https://ldkgroup.co.uk/api/breaches/wardencapture';
+  }
+  // Dev mode: no backend URL configured
+  return null;
+}
+
 export default async function handler(req, res) {
-    if (req.method !== 'POST') {
-        return res.status(405).json({ error: 'Method not allowed' });
-    }
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
-    const backendBase = (process.env.NEXT_PUBLIC_API_BASE_URL || '').replace(/\/$/, '');
+  const backendUrl = getBackendUrl();
 
-    if (backendBase) {
-        // ── Proxy mode ──────────────────────────────────────────────────────────────
-        const authHeader = req.headers.authorization || '';
-        const upstream = await fetch(`${backendBase}/api/breaches/wardencapture`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(authHeader ? { Authorization: authHeader } : {}),
-            },
-            body: JSON.stringify(req.body),
-        });
-        const data = await upstream.json();
-        return res.status(upstream.status).json(data);
-    }
+  // ───── DEV MODE (MOCK) ─────
+  if (!backendUrl) {
+    console.log('[wardencapture] DEV MODE: Returning mock response');
+    const mockId = `MOCK-${Date.now()}`;
+    return res.status(200).json({
+      id: mockId,
+      status: 'QUEUED_FOR_QC',
+    });
+  }
 
-    // ── Mock mode ───────────────────────────────────────────────────────────────
-    console.warn('[breaches/wardencapture stub] NEXT_PUBLIC_API_BASE_URL not set — returning mock response');
-    const { vrm, siteId, siteName, wardenId, actorId } = req.body || {};
-    const missing = ['vrm', 'siteId', 'siteName', 'wardenId', 'actorId'].filter((f) => !req.body?.[f]);
-    if (missing.length > 0) {
-        return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
-    }
-    const mockId = `mock-${Date.now()}`;
-    console.log(`[wardencapture mock] breach queued vrm=${vrm} siteId=${siteId} warden=${wardenId}`);
-    return res.status(200).json({ id: mockId, status: 'QUEUED_FOR_QC', vrm, _mock: true });
+  // ───── PRODUCTION MODE (FORWARD TO BACKEND) ─────
+  try {
+    console.log(`[wardencapture] Forwarding to backend: ${backendUrl}`);
+
+    const response = await fetch(backendUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // Forward Authorization header
+        ...(req.headers.authorization && {
+          authorization: req.headers.authorization,
+        }),
+      },
+      body: JSON.stringify(req.body || {}),
+    });
+
+    const data = await response.json();
+
+    // Mirror backend response status and data
+    return res.status(response.status).json(data);
+  } catch (error) {
+    console.error('[wardencapture] Forwarding error:', error?.message || error);
+    return res.status(502).json({ error: 'Backend unreachable' });
+  }
 }
