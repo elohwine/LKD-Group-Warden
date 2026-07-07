@@ -1,0 +1,84 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace "com.ldk.warden"
+    compileSdk rootProject.ext.compileSdkVersion
+
+    signingConfigs {
+            release {
+                storeFile file("/home/eloh/kiosk-epermit-mui-v5/android.keystore")
+                storePassword "developer123"
+                keyAlias "android"
+                keyPassword "developer123"
+            }
+        }
+    defaultConfig {
+        applicationId "com.ldk.warden"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 1
+        versionName "1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        aaptOptions {
+            ignoreAssetsPattern '!.svn:!.git:!.ds_store:!.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+
+    // ✅ Java 17 settings
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    /*
+    kotlinOptions {
+        jvmTarget = "17" // REMOVE or comment this out if not using Kotlin
+    }
+    */
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+
+repositories {
+    flatDir { dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs' }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}
+
+// --- Clean old APK/AABs before packing a new release ---
+tasks.register("cleanOutputs", Delete) {
+    delete fileTree(dir: "$buildDir/outputs", include: ["apk/**", "bundle/**"])    
+    delete "$buildDir/intermediates", "$buildDir/tmp"
+}
+
+// Ensure cleanOutputs runs before assembleRelease
+tasks.matching { it.name == "assembleRelease" }.all { dependsOn("cleanOutputs") }
