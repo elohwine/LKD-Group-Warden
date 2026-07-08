@@ -7,6 +7,28 @@ SDK_VERSION="33.0.2"
 ANDROID_SDK_ROOT="$HOME/Android/Sdk"
 APP_PATH="android/app/build/outputs/apk/release/ldk-warden-v1.0-release-signed.apk"
 
+validate_public_api_base() {
+    local base="${NEXT_PUBLIC_API_BASE_URL:-${NEXT_PUBLIC_WARDEN_API_BASE_URL:-www.ldkgroup.co.uk}}"
+
+    if [[ ! "$base" =~ ^https?:// ]]; then
+        base="https://$base"
+    fi
+
+    base="${base%/}"
+
+    if [[ "$base" == "https://ldkgroup.co.uk" ]]; then
+        base="https://www.ldkgroup.co.uk"
+    fi
+
+    if [[ ! "$base" =~ ^https://([a-zA-Z0-9-]+\.)*ldkgroup\.co\.uk$ ]]; then
+        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL must point to *.ldkgroup.co.uk over HTTPS (got: $base)${NC}"
+        exit 1
+    fi
+
+    export NEXT_PUBLIC_API_BASE_URL="$base"
+    export NEXT_PUBLIC_WARDEN_API_BASE_URL="$base"
+}
+
 require_env() {
     local name="$1"
     local value="${!name:-}"
@@ -64,6 +86,10 @@ fi
 cd - >/dev/null 2>&1 || true
 
 # ========= STEP 3 — BUILD PWA =========
+print_step "Validating mobile API base URL..."
+validate_public_api_base
+echo -e "${GREEN}Using NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}${NC}"
+
 print_step "Building PWA (Next build + export to out/)..."
 npm run build:web || { echo "${RED}PWA build/export failed${NC}"; exit 1; }
 
@@ -106,7 +132,11 @@ fi
 print_step "Checking connected devices..."
 adb devices
 
-read -p "Do you want to install APK on device? (y/n): " confirm
+confirm="${INSTALL_ON_DEVICE:-n}"
+if [[ -t 0 && -z "${INSTALL_ON_DEVICE:-}" ]]; then
+    read -p "Do you want to install APK on device? (y/n): " confirm
+fi
+
 if [[ "$confirm" =~ ^[Yy]$ ]]; then
     adb install -r $APP_PATH
     echo -e "${GREEN}APK installed successfully!${NC}"

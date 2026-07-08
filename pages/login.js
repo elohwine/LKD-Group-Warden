@@ -25,6 +25,10 @@ export default function LoginPage() {
 
   function formatLoginError(signinError) {
     const code = String(signinError?.message || signinError?.code || '').toLowerCase();
+    if (code.includes('api_base_url_not_configured')) return 'Backend API is not configured. Contact administrator.';
+    if (code.includes('firebase_client_not_ready')) return 'Login configuration is missing. Contact support.';
+    if (code.includes('role_lookup_invalid_response')) return 'Login route misconfiguration detected. Contact support.';
+    if (code.includes('role_lookup_failed_')) return 'Failed to verify user role. Please try again.';
     if (code.includes('insufficient_role')) return 'This account does not have warden access.';
     if (code.includes('invalid_credentials') || code.includes('wrong_password') || code.includes('unauthorized')) {
       return 'Invalid email or password.';
