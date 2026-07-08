@@ -92,6 +92,18 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'No files uploaded' });
     }
 
+    const validFileArray = fileArray.filter((file) => file?.filepath && file.size <= 5 * 1024 * 1024);
+
+    if (validFileArray.length === 0) {
+      fileArray.forEach((file) => {
+        try {
+          if (file?.filepath) fs.unlinkSync(file.filepath);
+        } catch (_) {}
+      });
+      console.warn('[uploadevidence] No files within size limits');
+      return res.status(400).json({ error: 'No files uploaded successfully' });
+    }
+
     // ───── PREPARE STORAGE ─────
     let bucketName = (process.env.FIREBASE_STORAGE_BUCKET || '').replace(/^gs:\/\//, '');
     if (!bucketName) {
@@ -118,20 +130,9 @@ export default async function handler(req, res) {
     }
 
     // ───── UPLOAD FILES ─────
-    for (const file of fileArray) {
+    for (const file of validFileArray) {
       if (!file || !file.filepath) {
         console.warn('[uploadevidence] Skipping file with missing filepath');
-        continue;
-      }
-
-      // Final size check (formidable may have passed it during upload)
-      if (file.size > 5 * 1024 * 1024) {
-        console.warn(
-          `[uploadevidence] File ${file.originalFilename} exceeds 5MB (${file.size} bytes)`
-        );
-        try {
-          fs.unlinkSync(file.filepath);
-        } catch (_) {}
         continue;
       }
 
