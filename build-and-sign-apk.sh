@@ -7,6 +7,36 @@ SDK_VERSION="33.0.2"
 ANDROID_SDK_ROOT="$HOME/Android/Sdk"
 APP_PATH="android/app/build/outputs/apk/release/ldk-warden-v1.0-release-signed.apk"
 
+load_env_file_if_present() {
+    local env_file="$1"
+    if [ -f "$env_file" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$env_file"
+        set +a
+    fi
+}
+
+ensure_public_firebase_config() {
+    load_env_file_if_present ".env.local"
+    load_env_file_if_present ".env.production"
+
+    export NEXT_PUBLIC_FIREBASE_API_KEY="${NEXT_PUBLIC_FIREBASE_API_KEY:-AIzaSyDlnhEMK0DkgyPYTsgnO0HFgldywKK1fFc}"
+    export NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN="${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN:-ldk-group-e-permits-system.firebaseapp.com}"
+    export NEXT_PUBLIC_FIREBASE_PROJECT_ID="${NEXT_PUBLIC_FIREBASE_PROJECT_ID:-ldk-group-e-permits-system}"
+    export NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET="${NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET:-ldk-group-e-permits-system.appspot.com}"
+    export NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID="${NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID:-203247315284}"
+    export NEXT_PUBLIC_FIREBASE_APP_ID="${NEXT_PUBLIC_FIREBASE_APP_ID:-1:203247315284:web:699c0401c754c5a11ac0c1}"
+    export NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID="${NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID:-G-DKR8PCRGB5}"
+
+    require_env NEXT_PUBLIC_FIREBASE_API_KEY
+    require_env NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
+    require_env NEXT_PUBLIC_FIREBASE_PROJECT_ID
+    require_env NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET
+    require_env NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID
+    require_env NEXT_PUBLIC_FIREBASE_APP_ID
+}
+
 validate_public_api_base() {
     local base="${NEXT_PUBLIC_API_BASE_URL:-${NEXT_PUBLIC_WARDEN_API_BASE_URL:-www.ldkgroup.co.uk}}"
 
@@ -89,6 +119,10 @@ cd - >/dev/null 2>&1 || true
 print_step "Validating mobile API base URL..."
 validate_public_api_base
 echo -e "${GREEN}Using NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}${NC}"
+
+print_step "Ensuring public Firebase client config..."
+ensure_public_firebase_config
+echo -e "${GREEN}Using NEXT_PUBLIC_FIREBASE_PROJECT_ID=${NEXT_PUBLIC_FIREBASE_PROJECT_ID}${NC}"
 
 print_step "Building PWA (Next build + export to out/)..."
 npm run build:web || { echo "${RED}PWA build/export failed${NC}"; exit 1; }

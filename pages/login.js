@@ -60,6 +60,9 @@ export default function LoginPage() {
       <div className="auth-grid auth-login-grid">
         <section className="auth-card auth-login-card">
           <div className="auth-card-header">
+            <div className="auth-brand-lockup">
+              <img src="/brand/ldk-logo-bw.png" alt="LDK Group" className="auth-brand-logo" />
+            </div>
             <p className="eyebrow">LDK Warden</p>
             <h2>Sign in</h2>
             <p>{passwordHint}</p>

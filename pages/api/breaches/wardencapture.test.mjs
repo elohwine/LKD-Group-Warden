@@ -34,23 +34,60 @@ const mockResponse = () => ({
   json: vi.fn(),
 });
 
-const mockRequest = (overrides = {}) => ({
+const mockRequest = (overrides = {}) => {
+  const { body: bodyOverrides = {}, headers: headerOverrides = {}, ...restOverrides } = overrides;
+
+  return {
   method: 'POST',
   headers: {
     authorization: 'Bearer valid-token',
     'content-type': 'application/json',
-    ...overrides.headers,
+    ...headerOverrides,
   },
   body: {
     vrm: 'AB12CDE',
     siteId: 'site-001',
     siteName: 'Test Site',
     contraventionReason: 'Parked in bay',
-    images: [],
-    ...overrides.body,
+    observationStartTime: '2026-07-08T10:00:00.000Z',
+    observationEndTime: '2026-07-08T10:12:00.000Z',
+    images: [
+      'https://example.com/evidence-entry.jpg',
+      'https://example.com/evidence-exit.jpg',
+    ],
+    imageUrls: [
+      'https://example.com/evidence-entry.jpg',
+      'https://example.com/evidence-exit.jpg',
+    ],
+    evidence: {
+      entry: {
+        imageUrl: 'https://example.com/evidence-entry.jpg',
+        vehicleImage: 'https://example.com/evidence-entry.jpg',
+        plateImage: 'https://example.com/evidence-entry.jpg',
+        timestamp: '2026-07-08T10:00:00.000Z',
+      },
+      exit: {
+        imageUrl: 'https://example.com/evidence-exit.jpg',
+        vehicleImage: 'https://example.com/evidence-exit.jpg',
+        plateImage: 'https://example.com/evidence-exit.jpg',
+        timestamp: '2026-07-08T10:12:00.000Z',
+      },
+    },
+    closingEvidence: {
+      imageUrl: 'https://example.com/evidence-exit.jpg',
+      vehicleImage: 'https://example.com/evidence-exit.jpg',
+      plateImage: 'https://example.com/evidence-exit.jpg',
+      closedAt: '2026-07-08T10:12:00.000Z',
+      breachEvidenceMode: 'paired_exit',
+      realExitObserved: true,
+    },
+    realExitObserved: true,
+    breachEvidenceMode: 'paired_exit',
+    ...bodyOverrides,
   },
-  ...overrides,
-});
+  ...restOverrides,
+};
+};
 
 describe('POST /api/breaches/wardencapture', () => {
   beforeEach(() => {
@@ -75,7 +112,7 @@ describe('POST /api/breaches/wardencapture', () => {
 
   describe('Authentication', () => {
     it('returns 401 when Authorization header is missing', async () => {
-      const req = mockRequest({ headers: {} });
+      const req = mockRequest({ headers: { authorization: '' } });
       const res = mockResponse();
 
       await handler(req, res);
@@ -142,12 +179,38 @@ describe('POST /api/breaches/wardencapture', () => {
     });
 
     it('returns 400 when vrm format is invalid', async () => {
-      const req = mockRequest({ body: { vrm: '!!!invalid!!!' } });
+      const req = mockRequest({ body: { vrm: '!!!' } });
       const res = mockResponse();
 
       await handler(req, res);
 
       expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('returns 400 when paired entry/exit evidence is missing', async () => {
+      const req = mockRequest({
+        body: {
+          images: ['https://example.com/single.jpg'],
+          imageUrls: ['https://example.com/single.jpg'],
+          evidence: {
+            entry: {
+              imageUrl: 'https://example.com/single.jpg',
+              vehicleImage: 'https://example.com/single.jpg',
+              plateImage: 'https://example.com/single.jpg',
+              timestamp: '2026-07-08T10:00:00.000Z',
+            },
+          },
+          closingEvidence: null,
+        },
+      });
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'Paired opening and closing evidence is required before a breach can be created',
+      });
     });
   });
 

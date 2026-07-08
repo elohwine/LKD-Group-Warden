@@ -69,6 +69,18 @@ export default async function handler(req, res) {
       observationStartTime,
       observationEndTime,
       images = [],
+      imageUrls = [],
+      evidence = null,
+      closingEvidence = null,
+      realExitObserved = false,
+      breachEvidenceMode = null,
+      entryTime = null,
+      closedAt = null,
+      lastSeen = null,
+      actualMinutes = null,
+      selectedContraventionCode = null,
+      manualNote = '',
+      authorization = null,
       location,
       notes,
     } = body;
@@ -121,10 +133,28 @@ export default async function handler(req, res) {
       endTime = now;
     }
 
+    if (endTime.getTime() <= startTime.getTime()) {
+      return res.status(400).json({ error: 'Closing evidence must be captured after opening evidence' });
+    }
+
     // ───── VALIDATE IMAGES ARRAY ─────
-    const validImages = Array.isArray(images)
-      ? images.filter((url) => typeof url === 'string' && url.startsWith('http'))
-      : [];
+    const validImages = [...images, ...imageUrls]
+      .filter((url) => typeof url === 'string' && url.startsWith('http'))
+      .filter((url, index, all) => all.indexOf(url) === index);
+
+    const hasEntryEvidence = Boolean(
+      evidence?.entry?.imageUrl || evidence?.entry?.vehicleImage || evidence?.entry?.plateImage
+    );
+    const hasExitEvidence = Boolean(
+      evidence?.exit?.imageUrl || evidence?.exit?.vehicleImage || evidence?.exit?.plateImage ||
+      closingEvidence?.imageUrl || closingEvidence?.vehicleImage || closingEvidence?.plateImage
+    );
+
+    if (validImages.length < 2 || !hasEntryEvidence || !hasExitEvidence) {
+      return res.status(400).json({
+        error: 'Paired opening and closing evidence is required before a breach can be created',
+      });
+    }
 
     // ───── BUILD FIRESTORE PAYLOAD ─────
     const payload = {
@@ -133,11 +163,23 @@ export default async function handler(req, res) {
       siteId,
       siteName: siteName || 'Unknown Site',
       contraventionReason,
+      selectedContraventionCode,
       observationStartTime: Timestamp.fromDate(startTime),
       observationEndTime: Timestamp.fromDate(endTime),
       images: validImages,
+      imageUrls: validImages,
+      evidence,
+      closingEvidence,
+      realExitObserved: Boolean(realExitObserved),
+      breachEvidenceMode: breachEvidenceMode || 'paired_exit',
+      entryTime: entryTime || observationStartTime || startTime.toISOString(),
+      closedAt: closedAt || observationEndTime || endTime.toISOString(),
+      lastSeen: lastSeen || closedAt || observationEndTime || endTime.toISOString(),
+      actualMinutes: Number.isFinite(Number(actualMinutes)) ? Number(actualMinutes) : Math.round((endTime.getTime() - startTime.getTime()) / 60000),
       location: location || null,
-      notes: notes || '',
+      notes: notes || manualNote || '',
+      manualNote: manualNote || notes || '',
+      authorization: authorization || null,
 
       // Server-stamped audit fields (GDPR compliance - not from client)
       source: 'WARDEN',
@@ -162,6 +204,8 @@ export default async function handler(req, res) {
           detail: {
             source: 'WARDEN',
             images: validImages.length,
+            breachEvidenceMode: breachEvidenceMode || 'paired_exit',
+            realExitObserved: Boolean(realExitObserved),
           },
         },
       ],

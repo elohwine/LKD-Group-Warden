@@ -2,9 +2,12 @@ export default function AppShell({ profile, siteName, online, syncing, queueCoun
   return (
     <div className="warden-app-shell">
       <header className="warden-topbar">
-        <div>
-          <div className="warden-brand">LDK Warden</div>
-          <div className="warden-subtitle">Mobile enforcement, live validation, offline queue</div>
+        <div className="warden-brand-lockup">
+          <img src="/brand/ldk-logo-mark-bw.png" alt="LDK mark" className="warden-brand-mark" />
+          <div>
+            <div className="warden-brand">LDK Warden</div>
+            <div className="warden-subtitle">Mobile enforcement, live validation, offline queue</div>
+          </div>
         </div>
         <div className="warden-topbar-actions">
           <span className={`status-pill ${online ? 'status-pill-online' : 'status-pill-offline'}`}>
