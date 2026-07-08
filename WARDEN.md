@@ -7,9 +7,9 @@ This document confirms what has been verified for the warden app flow after logi
 
 ## Verified Working
 
-1. Login uses the standard user flow:
-- Firebase client sign-in with email/password.
-- Role lookup through `/api/checkUserRole`.
+1. Login uses backend token auth only:
+- No Firebase client auth initialization in the app login flow.
+- Login is performed against backend auth endpoints and returns a session token.
 - Allowed roles: `warden`, `qc`, `admin`, `manager`, `epermit_officer`.
 
 2. Mobile/export compatibility fix:
