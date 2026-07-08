@@ -91,6 +91,11 @@ a {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.auth-login-grid {
+  grid-template-columns: minmax(0, 560px);
+  justify-content: center;
+}
+
 .auth-hero,
 .auth-card,
 .hero-card,
@@ -164,6 +169,10 @@ h3 {
   display: grid;
   align-content: start;
   gap: 20px;
+}
+
+.auth-login-card {
+  width: 100%;
 }
 
 .auth-form,

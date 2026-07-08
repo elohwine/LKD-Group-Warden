@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/router';
-import { onAuthStateChanged } from 'firebase/auth';
-import { auth } from '../lib/firebase-client.js';
 import { fetchJson } from '../lib/api';
 import { clearSession, loadSession, saveSession, saveStoredSiteId } from '../lib/session';
-import { signOutFromWardenApp } from '../lib/auth';
+import { signOutFromWardenApp, getStoredToken } from '../lib/auth';
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
@@ -82,35 +80,16 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        if (!authReadyRef.current) {
-          authReadyRef.current = true;
-        }
-        await router.replace('/login');
-        return;
-      }
-
+    async function bootstrapSession() {
       try {
-        const token = await user.getIdToken();
-        const roleData = await fetchJson('/api/checkUserRole', {
-          method: 'POST',
-          token,
-          body: { uid: user.uid }
-        });
+        const session = loadSession();
+        const token = session?.token;
 
-        if (!roleData?.role) {
-          throw new Error('role_missing');
+        if (!token || !session?.role) {
+          await router.replace('/login');
+          return;
         }
 
-        const session = {
-          uid: user.uid,
-          email: roleData.email || user.email || '',
-          role: roleData.role,
-          forcePasswordChange: Boolean(roleData.forcePasswordChange)
-        };
-
-        saveSession(session);
         setAuthToken(token);
         setProfile(session);
         setOnline(navigator.onLine);
@@ -122,9 +101,9 @@ export default function DashboardPage() {
         await signOutFromWardenApp();
         await router.replace('/login');
       }
-    });
+    }
 
-    return unsubscribe;
+    bootstrapSession();
   }, [router]);
 
   useEffect(() => {
@@ -200,7 +179,7 @@ export default function DashboardPage() {
     setMessage('Reading VRM from image…');
 
     try {
-      const token = await auth.currentUser?.getIdToken();
+      const token = authToken || getStoredToken();
       if (!token) throw new Error('auth_missing');
 
       const formData = new FormData();
@@ -236,7 +215,8 @@ export default function DashboardPage() {
   async function checkAuthorization(nextVrm) {
     const vrm = normalizeVrm(nextVrm || selectedVrm);
     if (!vrm || !selectedSiteId) return null;
-    const token = await auth.currentUser?.getIdToken();
+    const token = authToken || getStoredToken();
+    if (!token) throw new Error('auth_missing');
     const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, {
       token
     });
@@ -302,7 +282,7 @@ export default function DashboardPage() {
       await updateQueueItem(itemId, { status: 'syncing', attempts: queuedItem.attempts + 1, updatedAt: new Date().toISOString(), lastError: null });
       await refreshQueue();
 
-      const token = authToken || await auth.currentUser?.getIdToken();
+      const token = authToken || getStoredToken();
       if (!token) throw new Error('auth_missing');
 
       const formData = new FormData();

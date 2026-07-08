@@ -1,15 +1,28 @@
 apply plugin: 'com.android.application'
 
+def envOrProperty = { String name ->
+    System.getenv(name) ?: project.findProperty(name)
+}
+
+def keystorePath = envOrProperty('WARDEN_KEYSTORE_PATH')
+def keystoreAlias = envOrProperty('WARDEN_KEYSTORE_ALIAS')
+def keystorePassword = envOrProperty('WARDEN_KEYSTORE_PASSWORD')
+def keystoreAliasPassword = envOrProperty('WARDEN_KEY_PASSWORD')
+
+if (!keystorePath || !keystoreAlias || !keystorePassword || !keystoreAliasPassword) {
+    throw new GradleException('Missing WARDEN_KEYSTORE_* environment variables. Export WARDEN_KEYSTORE_PATH, WARDEN_KEYSTORE_ALIAS, WARDEN_KEYSTORE_PASSWORD, and WARDEN_KEY_PASSWORD before building.')
+}
+
 android {
     namespace "com.ldk.warden"
     compileSdk rootProject.ext.compileSdkVersion
 
     signingConfigs {
             release {
-                storeFile file("/home/eloh/kiosk-epermit-mui-v5/android.keystore")
-                storePassword "developer123"
-                keyAlias "android"
-                keyPassword "developer123"
+                storeFile file(keystorePath)
+                storePassword keystorePassword
+                keyAlias keystoreAlias
+                keyPassword keystoreAliasPassword
             }
         }
     defaultConfig {
@@ -42,6 +55,15 @@ android {
             signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    // Rename output APK to a specific branded filename
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            if (variant.buildType.name == 'release') {
+                outputFileName = "ldk-warden-v${variant.versionName}-release-signed.apk"
+            }
         }
     }
 }

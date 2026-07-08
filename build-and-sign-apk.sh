@@ -3,13 +3,18 @@
 # ========= CONFIGURATION =========
 APP_NAME="LDK Warden"
 PACKAGE_NAME="com.ldk.warden"
-KEYSTORE_PATH="$HOME/kiosk-epermit-mui-v5/android.keystore"
-KEYSTORE_ALIAS="android"
-KEYSTORE_PASS="developer123"
-KEYPASS="developer123"
 SDK_VERSION="33.0.2"
 ANDROID_SDK_ROOT="$HOME/Android/Sdk"
-APP_PATH="android/app/build/outputs/apk/release/app-release.apk"
+APP_PATH="android/app/build/outputs/apk/release/ldk-warden-v1.0-release-signed.apk"
+
+require_env() {
+    local name="$1"
+    local value="${!name:-}"
+    if [ -z "$value" ]; then
+        echo -e "${RED}Missing required environment variable: $name${NC}"
+        exit 1
+    fi
+}
 
 # ========= COLORS =========
 GREEN='\033[0;32m'
@@ -67,30 +72,14 @@ print_step "Generating native assets and syncing to Android..."
 npx cap sync android || { echo "${RED}Capacitor sync failed${NC}"; exit 1; }
 
 # ========= STEP 5 — CONFIGURE SIGNING =========
-print_step "Injecting signing configuration..."
+print_step "Validating signing environment..."
+require_env WARDEN_KEYSTORE_PATH
+require_env WARDEN_KEYSTORE_ALIAS
+require_env WARDEN_KEYSTORE_PASSWORD
+require_env WARDEN_KEY_PASSWORD
+
 cd android
 SIGNING_FILE="app/build.gradle"
-
-if ! grep -q "signingConfigs" $SIGNING_FILE; then
-cat <<EOL >> $SIGNING_FILE
-
-android {
-    signingConfigs {
-        release {
-            storeFile file("$KEYSTORE_PATH")
-            storePassword "$KEYSTORE_PASS"
-            keyAlias "$KEYSTORE_ALIAS"
-            keyPassword "$KEYPASS"
-        }
-    }
-    buildTypes {
-        release {
-            signingConfig signingConfigs.release
-        }
-    }
-}
-EOL
-fi
 
 # ========= STEP 6 — BUILD SIGNED APK =========
 print_step "Cleaning previous Android build outputs..."
@@ -101,6 +90,9 @@ rm -rf app/build/outputs/apk/* app/build/outputs/bundle/* app/build/intermediate
 
 print_step "Building signed APK..."
 ./gradlew assembleRelease || { echo "${RED}Gradle build failed${NC}"; exit 1; }
+
+# Return to repo root (same pattern as kiosk)
+cd - >/dev/null 2>&1 || true
 
 # ========= STEP 7 — VERIFY APK SIGNATURE =========
 print_step "Verifying APK signature..."
