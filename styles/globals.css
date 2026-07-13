@@ -727,6 +727,7 @@ textarea {
 }
 
 @media (max-width: 980px) {
+
   .auth-grid,
   .hero-card,
   .workspace-grid {
@@ -753,6 +754,7 @@ textarea {
 }
 
 @media (max-width: 640px) {
+
   .auth-page,
   .warden-main,
   .warden-topbar {
@@ -794,5 +796,704 @@ textarea {
   .card {
     padding: 18px;
     border-radius: 18px;
+  }
+
+  .evidence-split-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .breach-kpi-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .breach-card-actions {
+    flex-direction: column;
+  }
+}
+
+/* ─── Lifecycle status pills ──────────────────────────────────────────────── */
+
+.lc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 999px;
+  padding: 5px 11px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.lc-pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.lc-DRAFT_OPEN {
+  background: rgba(239, 184, 77, 0.14);
+  color: #ffe8b1;
+}
+
+.lc-DRAFT_OPEN .lc-pill-dot {
+  background: #efb84d;
+}
+
+.lc-READY {
+  background: rgba(95, 174, 234, 0.18);
+  color: #c9e8ff;
+}
+
+.lc-READY .lc-pill-dot {
+  background: #5faeea;
+}
+
+.lc-SYNCING {
+  background: rgba(95, 174, 234, 0.1);
+  color: #9ecfee;
+}
+
+.lc-SYNCING .lc-pill-dot {
+  background: #5faeea;
+  animation: pulse 1s infinite;
+}
+
+.lc-SUBMITTED {
+  background: rgba(74, 213, 157, 0.14);
+  color: #b6f5d9;
+}
+
+.lc-SUBMITTED .lc-pill-dot {
+  background: #4ad59d;
+}
+
+.lc-CONVERTED {
+  background: rgba(131, 97, 249, 0.18);
+  color: #d6c8ff;
+}
+
+.lc-CONVERTED .lc-pill-dot {
+  background: #8361f9;
+}
+
+.lc-FAILED {
+  background: rgba(255, 123, 123, 0.16);
+  color: #ffd0d0;
+}
+
+.lc-FAILED .lc-pill-dot {
+  background: #ff7b7b;
+}
+
+.lc-INCOMPLETE {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+}
+
+.lc-INCOMPLETE .lc-pill-dot {
+  background: #6b7a8d;
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* ─── Evidence split frame (entry | exit side-by-side) ───────────────────── */
+
+.evidence-split-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.evidence-frame {
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  display: grid;
+}
+
+.evidence-frame-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.22);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.evidence-frame-label-entry {
+  color: #5faeea;
+}
+
+.evidence-frame-label-exit {
+  color: #4ad59d;
+}
+
+.evidence-frame-img {
+  width: 100%;
+  aspect-ratio: 4/3;
+  object-fit: cover;
+  display: block;
+}
+
+.evidence-frame-placeholder {
+  aspect-ratio: 4/3;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  padding: 12px;
+}
+
+.evidence-frame-ts {
+  padding: 6px 10px;
+  font-size: 10px;
+  font-family: monospace;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.14);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* ─── Breach list card ────────────────────────────────────────────────────── */
+
+.breach-card {
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  display: grid;
+  gap: 10px;
+}
+
+.breach-card:hover {
+  border-color: rgba(95, 174, 234, 0.3);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.breach-card-selected {
+  border-color: rgba(95, 174, 234, 0.5) !important;
+  background: rgba(19, 116, 188, 0.14) !important;
+}
+
+.breach-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.breach-card-vrm {
+  font-size: 1.15rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  font-family: monospace;
+  color: var(--text);
+}
+
+.breach-card-site {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.breach-card-reason {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.breach-card-kpi {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.breach-card-kpi-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.breach-card-kpi-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: rgba(185, 196, 210, 0.6);
+}
+
+.breach-card-kpi-val {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.breach-card-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #ffe8b1;
+  background: rgba(239, 184, 77, 0.12);
+  border-radius: 999px;
+  padding: 3px 9px;
+}
+
+.breach-card-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ─── Detail pane ────────────────────────────────────────────────────────── */
+
+.detail-section-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent-strong);
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.breach-kpi-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.kpi-cell {
+  display: grid;
+  gap: 3px;
+}
+
+.kpi-cell-label {
+  font-size: 10px;
+  color: rgba(185, 196, 210, 0.7);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.kpi-cell-val {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* ─── Stats bar in capture header ────────────────────────────────────────── */
+
+.capture-stats-bar {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.capture-stats-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 70px;
+}
+
+.capture-stats-label {
+  font-size: 10px;
+  color: rgba(185, 196, 210, 0.65);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.capture-stats-val {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/* ─── Monitoring session banner ──────────────────────────────────────────── */
+
+.session-active-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(74, 213, 157, 0.1);
+  border: 1px solid rgba(74, 213, 157, 0.3);
+  font-size: 13px;
+  font-weight: 600;
+  color: #b6f5d9;
+}
+
+.session-active-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ad59d;
+  flex-shrink: 0;
+  animation: pulse 1.2s infinite;
+}
+
+/* ─── Gap utility ────────────────────────────────────────────────────────── */
+
+.gap-small {
+  gap: 8px;
+}
+
+.gap-xsmall {
+  gap: 4px;
+}
+
+/* ─── Misc ───────────────────────────────────────────────────────────────── */
+
+.text-muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.text-mono {
+  font-family: monospace;
+  letter-spacing: 0.04em;
+}
+
+.border-top-subtle {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 12px;
+  margin-top: 4px;
+}
+
+.card-subheading {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.evidence-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 0 6px;
+}
+
+.evidence-count-badge-entry {
+  background: rgba(95, 174, 234, 0.2);
+  color: #9fd6fc;
+}
+
+.evidence-count-badge-exit {
+  background: rgba(74, 213, 157, 0.18);
+  color: #b6f5d9;
+}
+
+/* ─── Stepper overlay ────────────────────────────────────────────────────── */
+
+.stepper-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(6px);
+  display: grid;
+  place-items: end center;
+  animation: fadeIn 0.18s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.stepper-panel {
+  width: 100%;
+  max-width: 460px;
+  max-height: 92vh;
+  overflow-y: auto;
+  background: var(--bg-primary, #0c1420);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 24px 24px 0 0;
+  padding: 20px 22px 28px;
+  animation: slideUp 0.22s ease;
+  display: grid;
+  gap: 18px;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(40px);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.stepper-header {
+  display: grid;
+  gap: 8px;
+  position: relative;
+}
+
+.stepper-close {
+  position: absolute;
+  top: 0;
+  right: 0;
+  font-size: 18px;
+  padding: 4px 8px;
+  z-index: 1;
+}
+
+.stepper-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0;
+}
+
+.stepper-dots {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.stepper-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  transition: background 0.2s, transform 0.2s;
+}
+
+.stepper-dot-active {
+  background: var(--accent-strong, #5faeea);
+  transform: scale(1.25);
+}
+
+.stepper-dot-done {
+  background: #4ad59d;
+}
+
+/* ─── Stepper steps ──────────────────────────────────────────────────────── */
+
+.stepper-step {
+  display: grid;
+  gap: 14px;
+}
+
+.stepper-step-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent-strong, #5faeea);
+  margin: 0;
+}
+
+.stepper-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+/* VRM banner in step 1-2 */
+.stepper-vrm-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.24);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.stepper-vrm-text {
+  font-size: 1.2rem;
+  font-weight: 800;
+  font-family: monospace;
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+/* Capture prompt */
+.stepper-capture-prompt {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  padding: 32px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 2px dashed rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.stepper-capture-prompt:hover {
+  border-color: rgba(95, 174, 234, 0.4);
+  background: rgba(95, 174, 234, 0.05);
+}
+
+.stepper-capture-icon {
+  font-size: 2rem;
+}
+
+/* Preview grid */
+.stepper-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+  gap: 8px;
+}
+
+.stepper-preview-img {
+  width: 100%;
+  aspect-ratio: 4/3;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Summary card */
+.stepper-summary-card {
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  display: grid;
+  gap: 8px;
+}
+
+.stepper-summary-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.stepper-summary-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(185, 196, 210, 0.7);
+}
+
+.stepper-summary-val {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  text-align: right;
+}
+
+.stepper-confirm-btn {
+  padding: 12px 20px !important;
+  font-size: 14px !important;
+}
+
+/* ─── FAB (Floating Action Button) ───────────────────────────────────────── */
+
+.fab-new-breach {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 800;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: none;
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  cursor: pointer;
+  background: linear-gradient(135deg, #5faeea 0%, #3d8bc9 100%);
+  color: #fff;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 0 3px rgba(95, 174, 234, 0.15);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.fab-new-breach:hover {
+  transform: scale(1.08);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5), 0 0 0 4px rgba(95, 174, 234, 0.25);
+}
+
+.fab-new-breach:active {
+  transform: scale(0.95);
+}
+
+/* ─── Active sessions summary ────────────────────────────────────────────── */
+
+.active-sessions-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(95, 174, 234, 0.08);
+  border: 1px solid rgba(95, 174, 234, 0.2);
+  font-size: 13px;
+  font-weight: 600;
+  color: #c9e8ff;
+}
+
+.active-sessions-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 800;
+  background: rgba(95, 174, 234, 0.25);
+  color: #fff;
+}
+
+@media (min-width: 641px) {
+  .stepper-panel {
+    border-radius: 24px;
+    margin-bottom: 20px;
+  }
+
+  .stepper-overlay {
+    place-items: center;
   }
 }

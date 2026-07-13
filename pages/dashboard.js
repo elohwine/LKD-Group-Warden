@@ -10,6 +10,7 @@ import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, update
 import AppShell from '../components/AppShell';
 import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
+import BreachStepper from '../components/BreachStepper';
 
 function formatCountdown(targetIso) {
   const diff = new Date(targetIso).getTime() - Date.now();
@@ -280,8 +281,9 @@ export default function DashboardPage() {
   const [ticks, setTicks] = useState(0);
   const [selectedContraventionCode, setSelectedContraventionCode] = useState('');
   const [authToken, setAuthToken] = useState('');
-  const [activeTab, setActiveTab] = useState('capture');
+  const [activeTab, setActiveTab] = useState('tracked');
   const [selectedTrackedId, setSelectedTrackedId] = useState('');
+  const [stepperOpen, setStepperOpen] = useState(false);
   const [breachStatusFilter, setBreachStatusFilter] = useState('all');
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
@@ -373,8 +375,12 @@ export default function DashboardPage() {
   }, [hasEntryEvidence, hasClosingEvidence, monitoringSessionActive, selectedTracked]);
 
   const filteredBreaches = useMemo(() => {
-    if (breachStatusFilter === 'all') return trackedBreaches;
-    return trackedBreaches.filter((item) => {
+    let list = trackedBreaches;
+    if (selectedSiteId) {
+      list = list.filter((item) => String(item?.payload?.siteId) === String(selectedSiteId));
+    }
+    if (breachStatusFilter === 'all') return list;
+    return list.filter((item) => {
       if (breachStatusFilter === 'open') return item.lifecycle.code === 'DRAFT_OPEN';
       if (breachStatusFilter === 'ready') return item.lifecycle.code === 'READY';
       if (breachStatusFilter === 'submitted') return item.lifecycle.code === 'SUBMITTED';
@@ -382,7 +388,7 @@ export default function DashboardPage() {
       if (breachStatusFilter === 'converted') return item.lifecycle.code === 'CONVERTED';
       return true;
     });
-  }, [trackedBreaches, breachStatusFilter]);
+  }, [trackedBreaches, breachStatusFilter, selectedSiteId]);
 
   useEffect(() => {
     if (activeTab !== 'tracked') return;
@@ -919,6 +925,64 @@ export default function DashboardPage() {
     setMessage('Open draft saved. Capture closing evidence later to finalise.');
   }
 
+  async function handleStepperComplete({
+    vrm,
+    siteId,
+    siteName,
+    contraventionCode,
+    contraventionLabel,
+    observationMinutes,
+    files,
+    note
+  }) {
+    try {
+      setBusy(true);
+      setMessage(`Saving new tracking session for VRM ${vrm}…`);
+
+      const entryTime = new Date().toISOString();
+      const endTime = observationMinutes > 0
+        ? new Date(Date.now() + observationMinutes * 60000).toISOString()
+        : '';
+
+      const draftPayload = {
+        vrm,
+        contraventionCode,
+        contraventionReason: contraventionLabel,
+        observationStartTime: entryTime,
+        observationEndTime: endTime,
+        siteId,
+        siteName,
+        note,
+      };
+
+      const draftFiles = files.map((file, i) => ({
+        name: `entry_${i}_${Date.now()}.jpg`,
+        type: file.type,
+        blob: file,
+        phase: 'entry',
+      }));
+
+      const item = createQueueItem({ payload: draftPayload, files: draftFiles });
+      item.status = 'draft';
+
+      await saveQueueItem(item);
+      await refreshQueue();
+
+      setStepperOpen(false);
+      setSelectedTrackedId(item.id);
+      setActiveTab('tracked');
+
+      // Pre-load the new item into active workflow state using handleReviewTracked
+      handleReviewTracked(item);
+      setMessage(`Started tracking session for vehicle ${vrm}.`);
+    } catch (e) {
+      console.error('[warden] failed to create stepper draft', e);
+      setMessage(e.message || 'Error occurred starting stepper session.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function syncQueueItem(itemId) {
     const queuedItem = (await listQueueItems()).find((item) => item.id === itemId);
     if (!queuedItem) return;
@@ -1153,7 +1217,6 @@ export default function DashboardPage() {
 
   function handleReviewTracked(item) {
     setSelectedTrackedId(item.id);
-    setActiveTab('capture');
     if (item?.payload?.siteId) {
       setSelectedSiteId(item.payload.siteId);
     }
@@ -1259,11 +1322,8 @@ export default function DashboardPage() {
     >
       <section className="tab-shell stack gap-large">
         <div className="tab-bar" role="tablist" aria-label="Warden workspace sections">
-          <button type="button" role="tab" aria-selected={activeTab === 'capture'} className={`tab-button ${activeTab === 'capture' ? 'tab-button-active' : ''}`} onClick={() => setActiveTab('capture')}>
-            Capture
-          </button>
           <button type="button" role="tab" aria-selected={activeTab === 'tracked'} className={`tab-button ${activeTab === 'tracked' ? 'tab-button-active' : ''}`} onClick={() => setActiveTab('tracked')}>
-            Breach inbox
+            Patrol
           </button>
           <button type="button" role="tab" aria-selected={activeTab === 'queue'} className={`tab-button ${activeTab === 'queue' ? 'tab-button-active' : ''}`} onClick={() => setActiveTab('queue')}>
             Queue
@@ -1272,278 +1332,57 @@ export default function DashboardPage() {
 
         {message ? <div className="notice notice-info">{message}</div> : null}
 
-        {activeTab === 'capture' ? (
-          <section className="workspace-grid">
-            <div className="card stack gap-large">
-              <div className="card-header-row">
-                <div>
-                  <p className="eyebrow">1. Site selection</p>
-                  <h3>Current patrol site</h3>
-                </div>
-                <span className="muted-chip">{sites.length} active sites</span>
-              </div>
-              <select className="field-select" value={selectedSiteId} onChange={(event) => setSelectedSiteId(event.target.value)}>
-                <option value="">Select site</option>
-                {sites.map((site) => (
-                  <option key={site.id} value={site.id}>
-                    {site.displayName || site.name || site.location || site.id}
-                  </option>
-                ))}
-              </select>
-              <p className="card-copy">
-                Site scope is enforced before submission. You can only finalise a breach against the patrol site selected here.
-              </p>
-            </div>
-
-            <div className="card stack gap-large">
-              <div className="card-header-row">
-                <div>
-                  <p className="eyebrow">2. Capture evidence</p>
-                  <h3>{selectedTracked ? 'Draft review workflow' : 'Paired evidence workflow'}</h3>
-                </div>
-                <span className={`muted-chip ${hasEntryEvidence && hasClosingEvidence ? 'muted-chip-ready' : ''}`}>
-                  {selectedTracked ? `${selectedTracked.lifecycle.label}` : hasEntryEvidence && hasClosingEvidence ? 'Ready to finalise' : 'Entry + closing evidence required'}
-                </span>
-              </div>
-
-              <div className="workflow-steps" role="status" aria-live="polite">
-                <span className={`workflow-step ${hasEntryEvidence ? 'workflow-step-done' : ''}`}>1. Entry captured</span>
-                <span className={`workflow-step ${hasClosingEvidence ? 'workflow-step-done' : ''}`}>2. Closing captured</span>
-                <span className={`workflow-step ${authorization ? 'workflow-step-done' : ''}`}>3. Permit checked</span>
-                <span className={`workflow-step ${vehicleLookup ? 'workflow-step-done' : ''}`}>4. Vehicle checked</span>
-              </div>
-
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                capture="environment"
-                multiple
-                onChange={handleFileSelection}
-                className="file-input"
-              />
-
-              <input
-                ref={qrFileInputRef}
-                type="file"
-                accept="image/*"
-                onChange={handlePermitQrSelection}
-                className="file-input"
-              />
-
-              <div className="quick-action-panel stack gap-medium">
-                <div className="card-header-row">
-                  <strong>Action deck</strong>
-                  <span className={`muted-chip ${monitoringSessionActive ? 'muted-chip-ready' : ''}`}>
-                    {monitoringSessionActive
-                      ? `Monitoring since ${new Date(monitoringSessionStartedAt || Date.now()).toLocaleTimeString()}`
-                      : 'Session idle'}
-                  </span>
-                </div>
-                <button type="button" className="primary-button quick-primary-button" onClick={handlePrimaryCaptureAction} disabled={busy}>
-                  {primaryCaptureAction.label}
-                </button>
-                <div className="inline-actions quick-action-row">
-                  <button type="button" className="secondary-button" onClick={handlePermitLookup} disabled={busy || !canRunLookups}>
-                    Verify permit
-                  </button>
-                  <button type="button" className="secondary-button" onClick={openPermitQrDialog}>
-                    Scan permit QR
-                  </button>
-                  <button type="button" className="secondary-button" onClick={handleVehicleLookup} disabled={busy || vehicleLookupLoading || !selectedVrm}>
-                    {vehicleLookupLoading ? 'Checking vehicle…' : 'Vehicle check'}
-                  </button>
-                  <button type="button" className="secondary-button" onClick={startMonitoringSession} disabled={!hasEntryEvidence || !selectedVrm || monitoringSessionActive}>
-                    Start session
-                  </button>
-                  <button type="button" className="ghost-button" onClick={stopMonitoringSession} disabled={!monitoringSessionActive}>
-                    End session
-                  </button>
-                </div>
-              </div>
-
-              <div className="capture-grid">
-                <label>
-                  VRM
-                  <input value={selectedVrm} onChange={(event) => setSelectedVrm(normalizeVrm(event.target.value))} placeholder="AB12CDE" />
-                </label>
-                <label>
-                  Contravention
-                  <select value={selectedContraventionCode} onChange={(event) => selectContravention(event.target.value)}>
-                    {contraventions.map((item) => (
-                      <option key={item.code} value={item.code}>
-                        {item.code} - {item.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <label>
-                Notes
-                <textarea value={manualNote} onChange={(event) => setManualNote(event.target.value)} rows={3} placeholder="Observation notes, bay position, signage issues, etc." />
-              </label>
-
-              <div className="evidence-stage-grid">
-                <div className="evidence-stage-card">
-                  <div className="card-header-row">
-                    <strong>Opening evidence</strong>
-                    <button type="button" className="ghost-button" onClick={() => openCaptureDialog('entry')}>
-                      Capture entry
-                    </button>
-                  </div>
-                  <span className={`evidence-pill ${hasEntryEvidence ? 'evidence-pill-ready' : 'evidence-pill-pending'}`}>
-                    {hasEntryEvidence ? `${entryFiles.length} image${entryFiles.length === 1 ? '' : 's'} captured` : 'Waiting for opening evidence'}
-                  </span>
-                  <p className="card-copy">
-                    First sighting. This starts the observation timeline and must exist before any breach can be created.
-                  </p>
-                  <div className="preview-row">
-                    {entryPreviews.length > 0 ? entryPreviews.map((preview) => <img key={preview} src={preview} alt="Opening evidence preview" className="preview-image" />) : <div className="preview-placeholder">No opening evidence captured yet.</div>}
-                  </div>
-                </div>
-
-                <div className="evidence-stage-card">
-                  <div className="card-header-row">
-                    <strong>Closing evidence</strong>
-                    <button type="button" className="ghost-button" onClick={() => openCaptureDialog('closing')} disabled={!hasEntryEvidence}>
-                      Capture exit
-                    </button>
-                  </div>
-                  <span className={`evidence-pill ${hasClosingEvidence ? 'evidence-pill-ready' : 'evidence-pill-pending'}`}>
-                    {hasClosingEvidence ? `${closingFiles.length} image${closingFiles.length === 1 ? '' : 's'} captured` : 'Waiting for closing evidence'}
-                  </span>
-                  <p className="card-copy">
-                    Final sighting. Closing evidence is mandatory and must confirm the vehicle remained in breach.
-                  </p>
-                  <div className="preview-row">
-                    {closingPreviews.length > 0 ? closingPreviews.map((preview) => <img key={preview} src={preview} alt="Closing evidence preview" className="preview-image" />) : <div className="preview-placeholder">No closing evidence captured yet.</div>}
-                  </div>
-                </div>
-              </div>
-
-              <div className="action-grid">
-                <button type="button" className="secondary-button" onClick={inferVrmFromImage} disabled={busy || !canRunImageAnalysis}>
-                  Analyse image
-                </button>
-                <button type="button" className="secondary-button" onClick={handleSaveDraft} disabled={busy || !selectedSiteId || !selectedVrm || !hasEntryEvidence}>
-                  Save open draft
-                </button>
-                <button type="button" className="primary-button action-grid-primary" onClick={handleFinalize} disabled={!canFinalizeBreach}>
-                  {selectedTracked ? 'Finalize selected draft' : 'Finalize breach'}
-                </button>
-              </div>
-              <p className="card-copy">
-                Save open draft after entry evidence to keep multiple breaches active. Finalize requires both entry and closing evidence.
-              </p>
-            </div>
-
-            <div className="card stack gap-large">
-              <div className="card-header-row">
-                <div>
-                  <p className="eyebrow">3. Live validation</p>
-                  <h3>Authorization status</h3>
-                </div>
-                <span className={`status-pill ${authorization?.hasAuthorization ? 'status-pill-online' : 'status-pill-offline'}`}>
-                  {authorization?.hasAuthorization ? 'Authorised' : 'Unverified'}
-                </span>
-              </div>
-              <div className="auth-state">
-                <LicensePlate number={selectedVrm || '—'} size="large" />
-                <div className="auth-state-copy">
-                  <strong>{authorization?.authorization?.type || 'No active permit'}</strong>
-                  <p>{authorization?.authorization ? `${authorization.authorization.site || 'Site matched'} • ${authorization.authorization.status || 'active'}` : 'Run analysis or enter a VRM to check the current site.'}</p>
-                  {vehicleLookup?.make || vehicleLookup?.model || vehicleLookup?.color ? (
-                    <p>{[vehicleLookup.make, vehicleLookup.model, vehicleLookup.color].filter(Boolean).join(' • ')}</p>
-                  ) : null}
-                </div>
-              </div>
-              <div className="auth-meta-grid">
-                <div>
-                  <span className="meta-label">Location</span>
-                  <strong>{location ? `${location.lat.toFixed(5)}, ${location.lng.toFixed(5)}` : 'Pending'}</strong>
-                </div>
-                <div>
-                  <span className="meta-label">Observation</span>
-                  <strong>{manualObservationMinutes > 0 ? `${manualObservationMinutes} minutes` : 'Not required'}</strong>
-                </div>
-                <div>
-                  <span className="meta-label">Notes</span>
-                  <strong>{manualNote || 'None'}</strong>
-                </div>
-                <div>
-                  <span className="meta-label">Evidence pair</span>
-                  <strong>{entryFiles.length > 0 && closingFiles.length > 0 ? `${entryFiles.length} + ${closingFiles.length} images` : 'Opening and closing required'}</strong>
-                </div>
-              </div>
-            </div>
-
-            <div className="card stack gap-large">
-              <div className="card-header-row">
-                <div>
-                  <p className="eyebrow">4. Car check details</p>
-                  <h3>Vehicle profile</h3>
-                </div>
-                <span className="muted-chip">{vehicleLookup ? 'Loaded' : 'Awaiting check'}</span>
-              </div>
-              {!vehicleLookup ? (
-                <p className="card-copy">Run car check to load make, model, fuel, MOT and tax details for operator review.</p>
-              ) : (
-                <>
-                  {(vehicleLookup.imageUrl || vehicleLookup.imageUrls?.[0]) ? (
-                    <div className="preview-row">
-                      <img src={vehicleLookup.imageUrl || vehicleLookup.imageUrls?.[0]} alt="Carcheck vehicle preview" className="preview-image" />
-                    </div>
-                  ) : null}
-                  <div className="detail-grid">
-                    <div><span className="meta-label">VRM</span><strong>{vehicleLookup.vrm || '—'}</strong></div>
-                    <div><span className="meta-label">Make</span><strong>{vehicleLookup.make || '—'}</strong></div>
-                    <div><span className="meta-label">Model</span><strong>{vehicleLookup.model || '—'}</strong></div>
-                    <div><span className="meta-label">Colour</span><strong>{vehicleLookup.color || '—'}</strong></div>
-                    <div><span className="meta-label">Body type</span><strong>{vehicleLookup.bodyType || '—'}</strong></div>
-                    <div><span className="meta-label">Fuel</span><strong>{vehicleLookup.fuelType || '—'}</strong></div>
-                    <div><span className="meta-label">MOT</span><strong>{vehicleLookup.motStatus || '—'}</strong></div>
-                    <div><span className="meta-label">MOT expiry</span><strong>{vehicleLookup.motExpiry || '—'}</strong></div>
-                    <div><span className="meta-label">Tax</span><strong>{vehicleLookup.taxStatus || '—'}</strong></div>
-                    <div><span className="meta-label">Tax due</span><strong>{vehicleLookup.taxDueDate || '—'}</strong></div>
-                    <div><span className="meta-label">Images</span><strong>{Array.isArray(vehicleLookup.imageUrls) ? vehicleLookup.imageUrls.length : 0}</strong></div>
-                  </div>
-                </>
-              )}
-            </div>
-          </section>
-        ) : null}
-
         {activeTab === 'tracked' ? (
           <section className="workspace-grid tracked-layout">
+            {/* ── Left: Breach list ── */}
             <div className="card stack gap-large">
               <div className="card-header-row">
                 <div>
-                  <p className="eyebrow">Breach list</p>
-                  <h3>Action-focused operator queue</h3>
+                  <p className="eyebrow">Patrol inbox</p>
+                  <h3>Active enforcement queue</h3>
                 </div>
                 <span className="muted-chip">{trackedBreaches.length} tracked</span>
               </div>
 
+              {trackedBreaches.filter(i => i.lifecycle.code === 'DRAFT_OPEN').length > 0 ? (
+                <div className="active-sessions-bar">
+                  <span className="active-sessions-count">
+                    {trackedBreaches.filter(i => i.lifecycle.code === 'DRAFT_OPEN').length}
+                  </span>
+                  <span>Active observation sessions currently ticking</span>
+                </div>
+              ) : null}
+
+              <div style={{ display: 'grid', gap: 6, margin: '8px 0 16px 0' }}>
+                <span className="meta-label">Current Patrol Zone / Bay Filter</span>
+                <select className="field-select" value={selectedSiteId} onChange={(event) => setSelectedSiteId(event.target.value)}>
+                  <option value="">All active sites / bays</option>
+                  {sites.map((site) => (
+                    <option key={site.id} value={site.id}>
+                      {site.displayName || site.name || site.location || site.id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               <div className="inline-actions status-filter-bar">
-                <button type="button" className={`ghost-button ${breachStatusFilter === 'all' ? 'tab-button-active' : ''}`} onClick={() => setBreachStatusFilter('all')}>
-                  All ({trackedBreaches.length})
-                </button>
-                <button type="button" className={`ghost-button ${breachStatusFilter === 'open' ? 'tab-button-active' : ''}`} onClick={() => setBreachStatusFilter('open')}>
-                  Open ({trackedBreaches.filter((item) => item.lifecycle.code === 'DRAFT_OPEN').length})
-                </button>
-                <button type="button" className={`ghost-button ${breachStatusFilter === 'ready' ? 'tab-button-active' : ''}`} onClick={() => setBreachStatusFilter('ready')}>
-                  Ready ({trackedBreaches.filter((item) => item.lifecycle.code === 'READY').length})
-                </button>
-                <button type="button" className={`ghost-button ${breachStatusFilter === 'submitted' ? 'tab-button-active' : ''}`} onClick={() => setBreachStatusFilter('submitted')}>
-                  Submitted ({trackedBreaches.filter((item) => item.lifecycle.code === 'SUBMITTED').length})
-                </button>
-                <button type="button" className={`ghost-button ${breachStatusFilter === 'converted' ? 'tab-button-active' : ''}`} onClick={() => setBreachStatusFilter('converted')}>
-                  Converted ({trackedBreaches.filter((item) => item.lifecycle.code === 'CONVERTED').length})
-                </button>
-                <button type="button" className={`ghost-button ${breachStatusFilter === 'failed' ? 'tab-button-active' : ''}`} onClick={() => setBreachStatusFilter('failed')}>
-                  Failed ({trackedBreaches.filter((item) => item.lifecycle.code === 'FAILED').length})
-                </button>
+                {[
+                  { key: 'all', label: 'All', count: trackedBreaches.length },
+                  { key: 'open', label: 'Open', count: trackedBreaches.filter(i => i.lifecycle.code === 'DRAFT_OPEN').length },
+                  { key: 'ready', label: 'Ready', count: trackedBreaches.filter(i => i.lifecycle.code === 'READY').length },
+                  { key: 'submitted', label: 'Submitted', count: trackedBreaches.filter(i => i.lifecycle.code === 'SUBMITTED').length },
+                  { key: 'converted', label: 'Converted', count: trackedBreaches.filter(i => i.lifecycle.code === 'CONVERTED').length },
+                  { key: 'failed', label: 'Failed', count: trackedBreaches.filter(i => i.lifecycle.code === 'FAILED').length },
+                ].map(({ key, label, count }) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className={`ghost-button ${breachStatusFilter === key ? 'tab-button-active' : ''}`}
+                    onClick={() => setBreachStatusFilter(key)}
+                  >
+                    {label} {count > 0 ? <span style={{ opacity: 0.7, marginLeft: 3 }}>{count}</span> : null}
+                  </button>
+                ))}
               </div>
 
               {filteredBreaches.length === 0 ? (
@@ -1551,32 +1390,90 @@ export default function DashboardPage() {
               ) : (
                 <div className="queue-list">
                   {filteredBreaches.map((item) => (
-                    <article key={item.id} className={`queue-item ${selectedTrackedId === item.id ? 'queue-item-selected' : ''}`}>
-                      <div>
-                        <strong>{item.vrm}</strong>
-                        <p>{item.reason}</p>
-                        <span>{item.siteName}</span>
-                        {item.isOpen ? <span className="tracked-timer">Observation open: {item.minutesRemaining} min left</span> : null}
-                        {item.lastError ? <span className="tracked-error">Last error: {item.lastError}</span> : null}
-                      </div>
-                      <div className="queue-item-meta">
-                        <span className={`status-pill ${item.status === 'failed' ? 'status-pill-offline' : 'status-pill-online'}`}>{item.lifecycle.label}</span>
-                        <span>{new Date(item.createdAt).toLocaleString()}</span>
-                        <span>{item.entryCount} entry / {item.closingCount} closing</span>
-                        <div className="inline-actions">
-                          <button type="button" className="primary-button" onClick={() => handlePrimaryAction(item)} disabled={syncing && (item.lifecycle.code === 'READY' || item.lifecycle.code === 'FAILED')}>
-                            {getPrimaryActionLabel(item)}
-                          </button>
-                          <button type="button" className="ghost-button" onClick={() => handleReviewTracked(item)}>
-                            Review
-                          </button>
-                          <button type="button" className="secondary-button" onClick={() => handleRetryTracked(item.id)} disabled={syncing || !item.lifecycle.syncable}>
-                            Retry
-                          </button>
-                          <button type="button" className="ghost-button ghost-danger" onClick={() => handleCancelTracked(item.id)}>
-                            Cancel
-                          </button>
+                    <article
+                      key={item.id}
+                      className={`breach-card ${selectedTrackedId === item.id ? 'breach-card-selected' : ''}`}
+                      onClick={() => handleReviewTracked(item)}
+                    >
+                      <div className="breach-card-top">
+                        <div>
+                          <div className="breach-card-vrm">{item.vrm}</div>
+                          <div className="breach-card-site">{item.siteName}</div>
                         </div>
+                        <span className={`lc-pill lc-${item.lifecycle.code}`}>
+                          <span className="lc-pill-dot" />
+                          {item.lifecycle.label}
+                        </span>
+                      </div>
+
+                      <div className="breach-card-reason">{item.reason}</div>
+
+                      <div className="breach-card-kpi">
+                        <div className="breach-card-kpi-item">
+                          <span className="breach-card-kpi-label">Entry imgs</span>
+                          <span className="breach-card-kpi-val">{item.entryCount || '—'}</span>
+                        </div>
+                        <div className="breach-card-kpi-item">
+                          <span className="breach-card-kpi-label">Exit imgs</span>
+                          <span className="breach-card-kpi-val">{item.closingCount || '—'}</span>
+                        </div>
+                        <div className="breach-card-kpi-item">
+                          <span className="breach-card-kpi-label">Created</span>
+                          <span className="breach-card-kpi-val">{new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        </div>
+                        {item.attempts > 0 ? (
+                          <div className="breach-card-kpi-item">
+                            <span className="breach-card-kpi-label">Attempts</span>
+                            <span className="breach-card-kpi-val">{item.attempts}</span>
+                          </div>
+                        ) : null}
+                      </div>
+
+                      {item.isOpen ? (
+                        <div className="breach-card-timer">
+                          ⏱ Observation open — {item.minutesRemaining} min remaining
+                        </div>
+                      ) : null}
+
+                      {item.lastError ? (
+                        <span className="tracked-error">Error: {item.lastError}</span>
+                      ) : null}
+
+                      <div className="breach-card-actions">
+                        <button
+                          type="button"
+                          className="primary-button"
+                          style={{ padding: '8px 14px', fontSize: '13px' }}
+                          onClick={(e) => { e.stopPropagation(); handlePrimaryAction(item); }}
+                          disabled={syncing && (item.lifecycle.code === 'READY' || item.lifecycle.code === 'FAILED')}
+                        >
+                          {getPrimaryActionLabel(item)}
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          style={{ padding: '8px 14px', fontSize: '13px' }}
+                          onClick={(e) => { e.stopPropagation(); handleReviewTracked(item); }}
+                        >
+                          Review
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          style={{ padding: '8px 14px', fontSize: '13px' }}
+                          onClick={(e) => { e.stopPropagation(); handleRetryTracked(item.id); }}
+                          disabled={syncing || !item.lifecycle.syncable}
+                        >
+                          Retry
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button ghost-danger"
+                          style={{ padding: '8px 14px', fontSize: '13px' }}
+                          onClick={(e) => { e.stopPropagation(); handleCancelTracked(item.id); }}
+                        >
+                          Remove
+                        </button>
                       </div>
                     </article>
                   ))}
@@ -1584,97 +1481,292 @@ export default function DashboardPage() {
               )}
             </div>
 
+            {/* ── Right: Detail pane ── */}
             {selectedTracked ? (
               <div className="card stack gap-large">
                 <div className="card-header-row">
                   <div>
-                    <p className="eyebrow">Breach card</p>
-                    <h3>{selectedTracked.vrm}</h3>
+                    <p className="eyebrow">Breach detail</p>
+                    <h3 style={{ fontFamily: 'monospace', letterSpacing: '0.06em' }}>{selectedTracked.vrm}</h3>
                   </div>
-                  <span className="muted-chip">{selectedTracked.lifecycle.label}</span>
-                </div>
-                <div className="detail-grid">
-                  <div><span className="meta-label">Site</span><strong>{selectedTracked.siteName}</strong></div>
-                  <div><span className="meta-label">Reason</span><strong>{selectedTracked.reason}</strong></div>
-                  <div><span className="meta-label">Created</span><strong>{new Date(selectedTracked.createdAt).toLocaleString()}</strong></div>
-                  <div><span className="meta-label">Attempts</span><strong>{selectedTracked.attempts}</strong></div>
-                  <div><span className="meta-label">Evidence</span><strong>{selectedTracked.entryCount} entry / {selectedTracked.closingCount} closing</strong></div>
-                  <div><span className="meta-label">Breach ID</span><strong>{selectedTracked?.payload?.breachId || 'Pending submission'}</strong></div>
-                  <div><span className="meta-label">Observation start</span><strong>{selectedTracked.observationStartTime ? new Date(selectedTracked.observationStartTime).toLocaleString() : '—'}</strong></div>
-                  <div><span className="meta-label">Observation end</span><strong>{selectedTracked.observationEndTime ? new Date(selectedTracked.observationEndTime).toLocaleString() : '—'}</strong></div>
+                  <span className={`lc-pill lc-${selectedTracked.lifecycle.code}`}>
+                    <span className="lc-pill-dot" />
+                    {selectedTracked.lifecycle.label}
+                  </span>
                 </div>
 
-                <div className="stack gap-small">
-                  <p className="eyebrow">Car check cache</p>
-                  {selectedTrackedVehicleLookup ? (
-                    <div className="detail-grid">
-                      <div><span className="meta-label">Make</span><strong>{selectedTrackedVehicleLookup.make || '—'}</strong></div>
-                      <div><span className="meta-label">Model</span><strong>{selectedTrackedVehicleLookup.model || '—'}</strong></div>
-                      <div><span className="meta-label">Colour</span><strong>{selectedTrackedVehicleLookup.color || '—'}</strong></div>
-                      <div><span className="meta-label">MOT</span><strong>{selectedTrackedVehicleLookup.motStatus || '—'}</strong></div>
-                      <div><span className="meta-label">Tax</span><strong>{selectedTrackedVehicleLookup.taxStatus || '—'}</strong></div>
-                      <div><span className="meta-label">Cached images</span><strong>{Array.isArray(selectedTrackedVehicleLookup.imageUrls) ? selectedTrackedVehicleLookup.imageUrls.length : 0}</strong></div>
+                {/* KPI strip */}
+                <div className="breach-kpi-row">
+                  <div className="kpi-cell">
+                    <span className="kpi-cell-label">Site</span>
+                    <span className="kpi-cell-val">{selectedTracked.siteName}</span>
+                  </div>
+                  <div className="kpi-cell">
+                    <span className="kpi-cell-label">Created</span>
+                    <span className="kpi-cell-val">{new Date(selectedTracked.createdAt).toLocaleDateString([], { day: '2-digit', month: 'short' })}</span>
+                  </div>
+                  <div className="kpi-cell">
+                    <span className="kpi-cell-label">Evidence</span>
+                    <span className="kpi-cell-val">{selectedTracked.entryCount}↑ / {selectedTracked.closingCount}↓</span>
+                  </div>
+                  <div className="kpi-cell">
+                    <span className="kpi-cell-label">Attempts</span>
+                    <span className="kpi-cell-val">{selectedTracked.attempts || 0}</span>
+                  </div>
+                </div>
+
+                {/* Observation timer banner */}
+                {selectedTracked.isOpen ? (
+                  <div className="session-active-banner">
+                    <span className="session-active-dot" />
+                    Observation open — {selectedTracked.minutesRemaining} min remaining
+                  </div>
+                ) : null}
+
+                {/* Timestamps row */}
+                <div className="detail-grid">
+                  <div><span className="meta-label">Contravention</span><strong>{selectedTracked.reason}</strong></div>
+                  <div><span className="meta-label">Breach ID</span><strong className="text-mono">{selectedTracked?.payload?.breachId || 'Pending submission'}</strong></div>
+                  <div><span className="meta-label">Obs. start</span><strong>{selectedTracked.observationStartTime ? new Date(selectedTracked.observationStartTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '—'}</strong></div>
+                  <div><span className="meta-label">Obs. end</span><strong>{selectedTracked.observationEndTime ? new Date(selectedTracked.observationEndTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '—'}</strong></div>
+                </div>
+
+                {/* Evidence with inline capture */}
+                <div className="border-top-subtle">
+                  <p className="detail-section-label">Evidence pair</p>
+                  <div className="evidence-split-grid">
+                    <div className="evidence-frame">
+                      <div className="evidence-frame-header">
+                        <span className="evidence-frame-label-entry">▶ Entry</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                          {selectedTracked.entryCount > 0 ? <span className="evidence-count-badge evidence-count-badge-entry">{selectedTracked.entryCount}</span> : null}
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            style={{ padding: '2px 8px', fontSize: '10px', borderRadius: '6px' }}
+                            onClick={() => { handleReviewTracked(selectedTracked); setTimeout(() => openCaptureDialog('entry'), 80); }}
+                          >
+                            {selectedTracked.entryCount > 0 ? 'Re-cap' : 'Capture ↑'}
+                          </button>
+                        </div>
+                      </div>
+                      {entryPreviews.length > 0 ? (
+                        <img src={entryPreviews[0]} alt="Entry evidence" className="evidence-frame-img" />
+                      ) : (
+                        <div className="evidence-frame-placeholder">No preview.<br />Tap Capture ↑.</div>
+                      )}
+                      {selectedTracked.observationStartTime ? (
+                        <div className="evidence-frame-ts">⏱ {new Date(selectedTracked.observationStartTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</div>
+                      ) : null}
                     </div>
-                  ) : (
-                    <p className="card-copy">No cached car check for this VRM yet. Run vehicle check to cache it in app memory.</p>
-                  )}
-                  <div className="inline-actions">
+                    <div className="evidence-frame">
+                      <div className="evidence-frame-header">
+                        <span className="evidence-frame-label-exit">■ Exit</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                          {selectedTracked.closingCount > 0 ? <span className="evidence-count-badge evidence-count-badge-exit">{selectedTracked.closingCount}</span> : null}
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            style={{ padding: '2px 8px', fontSize: '10px', borderRadius: '6px' }}
+                            onClick={() => { handleReviewTracked(selectedTracked); setTimeout(() => openCaptureDialog('closing'), 80); }}
+                            disabled={selectedTracked.entryCount === 0}
+                          >
+                            {selectedTracked.closingCount > 0 ? 'Re-cap' : 'Capture ↓'}
+                          </button>
+                        </div>
+                      </div>
+                      {closingPreviews.length > 0 ? (
+                        <img src={closingPreviews[0]} alt="Exit evidence" className="evidence-frame-img" />
+                      ) : (
+                        <div className="evidence-frame-placeholder">No preview.<br />{selectedTracked.entryCount > 0 ? 'Tap Capture ↓.' : 'Entry first.'}</div>
+                      )}
+                      {selectedTracked.observationEndTime ? (
+                        <div className="evidence-frame-ts">⏱ {new Date(selectedTracked.observationEndTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</div>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  {/* Finalize / session controls */}
+                  <div className="inline-actions" style={{ marginTop: 10 }}>
                     <button
                       type="button"
-                      className="secondary-button"
+                      className="primary-button"
+                      style={{ padding: '9px 16px', fontSize: '13px' }}
+                      onClick={() => { handleReviewTracked(selectedTracked); setTimeout(handleFinalize, 80); }}
+                      disabled={busy || selectedTracked.entryCount === 0 || selectedTracked.closingCount === 0}
+                    >
+                      {busy ? 'Finalizing…' : 'Finalize breach'}
+                    </button>
+                    {selectedTracked.lifecycle.syncable || selectedTracked.status === 'syncing' ? (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        style={{ padding: '9px 16px', fontSize: '13px' }}
+                        onClick={() => handleRetryTracked(selectedTracked.id)}
+                        disabled={syncing}
+                      >
+                        {syncing ? 'Syncing…' : 'Submit now'}
+                      </button>
+                    ) : null}
+                    {selectedTracked.lifecycle.code === 'DRAFT_OPEN' ? (
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        style={{ padding: '9px 16px', fontSize: '13px' }}
+                        onClick={() => { handleReviewTracked(selectedTracked); setTimeout(startMonitoringSession, 80); }}
+                        disabled={selectedTracked.entryCount === 0 || monitoringSessionActive}
+                      >
+                        Start session
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+
+                {/* VRM + Contravention editing */}
+                <div className="border-top-subtle">
+                  <p className="detail-section-label">Contravention details</p>
+                  <div className="capture-grid">
+                    <label>
+                      VRM
+                      <input
+                        value={selectedVrm || selectedTracked.vrm || ''}
+                        onChange={(e) => setSelectedVrm(normalizeVrm(e.target.value))}
+                        placeholder="AB12CDE"
+                        style={{ fontFamily: 'monospace', fontWeight: 800 }}
+                      />
+                    </label>
+                    <label>
+                      Contravention
+                      <select value={selectedContraventionCode} onChange={(e) => selectContravention(e.target.value)}>
+                        {contraventions.map((item) => (
+                          <option key={item.code} value={item.code}>{item.code} – {item.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <label style={{ marginTop: 8, display: 'grid', gap: 6, fontWeight: 600, fontSize: 14 }}>
+                    Warden notes
+                    <textarea rows={2} value={manualNote} onChange={(e) => setManualNote(e.target.value)} placeholder="Bay position, signage, observations…" />
+                  </label>
+                </div>
+
+                {/* Permit + car check actions */}
+                <div className="border-top-subtle">
+                  <p className="detail-section-label">Live validation</p>
+
+                  {authorization ? (
+                    <div className={`notice ${authorization.hasAuthorization ? 'notice-info' : 'notice-error'}`} style={{ marginBottom: 10 }}>
+                      <strong>{authorization.hasAuthorization ? '✓ Authorised' : '✗ No valid permit'}</strong>
+                      {authorization.authorization?.type ? ` — ${authorization.authorization.type}` : ''}
+                      {authorization.authorization?.status ? ` (${authorization.authorization.status})` : ''}
+                    </div>
+                  ) : null}
+
+                  <div className="action-strip">
+                    <span className="action-strip-label">Checks</span>
+                    <button
+                      type="button"
+                      className="quick-action-button"
                       onClick={async () => {
-                        const trackedVrm = selectedTracked?.payload?.vrm || selectedTracked?.vrm;
-                        if (!trackedVrm) return;
-                        setSelectedVrm(trackedVrm);
-                        await runVehicleLookupForVrm(trackedVrm);
+                        const vrm = selectedTracked?.payload?.vrm || selectedTracked?.vrm;
+                        handleReviewTracked(selectedTracked);
+                        await checkAuthorization(vrm);
+                      }}
+                      disabled={busy || !selectedTracked.vrm}
+                    >
+                      ✓ Verify e-permit
+                    </button>
+                    <button type="button" className="quick-action-button" onClick={openPermitQrDialog}>
+                      ⬛ Scan QR permit
+                    </button>
+                    <button
+                      type="button"
+                      className="quick-action-button"
+                      onClick={async () => {
+                        const vrm = selectedTracked?.payload?.vrm || selectedTracked?.vrm;
+                        if (!vrm) return;
+                        setSelectedVrm(vrm);
+                        await runVehicleLookupForVrm(vrm);
                       }}
                       disabled={vehicleLookupLoading || !selectedTracked?.vrm}
                     >
-                      {vehicleLookupLoading ? 'Checking vehicle…' : 'Run car check for this breach'}
+                      {vehicleLookupLoading ? '⏳ Checking…' : '🚗 Car check'}
+                    </button>
+                    <button
+                      type="button"
+                      className="quick-action-button"
+                      onClick={() => inferVrmFromImage()}
+                      disabled={busy || (!entryPreviews.length && !closingPreviews.length)}
+                    >
+                      🔍 Analyse VRM
                     </button>
                   </div>
+
+                  {selectedTrackedVehicleLookup ? (
+                    <div className="detail-grid" style={{ marginTop: 10 }}>
+                      <div><span className="meta-label">Make</span><strong>{selectedTrackedVehicleLookup.make || '—'}</strong></div>
+                      <div><span className="meta-label">Model</span><strong>{selectedTrackedVehicleLookup.model || '—'}</strong></div>
+                      <div><span className="meta-label">Colour</span><strong>{selectedTrackedVehicleLookup.color || '—'}</strong></div>
+                      <div><span className="meta-label">Body</span><strong>{selectedTrackedVehicleLookup.bodyType || '—'}</strong></div>
+                      <div><span className="meta-label">Fuel</span><strong>{selectedTrackedVehicleLookup.fuelType || '—'}</strong></div>
+                      <div><span className="meta-label">MOT</span><strong>{selectedTrackedVehicleLookup.motStatus || '—'}</strong></div>
+                      <div><span className="meta-label">MOT expiry</span><strong>{selectedTrackedVehicleLookup.motExpiry || '—'}</strong></div>
+                      <div><span className="meta-label">Tax</span><strong>{selectedTrackedVehicleLookup.taxStatus || '—'}</strong></div>
+                    </div>
+                  ) : null}
                 </div>
 
-                <div className="stack gap-medium">
-                  <p className="eyebrow">Evidence</p>
-                  <div className="preview-row">
-                    {entryPreviews.map((preview) => <img key={`entry-${preview}`} src={preview} alt="Opening evidence" className="preview-image" />)}
-                    {closingPreviews.map((preview) => <img key={`closing-${preview}`} src={preview} alt="Closing evidence" className="preview-image" />)}
-                    {entryPreviews.length === 0 && closingPreviews.length === 0 ? <div className="preview-placeholder">No evidence previews available.</div> : null}
-                  </div>
-                </div>
-
-                <div className="stack gap-medium">
-                  <p className="eyebrow">Escalation action</p>
+                {/* PCN conversion */}
+                <div className="border-top-subtle">
+                  <p className="detail-section-label">PCN escalation</p>
                   <div className="detail-grid">
                     <label>
                       PCN number
-                      <input value={pcnNumberInput} onChange={(event) => setPcnNumberInput(event.target.value)} placeholder="PCN-XXXX" />
+                      <input value={pcnNumberInput} onChange={(e) => setPcnNumberInput(e.target.value)} placeholder="PCN-XXXX" />
                     </label>
                     <label>
                       Amount (GBP)
-                      <input type="number" min="1" step="1" value={pcnAmountInput} onChange={(event) => setPcnAmountInput(event.target.value)} />
+                      <input type="number" min="1" step="1" value={pcnAmountInput} onChange={(e) => setPcnAmountInput(e.target.value)} />
                     </label>
                   </div>
                   <label>
                     PCN reason
-                    <textarea rows={2} value={pcnReasonInput} onChange={(event) => setPcnReasonInput(event.target.value)} />
+                    <textarea rows={2} value={pcnReasonInput} onChange={(e) => setPcnReasonInput(e.target.value)} />
                   </label>
-                  {convertError ? <div className="notice notice-error">{convertError}</div> : null}
-                  <div className="inline-actions">
+                  {convertError ? <div className="notice notice-error" style={{ marginTop: 8 }}>{convertError}</div> : null}
+                  <div className="inline-actions" style={{ marginTop: 10 }}>
                     <button
                       type="button"
                       className="primary-button"
+                      style={{ padding: '10px 18px' }}
                       onClick={handleConvertToPcn}
                       disabled={convertLoading || selectedTracked.lifecycle.code !== 'SUBMITTED' || selectedTracked?.payload?.convertedToPcn}
                     >
-                      {selectedTracked?.payload?.convertedToPcn ? 'Already converted' : convertLoading ? 'Converting…' : 'Convert breach to PCN'}
+                      {selectedTracked?.payload?.convertedToPcn ? 'Already converted' : convertLoading ? 'Converting…' : 'Convert to PCN'}
                     </button>
-                    <span className="card-copy">Conversion calls staging API contract at /api/breaches/convert-to-pcn so the record lands in PCNs and PCN QA.</span>
+                    <span className="text-muted">Only available once breach is submitted.</span>
+                  </div>
+                </div>
+
+                {/* Danger zone */}
+                <div className="border-top-subtle">
+                  <div className="inline-actions">
+                    <button
+                      type="button"
+                      className="ghost-button ghost-danger"
+                      style={{ fontSize: '13px' }}
+                      onClick={() => handleCancelTracked(selectedTracked.id)}
+                    >
+                      Remove breach
+                    </button>
                   </div>
                 </div>
               </div>
-            ) : null}
+            ) : (
+              <div className="card" style={{ display: 'grid', placeItems: 'center', minHeight: 220 }}>
+                <p className="card-copy" style={{ textAlign: 'center' }}>Select a breach from the list to view details and evidence.</p>
+              </div>
+            )}
           </section>
         ) : null}
 
@@ -1746,6 +1838,27 @@ export default function DashboardPage() {
           </section>
         ) : null}
       </section>
+
+      {/* Floating Action Button (FAB) for new breaches */}
+      <button
+        type="button"
+        className="fab-new-breach"
+        onClick={() => setStepperOpen(true)}
+        aria-label="New breach"
+        title="Create new breach session"
+      >
+        +
+      </button>
+
+      {/* 3-step creation stepper */}
+      <BreachStepper
+        open={stepperOpen}
+        onClose={() => setStepperOpen(false)}
+        onComplete={handleStepperComplete}
+        sites={sites}
+        contraventions={contraventions}
+        selectedSiteId={selectedSiteId}
+      />
     </AppShell>
   );
 }

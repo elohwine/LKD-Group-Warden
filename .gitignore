@@ -6,3 +6,8 @@ android/
 ios/
 .DS_Store
 *.log
+.env.local
+.env*.local
+.keystore/
+*.jks
+verify-stepper.js
