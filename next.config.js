@@ -16,6 +16,16 @@ const nextConfig = {
   reactStrictMode: true,
   experimental: {
     externalDir: true
+  },
+  async rewrites() {
+    // Only proxy to production backend during local Next.js dev server runs.
+    // Local API routes (under pages/api/*) naturally take precedence.
+    return [
+      {
+        source: '/api/:path*',
+        destination: 'https://www.ldkgroup.co.uk/api/:path*'
+      }
+    ];
   }
 };
 
