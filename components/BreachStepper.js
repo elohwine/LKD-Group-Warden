@@ -1,9 +1,18 @@
-import { useRef, useState, useMemo } from 'react';
+import { useRef, useState, useMemo, useEffect } from 'react';
+
+function fileToDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(reader.error || new Error('preview_read_failed'));
+        reader.readAsDataURL(file);
+    });
+}
 
 /**
  * BreachStepper — 3-step creation wizard for new breach sessions.
  *
- * Step 0: VRM + Site + Contravention
+ * Step 0: VRM + Contravention
  * Step 1: Entry evidence capture
  * Step 2: Confirm & start tracking
  */
@@ -17,8 +26,8 @@ export default function BreachStepper({
 }) {
     const [step, setStep] = useState(0);
     const [vrm, setVrm] = useState('');
-    const [siteId, setSiteId] = useState(defaultSiteId);
     const [contraventionCode, setContraventionCode] = useState(contraventions[0]?.code || '');
+    const [contraventionTouched, setContraventionTouched] = useState(false);
     const [files, setFiles] = useState([]);
     const [previews, setPreviews] = useState([]);
     const [note, setNote] = useState('');
@@ -32,19 +41,61 @@ export default function BreachStepper({
     );
 
     const selectedSite = useMemo(
-        () => sites.find((s) => String(s.id) === String(siteId)) || null,
-        [sites, siteId]
+        () => sites.find((s) => String(s.id) === String(defaultSiteId)) || null,
+        [sites, defaultSiteId]
     );
 
-    const observationMinutes = Number(selectedContravention?.defaultObservationMinutes || 10);
+    const siteConsiderationMinutes = useMemo(
+        () => Number(selectedSite?.anprRules?.considerationMinutes ?? selectedSite?.considerationMinutes ?? 0),
+        [selectedSite]
+    );
+
+    const defaultContraventionCode = useMemo(() => {
+        if (!contraventions.length) return '';
+        if (siteConsiderationMinutes > 0) {
+            const timedRule = contraventions.find((item) => {
+                const mins = Number(item?.defaultObservationMinutes ?? 0);
+                if (mins !== siteConsiderationMinutes) return false;
+                const text = `${item?.code || ''} ${item?.label || ''}`.toLowerCase();
+                return /consideration|make_payment_within|register_vehicle_within|payment/i.test(text);
+            });
+            if (timedRule?.code) return timedRule.code;
+
+            const minuteMatch = contraventions.find(
+                (item) => Number(item?.defaultObservationMinutes ?? 0) === siteConsiderationMinutes
+            );
+            if (minuteMatch?.code) return minuteMatch.code;
+        }
+        return contraventions[0]?.code || '';
+    }, [contraventions, siteConsiderationMinutes]);
+
+    useEffect(() => {
+        if (!contraventions.length) {
+            setContraventionCode('');
+            setContraventionTouched(false);
+            return;
+        }
+
+        if (!contraventionTouched && defaultContraventionCode) {
+            setContraventionCode(defaultContraventionCode);
+            return;
+        }
+
+        const exists = contraventions.some((c) => c.code === contraventionCode);
+        if (!exists) {
+            setContraventionCode(defaultContraventionCode || contraventions[0]?.code || '');
+            setContraventionTouched(false);
+        }
+    }, [contraventions, contraventionCode, contraventionTouched, defaultContraventionCode]);
+
+    const observationMinutes = Number(selectedContravention?.defaultObservationMinutes ?? 0);
 
     function reset() {
         setStep(0);
         setVrm('');
-        setSiteId(defaultSiteId);
-        setContraventionCode(contraventions[0]?.code || '');
+        setContraventionCode(defaultContraventionCode || contraventions[0]?.code || '');
+        setContraventionTouched(false);
         setFiles([]);
-        previews.forEach((p) => URL.revokeObjectURL(p));
         setPreviews([]);
         setNote('');
     }
@@ -54,11 +105,20 @@ export default function BreachStepper({
         onClose?.();
     }
 
-    function handleFileCapture(event) {
+    async function handleFileCapture(event) {
         const captured = Array.from(event.target.files || []);
         event.target.value = '';
         if (!captured.length) return;
-        const newPreviews = captured.map((f) => URL.createObjectURL(f));
+        const resolved = await Promise.all(
+            captured.map(async (file) => {
+                try {
+                    return await fileToDataUrl(file);
+                } catch (_) {
+                    return '';
+                }
+            })
+        );
+        const newPreviews = resolved.filter(Boolean);
         setFiles((prev) => [...prev, ...captured]);
         setPreviews((prev) => [...prev, ...newPreviews]);
         // Auto-advance to confirm step
@@ -68,11 +128,11 @@ export default function BreachStepper({
     }
 
     function handleConfirm() {
-        if (!vrm || !siteId || files.length === 0) return;
+        if (!vrm || !defaultSiteId || files.length === 0) return;
         onComplete?.({
             vrm: normalizeVrm(vrm),
-            siteId,
-            siteName: selectedSite?.displayName || selectedSite?.name || selectedSite?.location || siteId,
+            siteId: defaultSiteId,
+            siteName: selectedSite?.displayName || selectedSite?.name || selectedSite?.location || defaultSiteId,
             contraventionCode,
             contraventionLabel: selectedContravention?.label || '',
             observationMinutes,
@@ -87,8 +147,8 @@ export default function BreachStepper({
     }
 
     // Step validations
-    const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && siteId);
-    const canConfirm = Boolean(normalizeVrm(vrm) && siteId && files.length > 0);
+    const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && defaultSiteId);
+    const canConfirm = Boolean(normalizeVrm(vrm) && defaultSiteId && files.length > 0);
 
     if (!open) return null;
 
@@ -120,42 +180,38 @@ export default function BreachStepper({
                     className="file-input"
                 />
 
-                {/* Step 0: VRM + Site + Contravention */}
+                {/* Step 0: VRM + Contravention */}
                 {step === 0 ? (
                     <div className="stepper-step">
                         <p className="stepper-step-label">Step 1 — Vehicle identification</p>
-                        <label>
-                            VRM (registration)
+                        <label className="stepper-field">
+                            <span className="stepper-field-label">VRM (registration)</span>
                             <input
+                                className="stepper-vrm-input"
                                 value={vrm}
                                 onChange={(e) => setVrm(normalizeVrm(e.target.value))}
                                 placeholder="AB12CDE"
                                 autoFocus
-                                style={{ fontFamily: 'monospace', fontWeight: 800, fontSize: '1.1rem', letterSpacing: '0.08em' }}
                             />
                         </label>
-                        <label>
-                            Patrol site
-                            <select value={siteId} onChange={(e) => setSiteId(e.target.value)}>
-                                <option value="">Select site</option>
-                                {sites.map((site) => (
-                                    <option key={site.id} value={site.id}>
-                                        {site.displayName || site.name || site.location || site.id}
-                                    </option>
+                        <div className="stepper-fixed-site">
+                            <span className="stepper-fixed-site-label">Patrol site</span>
+                            <strong className="stepper-fixed-site-value">
+                                {selectedSite?.displayName || selectedSite?.name || selectedSite?.location || defaultSiteId || 'No site selected'}
+                            </strong>
+                        </div>
+                        <label className="stepper-field">
+                            <span className="stepper-field-label">Contravention</span>
+                            <select className="stepper-select" value={contraventionCode} onChange={(e) => { setContraventionCode(e.target.value); setContraventionTouched(true); }}>
+                                {contraventions.map((c, index) => (
+                                    <option key={c.code || `contravention-${index + 1}`} value={c.code || ''}>{c.code || `C${index + 1}`} – {c.label || 'Contravention'}</option>
                                 ))}
                             </select>
                         </label>
-                        <label>
-                            Contravention
-                            <select value={contraventionCode} onChange={(e) => setContraventionCode(e.target.value)}>
-                                {contraventions.map((c) => (
-                                    <option key={c.code} value={c.code}>{c.code} – {c.label}</option>
-                                ))}
-                            </select>
-                        </label>
-                        <label>
-                            Notes (optional)
+                        <label className="stepper-field">
+                            <span className="stepper-field-label">Notes (optional)</span>
                             <textarea
+                                className="stepper-note-input"
                                 value={note}
                                 onChange={(e) => setNote(e.target.value)}
                                 rows={2}
@@ -182,7 +238,7 @@ export default function BreachStepper({
                         <p className="stepper-step-label">Step 2 — Entry evidence</p>
                         <div className="stepper-vrm-banner">
                             <span className="stepper-vrm-text">{normalizeVrm(vrm)}</span>
-                            <span className="text-muted">{selectedSite?.displayName || selectedSite?.name || siteId}</span>
+                            <span className="text-muted">{selectedSite?.displayName || selectedSite?.name || defaultSiteId}</span>
                         </div>
 
                         {previews.length > 0 ? (
@@ -201,7 +257,7 @@ export default function BreachStepper({
 
                         <div className="stepper-nav">
                             <button type="button" className="ghost-button" onClick={() => setStep(0)}>← Back</button>
-                            <div style={{ display: 'flex', gap: 8 }}>
+                            <div className="stepper-nav-actions">
                                 <button type="button" className="secondary-button" onClick={openCamera}>
                                     {files.length > 0 ? 'Add more' : 'Open camera'}
                                 </button>
@@ -227,15 +283,15 @@ export default function BreachStepper({
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Site</span>
-                                <span className="stepper-summary-val">{selectedSite?.displayName || selectedSite?.name || siteId}</span>
+                                <span className="stepper-summary-val">{selectedSite?.displayName || selectedSite?.name || defaultSiteId}</span>
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Contravention</span>
-                                <span className="stepper-summary-val">{selectedContravention?.code} – {selectedContravention?.label}</span>
+                                <span className="stepper-summary-val">{selectedContravention?.code || 'N/A'} – {selectedContravention?.label || 'Contravention'}</span>
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Observation</span>
-                                <span className="stepper-summary-val">{observationMinutes > 0 ? `${observationMinutes} min timer` : 'No observation required'}</span>
+                                <span className="stepper-summary-val">{observationMinutes > 0 ? 'Monitored observation (count up)' : 'No observation required'}</span>
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Entry evidence</span>
@@ -264,7 +320,7 @@ export default function BreachStepper({
                                 disabled={!canConfirm}
                                 onClick={handleConfirm}
                             >
-                                {observationMinutes > 0 ? `Start ${observationMinutes}min session` : 'Create breach'}
+                                {observationMinutes > 0 ? 'Start tracking session' : 'Create breach'}
                             </button>
                         </div>
                     </div>

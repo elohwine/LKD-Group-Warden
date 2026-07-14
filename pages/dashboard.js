@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/router';
 import { fetchJson } from '../lib/api';
-import { clearSession, loadSession, saveSession, saveStoredSiteId } from '../lib/session';
+import { clearSession, getStoredSiteId, loadSession, restoreSession, saveStoredSiteId } from '../lib/session';
 import { signOutFromWardenApp, getStoredToken } from '../lib/auth';
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
@@ -12,18 +12,63 @@ import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
 import BreachStepper from '../components/BreachStepper';
 
-function formatCountdown(targetIso) {
-  const diff = new Date(targetIso).getTime() - Date.now();
-  if (Number.isNaN(diff)) return '00:00';
-  if (diff <= 0) return '00:00';
-  const totalSeconds = Math.floor(diff / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
+function formatElapsed(startIso, endIso = '') {
+  const startMs = new Date(startIso || '').getTime();
+  if (!Number.isFinite(startMs) || startMs <= 0) return '00:00';
+
+  const endMs = endIso ? new Date(endIso).getTime() : Date.now();
+  const diffMs = Math.max(0, endMs - startMs);
+  const totalSeconds = Math.floor(diffMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
-function toObjectUrlList(files) {
-  return files.map((file) => URL.createObjectURL(file));
+function normalizeObservationMinutes(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return Math.ceil(numeric);
+}
+
+function buildVehicleLookupFingerprint(lookup) {
+  if (!lookup || typeof lookup !== 'object') return '';
+  return [
+    normalizeVrm(lookup.vrm),
+    String(lookup.make || '').trim().toUpperCase(),
+    String(lookup.model || '').trim().toUpperCase(),
+    String(lookup.color || '').trim().toUpperCase(),
+    String(lookup.yearOfManufacture || '').trim().toUpperCase(),
+    String(lookup.fuelType || '').trim().toUpperCase(),
+    String(lookup.imageUrl || lookup.imageUrls?.[0] || '').trim(),
+  ].join('|');
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('preview_read_failed'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function toPreviewSrcList(files) {
+  const resolved = await Promise.all(
+    files.map(async (file) => {
+      try {
+        return await fileToDataUrl(file);
+      } catch (_) {
+        return '';
+      }
+    })
+  );
+  return resolved.filter(Boolean);
 }
 
 function normalizeVrm(value) {
@@ -38,6 +83,114 @@ function buildEvidenceFrame(imageUrl, timestamp) {
     plateImage: imageUrl,
     timestamp: timestamp || null,
   };
+}
+
+function buildCameraRawRecords(files, previews, { phase, capturedAt, source = 'WARDEN_CAPTURE' } = {}) {
+  const safeFiles = Array.isArray(files) ? files : [];
+  const safePreviews = Array.isArray(previews) ? previews : [];
+  const nowIso = capturedAt || new Date().toISOString();
+
+  return safeFiles.map((file, index) => ({
+    id: `${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`,
+    phase: phase === 'closing' ? 'closing' : 'entry',
+    source,
+    capturedAt: nowIso,
+    fileName: file?.name || `capture_${index + 1}.jpg`,
+    mimeType: file?.type || '',
+    sizeBytes: Number(file?.size || 0),
+    localPreviewUrl: safePreviews[index] || '',
+  }));
+}
+
+function resolveCameraRawImageSrc(record) {
+  const candidates = [
+    record?.localPreviewUrl,
+    record?.uploadedUrl,
+    record?.previewUrl,
+    record?.imageUrl,
+    record?.url,
+    record?.fileUrl,
+    record?.publicUrl,
+  ];
+
+  for (const value of candidates) {
+    const candidate = String(value || '').trim();
+    if (candidate) return candidate;
+  }
+
+  return '';
+}
+
+function mergeCameraRawRecords(existing, incoming, phase) {
+  const safeExisting = Array.isArray(existing) ? existing : [];
+  const safeIncoming = Array.isArray(incoming) ? incoming : [];
+  const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+  const normalizedIncoming = safeIncoming.map((item) => ({
+    ...item,
+    phase: item?.phase === 'closing' ? 'closing' : normalizedPhase,
+  }));
+  return [...safeExisting, ...normalizedIncoming];
+}
+
+async function backfillCameraRawPreviewUrls(records, files) {
+  const safeRecords = Array.isArray(records) ? records : [];
+  if (safeRecords.length === 0) {
+    return { records: safeRecords, changed: false };
+  }
+
+  const safeFiles = Array.isArray(files) ? files : [];
+  const entryBlobs = safeFiles
+    .filter((file) => file?.phase === 'entry' && file?.blob)
+    .map((file) => file.blob);
+  const closingBlobs = safeFiles
+    .filter((file) => file?.phase === 'closing' && file?.blob)
+    .map((file) => file.blob);
+
+  const [entryPreviews, closingPreviews] = await Promise.all([
+    toPreviewSrcList(entryBlobs),
+    toPreviewSrcList(closingBlobs),
+  ]);
+
+  let entryIndex = 0;
+  let closingIndex = 0;
+  let changed = false;
+
+  const nextRecords = safeRecords.map((record) => {
+    const phase = record?.phase === 'closing' ? 'closing' : 'entry';
+    const hasDirectImage = Boolean(resolveCameraRawImageSrc(record));
+    const preview = phase === 'closing'
+      ? (closingPreviews[closingIndex++] || '')
+      : (entryPreviews[entryIndex++] || '');
+
+    if (hasDirectImage || !preview) {
+      return record;
+    }
+
+    changed = true;
+    return { ...record, localPreviewUrl: preview };
+  });
+
+  return { records: nextRecords, changed };
+}
+
+function enrichCameraRawRecordsWithUploadedUrls(records, entryUrls, closingUrls) {
+  const safeRecords = Array.isArray(records) ? records : [];
+  const safeEntryUrls = Array.isArray(entryUrls) ? entryUrls : [];
+  const safeClosingUrls = Array.isArray(closingUrls) ? closingUrls : [];
+  let entryIndex = 0;
+  let closingIndex = 0;
+
+  return safeRecords.map((record) => {
+    if (record?.phase === 'entry') {
+      const uploadedUrl = safeEntryUrls[entryIndex] || '';
+      entryIndex += 1;
+      return uploadedUrl ? { ...record, uploadedUrl, targetSystem: 'LOS' } : record;
+    }
+
+    const uploadedUrl = safeClosingUrls[closingIndex] || '';
+    closingIndex += 1;
+    return uploadedUrl ? { ...record, uploadedUrl, targetSystem: 'LOS' } : record;
+  });
 }
 
 function collectImageUrlsFromValue(root) {
@@ -247,12 +400,6 @@ function stripCarcheckFromPayload(payload) {
   return safePayload;
 }
 
-function buildDraftPcnNumber(vrm) {
-  const safeVrm = normalizeVrm(vrm || '').slice(0, 6) || 'WARDEN';
-  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 12);
-  return `PCN-${safeVrm}-${stamp}`;
-}
-
 export default function DashboardPage() {
   const router = useRouter();
   const [profile, setProfile] = useState(null);
@@ -261,7 +408,7 @@ export default function DashboardPage() {
   const [selectedVrm, setSelectedVrm] = useState('');
   const [selectedReason, setSelectedReason] = useState('');
   const [manualNote, setManualNote] = useState('');
-  const [manualObservationMinutes, setManualObservationMinutes] = useState(10);
+  const [manualObservationMinutes, setManualObservationMinutes] = useState(0);
   const [location, setLocation] = useState(null);
   const [entryFiles, setEntryFiles] = useState([]);
   const [entryPreviews, setEntryPreviews] = useState([]);
@@ -269,29 +416,38 @@ export default function DashboardPage() {
   const [closingFiles, setClosingFiles] = useState([]);
   const [closingPreviews, setClosingPreviews] = useState([]);
   const [closingCapturedAt, setClosingCapturedAt] = useState('');
+  const [cameraRawData, setCameraRawData] = useState([]);
   const [authorization, setAuthorization] = useState(null);
+  const [authorizationByVrm, setAuthorizationByVrm] = useState({});
   const [vehicleLookup, setVehicleLookup] = useState(null);
   const [vehicleLookupLoading, setVehicleLookupLoading] = useState(false);
   const [vehicleLookupByVrm, setVehicleLookupByVrm] = useState({});
+  const [carcheckDialogMessage, setCarcheckDialogMessage] = useState('');
   const [queueItems, setQueueItems] = useState([]);
   const [syncing, setSyncing] = useState(false);
   const [online, setOnline] = useState(true);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
+  const [detailMessage, setDetailMessage] = useState('');
   const [ticks, setTicks] = useState(0);
   const [selectedContraventionCode, setSelectedContraventionCode] = useState('');
   const [authToken, setAuthToken] = useState('');
   const [activeTab, setActiveTab] = useState('tracked');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedTrackedId, setSelectedTrackedId] = useState('');
+  const [darkMode, setDarkMode] = useState(true);
+  const [carcheckDialogOpen, setCarcheckDialogOpen] = useState(false);
+  const [pcnDialogOpen, setPcnDialogOpen] = useState(false);
   const [stepperOpen, setStepperOpen] = useState(false);
   const [breachStatusFilter, setBreachStatusFilter] = useState('all');
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
-  const [pcnNumberInput, setPcnNumberInput] = useState('');
-  const [pcnAmountInput, setPcnAmountInput] = useState('100');
   const [pcnReasonInput, setPcnReasonInput] = useState('No valid permit or payment found');
   const [monitoringSessionActive, setMonitoringSessionActive] = useState(false);
   const [monitoringSessionStartedAt, setMonitoringSessionStartedAt] = useState('');
+  const [cameraRawViewMode, setCameraRawViewMode] = useState('grid');
+  const [cameraRawVrmQuery, setCameraRawVrmQuery] = useState('');
+  const [cameraRawSiteFilter, setCameraRawSiteFilter] = useState('all');
   const fileInputRef = useRef(null);
   const qrFileInputRef = useRef(null);
   const authReadyRef = useRef(false);
@@ -301,12 +457,21 @@ export default function DashboardPage() {
   const contraventions = useMemo(() => getContraventionOptions(selectedSite), [selectedSite]);
   const activeTimers = useMemo(() => {
     return queueItems
-      .filter((item) => item?.payload?.observationEndTime)
+      .filter((item) => {
+        const status = String(item?.status || '').toLowerCase();
+        const { closingCount } = getEvidencePhaseCounts(item?.files);
+        const exitCaptured = closingCount > 0 || Boolean(item?.payload?.closingCapturedAt);
+        const converted = Boolean(item?.payload?.convertedToPcn) || item?.payload?.breachLifecycle === 'CONVERTED_TO_PCN';
+        if (converted) return false;
+        if (status === 'submitted' || status === 'synced') return false;
+        return Boolean(item?.payload?.observationStartTime || item?.payload?.entryCapturedAt) && !exitCaptured;
+      })
       .map((item) => ({
         id: item.id,
         vrm: item.payload.vrm,
         reason: item.payload.contraventionReason,
-        endsAt: item.payload.observationEndTime,
+        startsAt: item.payload.observationStartTime || item.payload.entryCapturedAt,
+        requiredMinutes: 0,
         siteName: item.payload.siteName || selectedSite?.name || 'Site'
       }));
   }, [queueItems, selectedSite?.name]);
@@ -319,11 +484,22 @@ export default function DashboardPage() {
     return queueItems.map((item) => {
       const lifecycle = getBreachLifecycle(item);
       const { entryCount, closingCount } = getEvidencePhaseCounts(item.files);
-      const observationEndTime = item?.payload?.observationEndTime;
-      const isOpen = Boolean(observationEndTime && new Date(observationEndTime).getTime() > Date.now());
-      const minutesRemaining = isOpen
-        ? Math.max(0, Math.ceil((new Date(observationEndTime).getTime() - Date.now()) / 60000))
+      const observationStartTime = item?.payload?.observationStartTime || item?.payload?.entryCapturedAt || '';
+      const observationEndTime =
+        item?.payload?.observationEndTime ||
+        item?.payload?.closingCapturedAt ||
+        item?.payload?.convertedAt ||
+        '';
+      const hasExitEvidence =
+        closingCount > 0 ||
+        Boolean(item?.payload?.closingCapturedAt) ||
+        lifecycle.code === 'CONVERTED';
+      const isOpen = lifecycle.code === 'DRAFT_OPEN' && !hasExitEvidence;
+      const elapsedMinutes = observationStartTime
+        ? Math.max(0, diffMinutes(observationStartTime, hasExitEvidence ? observationEndTime : new Date().toISOString()))
         : 0;
+      const requiredMinutes = 0;
+      const isPastRequired = false;
       return {
         id: item.id,
         createdAt: item.createdAt,
@@ -334,10 +510,12 @@ export default function DashboardPage() {
         vrm: item.payload?.vrm || 'Pending VRM',
         siteName: item.payload?.siteName || 'Site not set',
         reason: item.payload?.contraventionReason || 'No reason supplied',
-        observationStartTime: item.payload?.observationStartTime,
+        observationStartTime,
         observationEndTime,
         isOpen,
-        minutesRemaining,
+        elapsedMinutes,
+        requiredMinutes,
+        isPastRequired,
         payload: item.payload || {},
         files: Array.isArray(item.files) ? item.files : [],
         entryCount,
@@ -360,6 +538,166 @@ export default function DashboardPage() {
     if (!trackedVrm) return null;
     return vehicleLookupByVrm[trackedVrm] || null;
   }, [selectedTracked, vehicleLookupByVrm]);
+  const selectedTrackedAuthorization = useMemo(() => {
+    const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm);
+    if (trackedVrm && authorizationByVrm[trackedVrm]) {
+      return authorizationByVrm[trackedVrm];
+    }
+    if (selectedTracked?.payload?.authorization) {
+      return selectedTracked.payload.authorization;
+    }
+    return authorization;
+  }, [selectedTracked, authorizationByVrm, authorization]);
+  const selectedTrackedVehicleDetails = useMemo(() => {
+    if (selectedTrackedVehicleLookup) return selectedTrackedVehicleLookup;
+
+    const payloadVehicleLookup =
+      selectedTracked?.payload?.vehicleLookup ||
+      selectedTracked?.payload?.vehicleDetails ||
+      selectedTracked?.payload?.savedVehicleLookup ||
+      selectedTracked?.payload?.carcheck ||
+      selectedTracked?.payload?.carCheck ||
+      selectedTracked?.payload?.carcheckResult ||
+      selectedTracked?.payload?.carCheckResult ||
+      null;
+
+    if (!payloadVehicleLookup) return null;
+
+    return normalizeVehicleLookup(
+      payloadVehicleLookup,
+      selectedTracked?.payload?.vrm || selectedTracked?.vrm || ''
+    );
+  }, [selectedTracked, selectedTrackedVehicleLookup]);
+  const selectedTrackedVehicleImageUrl = useMemo(() => {
+    if (selectedTrackedVehicleDetails?.imageUrl) return selectedTrackedVehicleDetails.imageUrl;
+    if (Array.isArray(selectedTrackedVehicleDetails?.imageUrls) && selectedTrackedVehicleDetails.imageUrls.length > 0) {
+      return selectedTrackedVehicleDetails.imageUrls[0];
+    }
+
+    const payloadImageUrls = collectImageUrlsFromValue([
+      selectedTracked?.payload?.images,
+      selectedTracked?.payload?.imageUrls,
+      selectedTracked?.payload?.savedVehicleImageUrl,
+      selectedTracked?.payload?.evidence,
+      selectedTracked?.payload?.vehicle,
+      selectedTracked?.files,
+    ]);
+    return payloadImageUrls[0] || null;
+  }, [selectedTracked, selectedTrackedVehicleDetails]);
+  const pcnPreview = useMemo(() => {
+    if (!selectedTracked) {
+      return {
+        entryTime: '',
+        closingTime: '',
+        durationMinutes: 0,
+        imageUrls: [],
+        observationCapture: null,
+        contraventionCapture: null,
+        permitStatus: 'Not checked',
+        paymentStatus: 'Not checked',
+      };
+    }
+
+    const payload = selectedTracked?.payload || {};
+    const entryTime = payload?.entryCapturedAt || payload?.observationStartTime || '';
+    const closingTime = payload?.closingCapturedAt || payload?.observationEndTime || payload?.convertedAt || '';
+    const durationMinutes = Number(payload?.actualMinutes) > 0
+      ? Number(payload.actualMinutes)
+      : diffMinutes(entryTime, closingTime);
+    const imageUrls = collectImageUrlsFromValue([
+      payload?.images,
+      payload?.imageUrls,
+      payload?.evidence,
+      payload?.closingEvidence,
+      payload?.cameraRawData,
+    ]).slice(0, 8);
+    const cameraRecords = Array.isArray(payload?.cameraRawData) ? payload.cameraRawData : [];
+    const entryRecord = cameraRecords.find((record) => String(record?.phase || '').toLowerCase() !== 'closing') || null;
+    const closingRecord = cameraRecords.find((record) => String(record?.phase || '').toLowerCase() === 'closing') || null;
+    const fallbackEntryImage = imageUrls[0] || '';
+    const fallbackClosingImage = imageUrls[imageUrls.length > 1 ? 1 : 0] || '';
+    const observationCapture = {
+      imageUrl: resolveCameraRawImageSrc(entryRecord) || fallbackEntryImage,
+      capturedAt: entryRecord?.capturedAt || entryTime || '',
+      label: 'Observation capture',
+    };
+    const contraventionCapture = {
+      imageUrl: resolveCameraRawImageSrc(closingRecord) || fallbackClosingImage,
+      capturedAt: closingRecord?.capturedAt || closingTime || '',
+      label: 'Contravention capture',
+    };
+
+    const auth = selectedTrackedAuthorization || payload?.authorization || null;
+    const hasAuth = Boolean(auth?.hasAuthorization);
+    const authType = String(auth?.authorization?.type || '').toLowerCase();
+
+    const permitStatus = hasAuth
+      ? (authType.includes('permit') ? 'Matched' : 'No active permit')
+      : 'No active permit';
+    const paymentStatus = hasAuth
+      ? ((authType.includes('payment') || authType.includes('session') || authType.includes('pay')) ? 'Matched' : 'No active payment')
+      : 'No active payment';
+
+    return {
+      entryTime,
+      closingTime,
+      durationMinutes,
+      imageUrls,
+      observationCapture,
+      contraventionCapture,
+      permitStatus,
+      paymentStatus,
+    };
+  }, [selectedTracked, selectedTrackedAuthorization]);
+  const cameraRawFeed = useMemo(() => {
+    const feed = [];
+
+    queueItems.forEach((item) => {
+      const records = Array.isArray(item?.payload?.cameraRawData) ? item.payload.cameraRawData : [];
+      records.forEach((record, index) => {
+        feed.push({
+          ...record,
+          vrm: item?.payload?.vrm || item?.vrm || 'Unknown',
+          siteName: item?.payload?.siteName || 'Site',
+          queueItemId: item?.id,
+          recordKey: `${item?.id || 'queue'}-${record?.id || `${record?.phase || 'entry'}-${index}`}`,
+        });
+      });
+    });
+
+    return feed.sort((left, right) => String(right?.capturedAt || '').localeCompare(String(left?.capturedAt || '')));
+  }, [queueItems]);
+  const selectedTrackedCameraRawData = useMemo(() => {
+    const fromPayload = Array.isArray(selectedTracked?.payload?.cameraRawData)
+      ? selectedTracked.payload.cameraRawData
+      : [];
+
+    if (fromPayload.length > 0) {
+      return fromPayload;
+    }
+
+    return Array.isArray(cameraRawData) ? cameraRawData : [];
+  }, [selectedTracked, cameraRawData]);
+  const cameraRawSiteOptions = useMemo(() => {
+    const unique = Array.from(new Set(
+      cameraRawFeed
+        .map((item) => String(item?.siteName || '').trim())
+        .filter(Boolean)
+    ));
+    return unique.sort((a, b) => a.localeCompare(b));
+  }, [cameraRawFeed]);
+  const filteredCameraRawFeed = useMemo(() => {
+    const normalizedVrmQuery = normalizeVrm(cameraRawVrmQuery);
+    const normalizedSiteFilter = String(cameraRawSiteFilter || 'all').trim().toLowerCase();
+
+    return cameraRawFeed.filter((item) => {
+      const itemVrm = normalizeVrm(item?.vrm || '');
+      const itemSite = String(item?.siteName || '').trim().toLowerCase();
+      const vrmMatch = !normalizedVrmQuery || itemVrm.includes(normalizedVrmQuery);
+      const siteMatch = normalizedSiteFilter === 'all' || itemSite === normalizedSiteFilter;
+      return vrmMatch && siteMatch;
+    });
+  }, [cameraRawFeed, cameraRawVrmQuery, cameraRawSiteFilter]);
 
   const primaryCaptureAction = useMemo(() => {
     if (!hasEntryEvidence) {
@@ -392,9 +730,10 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (activeTab !== 'tracked') return;
+    if (!selectedTrackedId) return;
     const stillSelected = filteredBreaches.some((item) => item.id === selectedTrackedId);
     if (!stillSelected) {
-      setSelectedTrackedId(filteredBreaches[0]?.id || '');
+      setSelectedTrackedId('');
     }
   }, [activeTab, filteredBreaches, selectedTrackedId]);
 
@@ -436,7 +775,7 @@ export default function DashboardPage() {
   useEffect(() => {
     async function bootstrapSession() {
       try {
-        const session = loadSession();
+        const session = loadSession() || await restoreSession();
         const token = session?.token;
 
         if (!token || !session?.role) {
@@ -476,16 +815,30 @@ export default function DashboardPage() {
     return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => () => {
-    entryPreviews.forEach((preview) => URL.revokeObjectURL(preview));
-    closingPreviews.forEach((preview) => URL.revokeObjectURL(preview));
-  }, [entryPreviews, closingPreviews]);
+  useEffect(() => {
+    const refreshTick = () => setTicks((value) => value + 1);
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        refreshTick();
+      }
+    };
+
+    window.addEventListener('focus', refreshTick);
+    window.addEventListener('pageshow', refreshTick);
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    return () => {
+      window.removeEventListener('focus', refreshTick);
+      window.removeEventListener('pageshow', refreshTick);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, []);
 
   useEffect(() => {
     const contravention = contraventions.find((item) => item.code === selectedContraventionCode) || contraventions[0];
     if (contravention) {
       setSelectedReason(contravention.label);
-      setManualObservationMinutes(Number(contravention.defaultObservationMinutes || 10));
+      setManualObservationMinutes(Number(contravention.defaultObservationMinutes ?? 0));
     }
   }, [contraventions, selectedContraventionCode]);
 
@@ -494,6 +847,24 @@ export default function DashboardPage() {
       saveStoredSiteId(selectedSiteId);
     }
   }, [selectedSiteId]);
+
+  useEffect(() => {
+    setCarcheckDialogOpen(false);
+    setPcnDialogOpen(false);
+  }, [selectedTrackedId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const storedTheme = window.localStorage.getItem('warden-theme');
+    const preferDark = storedTheme !== 'light';
+    setDarkMode(preferDark);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    document.documentElement.classList.toggle('theme-light', !darkMode);
+    window.localStorage.setItem('warden-theme', darkMode ? 'dark' : 'light');
+  }, [darkMode]);
 
   useEffect(() => {
     const vrm = normalizeVrm(selectedVrm);
@@ -517,7 +888,33 @@ export default function DashboardPage() {
 
   async function refreshQueue() {
     const items = await listQueueItems();
-    setQueueItems(items.sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt))));
+    const nextItems = [];
+
+    for (const item of items) {
+      const records = Array.isArray(item?.payload?.cameraRawData) ? item.payload.cameraRawData : [];
+      if (records.length === 0) {
+        nextItems.push(item);
+        continue;
+      }
+
+      const { records: repairedRecords, changed } = await backfillCameraRawPreviewUrls(records, item?.files);
+      if (changed) {
+        const repairedItem = {
+          ...item,
+          payload: {
+            ...(item?.payload || {}),
+            cameraRawData: repairedRecords,
+          },
+          updatedAt: new Date().toISOString(),
+        };
+        await saveQueueItem(repairedItem);
+        nextItems.push(repairedItem);
+      } else {
+        nextItems.push(item);
+      }
+    }
+
+    setQueueItems(nextItems.sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt))));
   }
 
   async function handleLogout() {
@@ -533,25 +930,58 @@ export default function DashboardPage() {
 
   async function handleFileSelection(event) {
     const nextFiles = Array.from(event.target.files || []);
-    const nextPreviews = toObjectUrlList(nextFiles);
+    const nextPreviews = await toPreviewSrcList(nextFiles);
     const capturedAt = new Date().toISOString();
     const phase = capturePhaseRef.current === 'closing' ? 'closing' : 'entry';
+    const nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase, capturedAt });
 
     if (phase === 'entry') {
-      entryPreviews.forEach((preview) => URL.revokeObjectURL(preview));
       setEntryFiles(nextFiles);
       setEntryPreviews(nextPreviews);
-      setEntryCapturedAt(capturedAt);
+      setEntryCapturedAt((current) => current || capturedAt);
       setClosingFiles([]);
-      closingPreviews.forEach((preview) => URL.revokeObjectURL(preview));
       setClosingPreviews([]);
       setClosingCapturedAt('');
+      setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'entry'));
       setMessage(`Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`);
     } else {
-      closingPreviews.forEach((preview) => URL.revokeObjectURL(preview));
       setClosingFiles(nextFiles);
       setClosingPreviews(nextPreviews);
       setClosingCapturedAt(capturedAt);
+      setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'closing'));
+      setMonitoringSessionActive(false);
+      setMonitoringSessionStartedAt('');
+
+      if (selectedTrackedId) {
+        try {
+          const selectedPayload = selectedTracked?.payload || {};
+          const entryTime =
+            entryCapturedAt ||
+            selectedPayload.entryCapturedAt ||
+            selectedPayload.observationStartTime ||
+            monitoringSessionStartedAt ||
+            capturedAt;
+          const computedMinutes = diffMinutes(entryTime, capturedAt);
+
+          await updateQueueItem(selectedTrackedId, {
+            payload: {
+              ...selectedPayload,
+              observationStartTime: entryTime,
+              observationEndTime: capturedAt,
+              entryCapturedAt: entryTime,
+              closingCapturedAt: capturedAt,
+              actualMinutes: computedMinutes,
+              breachLifecycle: computedMinutes > 0 ? 'READY_FOR_SYNC' : selectedPayload.breachLifecycle,
+              cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'closing'),
+            },
+            updatedAt: new Date().toISOString(),
+          });
+          await refreshQueue();
+        } catch (persistError) {
+          console.error('[warden] failed to persist closing capture timing', persistError);
+        }
+      }
+
       setMessage(`Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`);
     }
 
@@ -613,6 +1043,7 @@ export default function DashboardPage() {
       token
     });
     setAuthorization(result);
+    setAuthorizationByVrm((current) => ({ ...current, [vrm]: result }));
     return result;
   }
 
@@ -621,13 +1052,13 @@ export default function DashboardPage() {
     try {
       const result = await checkAuthorization(selectedVrm);
       if (result?.hasAuthorization) {
-        setMessage('E-permit lookup matched an active authorisation for this site.');
+        setDetailMessage('E-permit lookup matched an active authorisation for this site.');
       } else {
-        setMessage('E-permit lookup completed. No active authorisation matched this site.');
+        setDetailMessage('E-permit lookup completed. No active authorisation matched this site.');
       }
     } catch (error) {
       console.error('[warden] permit lookup failed', error);
-      setMessage(error?.message || 'Permit lookup failed');
+      setDetailMessage(error?.message || 'Permit lookup failed');
     } finally {
       setBusy(false);
     }
@@ -688,27 +1119,29 @@ export default function DashboardPage() {
 
       if ((parsedVrm || selectedVrm) && selectedSiteId) {
         await checkAuthorization(parsedVrm || selectedVrm);
-        setMessage(`Permit QR scanned${parsedVrm ? ` for ${parsedVrm}` : ''}. Authorization refreshed.`);
+        setDetailMessage(`Permit QR scanned${parsedVrm ? ` for ${parsedVrm}` : ''}. Authorization refreshed.`);
       } else {
-        setMessage('Permit QR scanned. Select site/VRM to run authorization check.');
+        setDetailMessage('Permit QR scanned. Select site/VRM to run authorization check.');
       }
     } catch (error) {
       console.error('[warden] permit QR scan failed', error);
-      setMessage(error?.message || 'Permit QR scan failed');
+      setDetailMessage(error?.message || 'Permit QR scan failed');
     }
   }
 
-  async function runVehicleLookupForVrm(inputVrm) {
+  async function runVehicleLookupForVrm(inputVrm, options = {}) {
     const vrm = normalizeVrm(inputVrm);
+    const forceRefresh = Boolean(options.forceRefresh);
     if (!vrm) {
       setMessage('Enter or read a VRM before running car check.');
       return;
     }
 
     const cachedLookup = vehicleLookupByVrm[vrm];
-    if (cachedLookup) {
+    if (cachedLookup && !forceRefresh) {
       setVehicleLookup(cachedLookup);
-      setMessage(`Carcheck loaded from app memory${cachedLookup?.make || cachedLookup?.model ? `: ${[cachedLookup.make, cachedLookup.model].filter(Boolean).join(' ')}` : ''}.`);
+      setCarcheckDialogMessage(`Loaded from app memory${cachedLookup?.make || cachedLookup?.model ? `: ${[cachedLookup.make, cachedLookup.model].filter(Boolean).join(' ')}` : ''}.`);
+      setCarcheckDialogOpen(true);
       return;
     }
 
@@ -716,25 +1149,75 @@ export default function DashboardPage() {
     try {
       const token = authToken || getStoredToken();
       if (!token) throw new Error('auth_missing');
-      const result = await fetchJson(`/api/carcheck?vrm=${encodeURIComponent(vrm)}`, { token });
+      const result = await fetchJson(`/api/vehicle/lookup?vrm=${encodeURIComponent(vrm)}`, { token });
+
+      const responseInfo = result?.ResponseInformation || result?.responseInformation || null;
+      if (responseInfo && responseInfo.IsSuccessStatusCode === false) {
+        const apiMessage = responseInfo.StatusMessage || responseInfo.statusMessage || 'Lookup returned no result';
+        throw new Error(`Carcheck: ${apiMessage}`);
+      }
+
       const normalized = normalizeVehicleLookup(result, vrm);
       setVehicleLookup(normalized);
       setVehicleLookupByVrm((current) => ({ ...current, [vrm]: normalized }));
-      setMessage(`Carcheck complete${normalized?.make || normalized?.model ? `: ${[normalized.make, normalized.model].filter(Boolean).join(' ')}` : ''}.`);
+      setCarcheckDialogMessage(`Carcheck complete${normalized?.make || normalized?.model ? `: ${[normalized.make, normalized.model].filter(Boolean).join(' ')}` : ''}.`);
+      setCarcheckDialogOpen(true);
     } catch (error) {
       console.error('[warden] vehicle lookup failed', error);
       setVehicleLookup(null);
-      setMessage(error?.message || 'Carcheck failed');
+      setCarcheckDialogMessage(error?.message || 'Carcheck unavailable');
+      setCarcheckDialogOpen(true);
     } finally {
       setVehicleLookupLoading(false);
     }
   }
 
   async function handleVehicleLookup() {
-    await runVehicleLookupForVrm(selectedVrm);
+    await runVehicleLookupForVrm(selectedVrm, { forceRefresh: true });
   }
 
-  async function queueOrSendCapture({ immediate = false, targetItemId = '' } = {}) {
+  async function handleSaveCarcheckDetails() {
+    const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm);
+    if (!trackedVrm) {
+      setDetailMessage('Run carcheck before saving details.');
+      return;
+    }
+
+    const currentLookup = selectedTrackedVehicleDetails || vehicleLookup;
+    if (!currentLookup) {
+      setDetailMessage('No carcheck result to save yet.');
+      return;
+    }
+
+    if (!selectedTrackedId) {
+      setDetailMessage('Open a session before saving carcheck details.');
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const existingLookup = selectedTracked?.payload?.savedVehicleLookup || null;
+    const incomingFingerprint = buildVehicleLookupFingerprint(currentLookup);
+    const existingFingerprint = buildVehicleLookupFingerprint(existingLookup);
+    if (selectedTracked?.payload?.savedVehicleSavedAt && existingFingerprint && incomingFingerprint === existingFingerprint) {
+      setDetailMessage('Vehicle details already saved. You can reopen this result anytime.');
+      return;
+    }
+
+    await updateQueueItem(selectedTrackedId, {
+      payload: {
+        ...selectedTracked?.payload,
+        vrm: trackedVrm,
+        savedVehicleLookup: currentLookup,
+        savedVehicleImageUrl: currentLookup?.imageUrl || currentLookup?.imageUrls?.[0] || selectedTrackedVehicleImageUrl || null,
+        savedVehicleSavedAt: nowIso,
+      },
+      updatedAt: nowIso,
+    });
+    await refreshQueue();
+    setDetailMessage('Vehicle details saved. Reopen anytime from this session.');
+  }
+
+  async function queueOrSendCapture({ immediate = false, targetItemId = '', openPcnDialogAfterSync = false } = {}) {
     if (!selectedSiteId) {
       setMessage('Choose a patrol site before submitting.');
       return;
@@ -754,20 +1237,15 @@ export default function DashboardPage() {
       return;
     }
 
-    const observationRequired = manualObservationMinutes > 0;
+    const requiredObservationMinutes = 0;
     const now = new Date();
     const locationSnapshot = location || (await getCurrentLocation());
     const entryTime = entryCapturedAt || now.toISOString();
     const closingTime = closingCapturedAt || now.toISOString();
     const elapsedMinutes = diffMinutes(entryTime, closingTime);
 
-    if (!elapsedMinutes && observationRequired) {
+    if (!elapsedMinutes) {
       setMessage('Closing evidence must be captured after opening evidence.');
-      return;
-    }
-
-    if (observationRequired && elapsedMinutes < manualObservationMinutes) {
-      setMessage(`Closing evidence must be at least ${manualObservationMinutes} minutes after opening evidence.`);
       return;
     }
 
@@ -781,8 +1259,9 @@ export default function DashboardPage() {
       contraventionReason: selectedReason,
       status: 'QUEUED_FOR_QC',
       location: locationSnapshot || null,
-      observationStartTime: observationRequired ? entryTime : null,
-      observationEndTime: observationRequired ? closingTime : null,
+      observationStartTime: entryTime,
+      observationEndTime: closingTime,
+      expectedObservationMinutes: requiredObservationMinutes,
       entryCapturedAt: entryTime,
       closingCapturedAt: closingTime,
       realExitObserved: true,
@@ -791,6 +1270,7 @@ export default function DashboardPage() {
       manualNote,
       authorization,
       selectedContraventionCode,
+      cameraRawData,
     });
 
     const files = [
@@ -843,7 +1323,7 @@ export default function DashboardPage() {
       return;
     }
 
-    await syncQueueItem(itemId);
+    await syncQueueItem(itemId, { openPcnDialogAfterSuccess: openPcnDialogAfterSync });
   }
 
   async function handleSaveDraft() {
@@ -880,6 +1360,7 @@ export default function DashboardPage() {
       manualNote,
       authorization,
       selectedContraventionCode,
+      cameraRawData,
     });
 
     const draftFiles = [
@@ -940,19 +1421,20 @@ export default function DashboardPage() {
       setMessage(`Saving new tracking session for VRM ${vrm}…`);
 
       const entryTime = new Date().toISOString();
-      const endTime = observationMinutes > 0
-        ? new Date(Date.now() + observationMinutes * 60000).toISOString()
-        : '';
+      const requiredObservationMinutes = 0;
+      const stepperPreviews = await toPreviewSrcList(files);
 
       const draftPayload = {
         vrm,
         contraventionCode,
         contraventionReason: contraventionLabel,
         observationStartTime: entryTime,
-        observationEndTime: endTime,
+        observationEndTime: null,
+        expectedObservationMinutes: requiredObservationMinutes,
         siteId,
         siteName,
         note,
+        cameraRawData: buildCameraRawRecords(files, stepperPreviews, { phase: 'entry', capturedAt: entryTime, source: 'WARDEN_STEPPER' }),
       };
 
       const draftFiles = files.map((file, i) => ({
@@ -983,7 +1465,7 @@ export default function DashboardPage() {
     }
   }
 
-  async function syncQueueItem(itemId) {
+  async function syncQueueItem(itemId, { openPcnDialogAfterSuccess = false } = {}) {
     const queuedItem = (await listQueueItems()).find((item) => item.id === itemId);
     if (!queuedItem) return;
 
@@ -1023,6 +1505,11 @@ export default function DashboardPage() {
       const entryFrame = buildEvidenceFrame(entryEvidence.images?.[0], entryTime);
       const closingFrame = buildEvidenceFrame(closingEvidence.images?.[0], closingTime);
       const allImages = [...(entryEvidence.images || []), ...(closingEvidence.images || [])];
+      const cameraRawDataForLos = enrichCameraRawRecordsWithUploadedUrls(
+        queuedItem?.payload?.cameraRawData || [],
+        entryEvidence.images || [],
+        closingEvidence.images || []
+      );
       const safeQueuedPayload = stripCarcheckFromPayload(queuedItem.payload);
       const breachPayload = {
         ...safeQueuedPayload,
@@ -1057,6 +1544,7 @@ export default function DashboardPage() {
         closedAt: closingTime,
         lastSeen: closingTime,
         actualMinutes: diffMinutes(entryTime, closingTime),
+        cameraRawData: cameraRawDataForLos,
       };
 
       const breachResult = await fetchJson('/api/breaches/wardencapture', {
@@ -1079,6 +1567,18 @@ export default function DashboardPage() {
         },
       });
 
+      if (openPcnDialogAfterSuccess) {
+        const refreshedItems = await listQueueItems();
+        const submittedItem = refreshedItems.find((item) => item.id === itemId);
+        if (submittedItem) {
+          setSelectedTrackedId(submittedItem.id);
+          setActiveTab('tracked');
+          setPcnReasonInput(submittedItem?.payload?.pcnReason || 'No valid permit or payment found');
+          setConvertError('');
+          setPcnDialogOpen(true);
+        }
+      }
+
       setMessage(`Breach submitted successfully: ${breachId || vrm}`);
       setSelectedVrm('');
       setEntryFiles([]);
@@ -1090,6 +1590,7 @@ export default function DashboardPage() {
       setAuthorization(null);
       setVehicleLookup(null);
       setManualNote('');
+      setCameraRawData([]);
       setMonitoringSessionActive(false);
       setMonitoringSessionStartedAt('');
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -1108,32 +1609,43 @@ export default function DashboardPage() {
 
   async function handleConvertToPcn() {
     if (!selectedTracked) return;
-    const breachId = selectedTracked?.payload?.breachId || '';
-    if (!breachId) {
-      setConvertError('This breach has not been submitted yet, so it cannot be converted to PCN.');
-      return;
-    }
-
-    if (!pcnNumberInput.trim()) {
-      setConvertError('PCN number is required.');
-      return;
-    }
-
-    const amount = Number(pcnAmountInput);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      setConvertError('A valid PCN amount is required.');
-      return;
-    }
 
     setConvertLoading(true);
     setConvertError('');
     try {
+      let workingItem = selectedTracked;
+      let breachId = workingItem?.payload?.breachId || '';
+
+      if (!breachId) {
+        setMessage('Submitting evidence package before final PCN submission...');
+        await queueOrSendCapture({
+          targetItemId: selectedTrackedId || '',
+          openPcnDialogAfterSync: false,
+        });
+
+        const refreshedItems = await listQueueItems();
+        const refreshed = refreshedItems.find((item) => item.id === (selectedTrackedId || '')) || null;
+        if (refreshed) {
+          workingItem = {
+            ...selectedTracked,
+            payload: refreshed.payload,
+            vrm: refreshed?.payload?.vrm || selectedTracked?.vrm,
+            siteName: refreshed?.payload?.siteName || selectedTracked?.siteName,
+          };
+          breachId = refreshed?.payload?.breachId || '';
+        }
+      }
+
+      if (!breachId) {
+        throw new Error('Could not create breach record before final PCN submission. Please retry.');
+      }
+
       const token = authToken || getStoredToken();
       if (!token) throw new Error('auth_missing');
 
       const images = [
-        ...(Array.isArray(selectedTracked?.payload?.images) ? selectedTracked.payload.images : []),
-        ...(Array.isArray(selectedTracked?.payload?.imageUrls) ? selectedTracked.payload.imageUrls : []),
+        ...(Array.isArray(workingItem?.payload?.images) ? workingItem.payload.images : []),
+        ...(Array.isArray(workingItem?.payload?.imageUrls) ? workingItem.payload.imageUrls : []),
       ]
         .filter((value) => typeof value === 'string' && value.length > 0)
         .filter((value, index, all) => all.indexOf(value) === index);
@@ -1142,35 +1654,39 @@ export default function DashboardPage() {
         token,
         body: {
           breachId,
-          pcnNumber: pcnNumberInput.trim(),
-          amount,
           reason: pcnReasonInput.trim() || 'No valid permit or payment found',
           notes: `Converted from breach ${breachId}`,
-          vrm: selectedTracked.vrm,
-          timestamp: selectedTracked.observationEndTime || selectedTracked.createdAt || new Date().toISOString(),
-          siteId: selectedTracked?.payload?.siteId || '',
-          siteName: selectedTracked.siteName || '',
-          evidence: selectedTracked?.payload?.evidence || {},
+          vrm: workingItem?.vrm || selectedTracked?.vrm,
+          timestamp: workingItem?.observationEndTime || workingItem?.createdAt || new Date().toISOString(),
+          siteId: workingItem?.payload?.siteId || '',
+          siteName: workingItem?.siteName || '',
+          evidence: workingItem?.payload?.evidence || {},
           images,
         },
       });
 
-      await updateQueueItem(selectedTracked.id, {
+      const convertedAt = new Date().toISOString();
+      await updateQueueItem(selectedTrackedId || selectedTracked.id, {
         status: 'submitted',
-        updatedAt: new Date().toISOString(),
+        updatedAt: convertedAt,
         payload: {
-          ...selectedTracked.payload,
+          ...(workingItem?.payload || selectedTracked.payload),
           breachLifecycle: 'CONVERTED_TO_PCN',
           convertedToPcn: true,
-          convertedAt: new Date().toISOString(),
-          pcnAmount: amount,
+          convertedAt,
+          observationEndTime: workingItem?.payload?.observationEndTime || workingItem?.payload?.closingCapturedAt || convertedAt,
+          closingCapturedAt: workingItem?.payload?.closingCapturedAt || workingItem?.payload?.observationEndTime || convertedAt,
           pcnReason: pcnReasonInput.trim() || 'No valid permit or payment found',
           pcnId: response?.id || response?.pcnId || '',
-          pcnNumber: response?.pcnNumber || pcnNumberInput.trim(),
+          pcnNumber: response?.pcnNumber || '',
+          pcnAmount: Number(response?.amount || 0) > 0 ? Number(response.amount) : Number(workingItem?.payload?.pcnAmount || 0),
         },
       });
       await refreshQueue();
-      setMessage(`Breach converted to PCN ${response?.pcnNumber || pcnNumberInput.trim()} and routed for QA escalation.`);
+      setMessage(`Breach converted to PCN ${response?.pcnNumber || ''} and routed for QA escalation.`);
+      setPcnDialogOpen(false);
+      setMonitoringSessionActive(false);
+      setMonitoringSessionStartedAt('');
     } catch (error) {
       console.error('[warden] convert breach failed', error);
       setConvertError(error?.message || 'Failed to convert breach to PCN');
@@ -1215,7 +1731,8 @@ export default function DashboardPage() {
     }
   }
 
-  function handleReviewTracked(item) {
+  async function handleReviewTracked(item) {
+    setDetailMessage('');
     setSelectedTrackedId(item.id);
     if (item?.payload?.siteId) {
       setSelectedSiteId(item.payload.siteId);
@@ -1229,11 +1746,13 @@ export default function DashboardPage() {
     if (item?.payload?.selectedContraventionCode) {
       setSelectedContraventionCode(item.payload.selectedContraventionCode);
     }
-    if (item?.payload?.authorization) {
-      setAuthorization(item.payload.authorization);
-    }
-
     const trackedVrm = normalizeVrm(item?.payload?.vrm || item?.vrm);
+    const payloadAuthorization = item?.payload?.authorization || null;
+    if (payloadAuthorization && trackedVrm) {
+      setAuthorizationByVrm((current) => ({ ...current, [trackedVrm]: payloadAuthorization }));
+    }
+    setAuthorization(payloadAuthorization || (trackedVrm ? authorizationByVrm[trackedVrm] || null : null));
+
     setVehicleLookup(trackedVrm ? (vehicleLookupByVrm[trackedVrm] || null) : null);
 
     const entryEvidence = (Array.isArray(item.files) ? item.files : [])
@@ -1243,37 +1762,100 @@ export default function DashboardPage() {
       .filter((file) => file?.phase === 'closing' && file?.blob)
       .map((file) => file.blob);
 
-    entryPreviews.forEach((preview) => URL.revokeObjectURL(preview));
-    closingPreviews.forEach((preview) => URL.revokeObjectURL(preview));
-
     setEntryFiles(entryEvidence);
     setClosingFiles(closingEvidence);
-    setEntryPreviews(toObjectUrlList(entryEvidence));
-    setClosingPreviews(toObjectUrlList(closingEvidence));
+    const [nextEntryPreviews, nextClosingPreviews] = await Promise.all([
+      toPreviewSrcList(entryEvidence),
+      toPreviewSrcList(closingEvidence),
+    ]);
+    setEntryPreviews(nextEntryPreviews);
+    setClosingPreviews(nextClosingPreviews);
+    setCameraRawData(Array.isArray(item?.payload?.cameraRawData) ? item.payload.cameraRawData : []);
     setEntryCapturedAt(item?.payload?.entryCapturedAt || item?.payload?.observationStartTime || '');
     setClosingCapturedAt(item?.payload?.closingCapturedAt || item?.payload?.observationEndTime || '');
 
     const sessionStart = item?.payload?.entryCapturedAt || item?.payload?.observationStartTime || '';
     setMonitoringSessionStartedAt(sessionStart);
-    setMonitoringSessionActive(Boolean(sessionStart) && closingEvidence.length === 0);
+    setMonitoringSessionActive(Boolean(sessionStart) && !item?.payload?.closingCapturedAt && !item?.payload?.observationEndTime && closingEvidence.length === 0);
 
-    setPcnNumberInput(item?.payload?.pcnNumber || buildDraftPcnNumber(item?.payload?.vrm || item.vrm));
-    setPcnAmountInput(item?.payload?.pcnAmount ? String(item.payload.pcnAmount) : '100');
     setPcnReasonInput(item?.payload?.pcnReason || 'No valid permit or payment found');
     setConvertError('');
 
-    setMessage(`Loaded ${item.lifecycle.label.toLowerCase()} ${item.vrm} for review.`);
+    const lifecycleLabel = (item?.lifecycle?.label || getBreachLifecycle(item).label || 'session').toLowerCase();
+    const itemVrm = item?.vrm || item?.payload?.vrm || selectedVrm || 'vehicle';
+    setMessage(`Loaded ${lifecycleLabel} ${itemVrm} for review.`);
   }
 
-  async function handleFinalize() {
+  async function handleFinalize({ openPcnDialogAfterSync = false } = {}) {
     setBusy(true);
     try {
       setLocation((await getCurrentLocation()) || location);
       await checkAuthorization(selectedVrm);
-      await queueOrSendCapture({ targetItemId: selectedTrackedId || '' });
+      await queueOrSendCapture({
+        targetItemId: selectedTrackedId || '',
+        openPcnDialogAfterSync,
+      });
     } finally {
       setBusy(false);
     }
+  }
+
+  function openPcnSubmissionDialog() {
+    setPcnReasonInput(selectedTracked?.payload?.pcnReason || 'No valid permit or payment found');
+    setConvertError('');
+    setPcnDialogOpen(true);
+  }
+
+  async function handleRestartSession() {
+    if (!selectedTracked) return;
+
+    const nowIso = new Date().toISOString();
+    const basePayload = stripCarcheckFromPayload(selectedTracked?.payload || {});
+    const restartPayload = {
+      ...basePayload,
+      vrm: normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm),
+      siteId: selectedTracked?.payload?.siteId || selectedSiteId,
+      siteName: selectedTracked?.payload?.siteName || selectedTracked?.siteName || selectedSite?.name || selectedSite?.displayName || selectedSiteId,
+      status: 'DRAFT_OPEN',
+      breachLifecycle: 'DRAFT_OPEN',
+      observationStartTime: nowIso,
+      observationEndTime: null,
+      entryCapturedAt: null,
+      closingCapturedAt: null,
+      actualMinutes: 0,
+      convertedToPcn: false,
+      convertedAt: null,
+      pcnId: '',
+      pcnNumber: '',
+      pcnAmount: null,
+      pcnReason: '',
+      breachId: '',
+      cameraRawData: [],
+      manualNote: [basePayload?.manualNote, 'Session restarted after closure'].filter(Boolean).join('\n'),
+    };
+
+    const restartItem = createQueueItem({ payload: restartPayload, files: [] });
+    restartItem.status = 'draft';
+
+    await saveQueueItem(restartItem);
+    await refreshQueue();
+
+    setSelectedTrackedId(restartItem.id);
+    setActiveTab('tracked');
+    setSelectedVrm(restartPayload.vrm || '');
+    setSelectedSiteId(restartPayload.siteId || selectedSiteId);
+    setEntryFiles([]);
+    setEntryPreviews([]);
+    setEntryCapturedAt('');
+    setClosingFiles([]);
+    setClosingPreviews([]);
+    setClosingCapturedAt('');
+    setCameraRawData([]);
+    setMonitoringSessionActive(false);
+    setMonitoringSessionStartedAt('');
+    setPcnDialogOpen(false);
+    setConvertError('');
+    setMessage(`Restarted session for ${restartPayload.vrm || selectedTracked.vrm}. Capture opening evidence to begin a new observation.`);
   }
 
   async function handlePrimaryCaptureAction() {
@@ -1297,7 +1879,7 @@ export default function DashboardPage() {
     setSelectedContraventionCode(code);
     if (next) {
       setSelectedReason(next.label);
-      setManualObservationMinutes(Number(next.defaultObservationMinutes || 10));
+      setManualObservationMinutes(Number(next.defaultObservationMinutes ?? 0));
     }
   }
 
@@ -1323,7 +1905,11 @@ export default function DashboardPage() {
           <button
             type="button"
             className="app-header-back"
-            onClick={() => setSelectedTrackedId('')}
+            onClick={() => {
+              setSelectedTrackedId('');
+              setDetailMessage('');
+              setMessage('');
+            }}
           >
             ‹ Back
           </button>
@@ -1336,6 +1922,8 @@ export default function DashboardPage() {
             <span className="app-header-vrm">{selectedTracked.vrm}</span>
           ) : currentScreen === 'queue' ? (
             <span>Sync Queue</span>
+          ) : currentScreen === 'camera' ? (
+            <span>Camera Raw Data</span>
           ) : (
             <span>Active Sessions</span>
           )}
@@ -1346,6 +1934,15 @@ export default function DashboardPage() {
             className={`conn-dot ${online ? 'conn-dot--online' : 'conn-dot--offline'}`}
             title={online ? 'Online' : 'Offline'}
           />
+          <button
+            type="button"
+            className="header-settings-btn"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Open settings"
+            title="Settings"
+          >
+            ⚙
+          </button>
           <button type="button" className="header-logout-btn" onClick={handleLogout}>
             Sign out
           </button>
@@ -1399,7 +1996,7 @@ export default function DashboardPage() {
           {/* Site selector */}
           {sites.length > 1 ? (
             <select
-              className="site-filter-select"
+              className="site-filter-select site-filter-select--home"
               value={selectedSiteId}
               onChange={e => { setSelectedSiteId(e.target.value); saveStoredSiteId(e.target.value); }}
             >
@@ -1422,10 +2019,7 @@ export default function DashboardPage() {
           ) : (
             <div className="sessions-list">
               {filteredBreaches.map(item => {
-                const timedOut =
-                  item.lifecycle.code === 'DRAFT_OPEN' &&
-                  !item.isOpen &&
-                  Boolean(item.observationEndTime);
+                const timedOut = item.lifecycle.code === 'DRAFT_OPEN' && item.isPastRequired;
                 const lcKey = item.lifecycle.code.toLowerCase().replace(/_/g, '-');
                 return (
                   <article
@@ -1455,14 +2049,23 @@ export default function DashboardPage() {
                     </div>
                     <div className="sc-right">
                       {item.isOpen ? (
-                        <div className="sc-timer">
-                          <span className="sc-timer-icon">⏱</span>
-                          <span className="sc-timer-val">{formatCountdown(item.observationEndTime)}</span>
-                        </div>
+                        <>
+                          <div className="sc-timer">
+                            <span className="sc-timer-icon">⏱</span>
+                            <span className="sc-timer-val">{formatElapsed(item.observationStartTime)}</span>
+                          </div>
+                          {item.isPastRequired ? (
+                            <div className="sc-cta-pill sc-cta-pill--overtime" style={{ marginTop: 6 }}>
+                              Overstay
+                            </div>
+                          ) : null}
+                        </>
                       ) : item.lifecycle.code === 'READY' ? (
                         <div className="sc-cta-pill sc-cta-pill--ready">Issue PCN →</div>
                       ) : timedOut ? (
                         <div className="sc-cta-pill sc-cta-pill--overtime">Capture closing →</div>
+                      ) : item.lifecycle.code === 'CONVERTED' ? (
+                        <div className="sc-cta-pill sc-cta-pill--closed">Closed</div>
                       ) : null}
                       <span className="sc-chevron" aria-hidden>›</span>
                     </div>
@@ -1495,32 +2098,110 @@ export default function DashboardPage() {
           </div>
 
           {/* Observation timer */}
-          {selectedTracked.observationEndTime ? (
+          {selectedTracked.observationStartTime ? (
             <div className={`obs-card ${selectedTracked.isOpen ? 'obs-card--active' : 'obs-card--done'}`}>
               <span className="obs-dot" />
               <div className="obs-text">
                 <div className="obs-label">
-                  {selectedTracked.isOpen ? 'Observation in progress' : 'Observation complete'}
+                  {selectedTracked.isOpen ? 'Observation active (count up)' : 'Exit captured'}
                 </div>
+                <div className="obs-value">Elapsed: {selectedTracked.elapsedMinutes || 0} min</div>
                 {selectedTracked.isOpen ? (
-                  <div className="obs-value">{selectedTracked.minutesRemaining} min remaining</div>
-                ) : (
-                  <div className="obs-value">
-                    {selectedTracked.observationStartTime
-                      ? new Date(selectedTracked.observationStartTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                      : ''}
-                    {' → '}
-                    {selectedTracked.observationEndTime
-                      ? new Date(selectedTracked.observationEndTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                      : ''}
+                  <div className="obs-value" style={{ color: 'var(--danger, #ff6b6b)', fontWeight: 700 }}>
+                    Capture closing evidence to stop timer.
                   </div>
-                )}
+                ) : null}
               </div>
-              {selectedTracked.isOpen ? (
-                <div className="obs-countdown">{formatCountdown(selectedTracked.observationEndTime)}</div>
-              ) : null}
+              <div className="obs-countdown">
+                {formatElapsed(selectedTracked.observationStartTime, selectedTracked.isOpen ? '' : selectedTracked.observationEndTime)}
+              </div>
             </div>
           ) : null}
+
+          {selectedTracked?.lifecycle?.code === 'CONVERTED' ? (
+            <div className="notice notice-info">
+              Session closed: converted to formal PCN. Observation timer is stopped.
+            </div>
+          ) : null}
+
+          {/* E-permit lookup */}
+          <div className="detail-section">
+            <div className="detail-section-label">E-permit lookup</div>
+            <button
+              type="button"
+              className="action-btn action-btn--secondary"
+              disabled={!selectedVrm || busy}
+              onClick={handlePermitLookup}
+            >
+              {busy ? 'Checking ePermit...' : 'Check ePermit'}
+            </button>
+
+            {selectedTrackedAuthorization ? (
+              <div className={`auth-result ${selectedTrackedAuthorization.hasAuthorization ? 'auth-result--ok' : 'auth-result--none'}`}>
+                <span className="auth-result-icon">{selectedTrackedAuthorization.hasAuthorization ? '✓' : '✗'}</span>
+                <div>
+                  <div className="auth-result-text">
+                    {selectedTrackedAuthorization.hasAuthorization
+                      ? `Authorised - ${selectedTrackedAuthorization.authorization?.type || 'permit found'}`
+                      : 'No active permit or payment found'}
+                  </div>
+                  {selectedTrackedAuthorization.authorization?.site ? (
+                    <div className="auth-result-sub">{selectedTrackedAuthorization.authorization.site}</div>
+                  ) : null}
+                </div>
+              </div>
+            ) : (
+              <p className="text-muted" style={{ fontSize: 13, margin: 0 }}>
+                No check run yet
+              </p>
+            )}
+
+          </div>
+
+          {/* Carcheck */}
+          <div className="detail-section">
+            <div className="detail-section-label">Carcheck</div>
+            <button
+              type="button"
+              className="action-btn action-btn--secondary"
+              disabled={!selectedVrm || vehicleLookupLoading || busy}
+              onClick={handleVehicleLookup}
+            >
+              {vehicleLookupLoading ? 'Checking carcheck...' : 'Run carcheck'}
+            </button>
+
+            {selectedTrackedVehicleDetails ? (
+              <button
+                type="button"
+                className="carcheck-open-btn"
+                  onClick={() => {
+                    const trackedVrm = selectedTracked?.payload?.vrm || selectedTracked?.vrm;
+                    if (!trackedVrm) return;
+                    setSelectedVrm(trackedVrm);
+                    setCarcheckDialogMessage(
+                      `Reopened saved carcheck${selectedTrackedVehicleDetails.make || selectedTrackedVehicleDetails.model ? `: ${[selectedTrackedVehicleDetails.make, selectedTrackedVehicleDetails.model].filter(Boolean).join(' ')}` : ''}.`
+                    );
+                    setCarcheckDialogOpen(true);
+                  }}
+              >
+                <span className="carcheck-open-btn-title">
+                  {selectedTracked?.payload?.savedVehicleSavedAt ? 'Saved carcheck result' : 'Carcheck result ready'}
+                </span>
+                <span className="carcheck-open-btn-sub">
+                  {[
+                    selectedTrackedVehicleDetails.make,
+                    selectedTrackedVehicleDetails.model,
+                    selectedTrackedVehicleDetails.color,
+                  ].filter(Boolean).join(' · ') || 'Open vehicle details'}
+                </span>
+                <span className="carcheck-open-btn-arrow">Open</span>
+              </button>
+            ) : (
+              <p className="text-muted" style={{ fontSize: 13, margin: 0 }}>
+                No carcheck run yet
+              </p>
+            )}
+          </div>
 
           {/* Evidence */}
           <div className="detail-section">
@@ -1568,123 +2249,68 @@ export default function DashboardPage() {
                   <button
                     type="button"
                     className="evidence-capture-btn"
-                    disabled={selectedTracked.isOpen && !monitoringSessionActive}
                     onClick={() => openCaptureDialog('closing')}
                   >
                     <span className="evidence-capture-icon">📷</span>
-                    <span>{selectedTracked.isOpen && !monitoringSessionActive ? 'Available when ready' : 'Capture closing'}</span>
+                    <span>Capture closing</span>
                   </button>
                 )}
               </div>
             </div>
           </div>
 
-          {/* Authorisation */}
-          <div className="detail-section">
-            <div className="detail-section-label">Authorisation</div>
-            {authorization ? (
-              <div className={`auth-result ${authorization.hasAuthorization ? 'auth-result--ok' : 'auth-result--none'}`}>
-                <span className="auth-result-icon">{authorization.hasAuthorization ? '✓' : '✗'}</span>
-                <div>
-                  <div className="auth-result-text">
-                    {authorization.hasAuthorization
-                      ? `Authorised — ${authorization.authorization?.type || 'permit found'}`
-                      : 'No active permit or payment found'}
-                  </div>
-                  {authorization.authorization?.site ? (
-                    <div className="auth-result-sub">{authorization.authorization.site}</div>
-                  ) : null}
-                </div>
-              </div>
-            ) : (
-              <p className="text-muted" style={{ fontSize: 13, margin: 0 }}>
-                No check run yet
-              </p>
-            )}
-
-            {selectedTrackedVehicleLookup ? (
-              <div className="vehicle-result">
-                <span className="vehicle-result-label">Vehicle</span>
-                <span>
-                  {[
-                    selectedTrackedVehicleLookup.make,
-                    selectedTrackedVehicleLookup.model,
-                    selectedTrackedVehicleLookup.colour,
-                    selectedTrackedVehicleLookup.yearOfManufacture,
-                  ].filter(Boolean).join(' · ')}
-                </span>
-              </div>
-            ) : null}
-          </div>
-
           {/* ─── Primary actions ─── */}
           <div className="detail-actions">
 
-            {/* Start monitoring timer */}
-            {!monitoringSessionActive && entryFiles.length > 0 && closingFiles.length === 0 && selectedTracked.isOpen ? (
-              <button type="button" className="action-btn action-btn--primary" onClick={startMonitoringSession}>
-                🕐 Start observation timer
-              </button>
-            ) : null}
-
             {/* Capture closing evidence */}
-            {entryFiles.length > 0 && closingFiles.length === 0 && (monitoringSessionActive || !selectedTracked.isOpen) ? (
+            {entryFiles.length > 0 && closingFiles.length === 0 ? (
               <button type="button" className="action-btn action-btn--primary" onClick={() => openCaptureDialog('closing')}>
                 📷 Capture closing evidence
               </button>
             ) : null}
-
-            {/* Check permit & vehicle */}
-            <button
-              type="button"
-              className="action-btn action-btn--secondary"
-              disabled={!selectedVrm || vehicleLookupLoading || busy}
-              onClick={handlePermitLookup}
-            >
-              {vehicleLookupLoading ? '🔍 Checking…' : '🔍 Check permit & vehicle'}
-            </button>
 
             {/* Issue PCN — only when both evidence types present */}
             {canFinalizeBreach ? (
               <button
                 type="button"
                 className="action-btn action-btn--issue"
-                onClick={handleFinalize}
+                onClick={openPcnSubmissionDialog}
                 disabled={busy}
               >
-                {busy ? '📋 Saving…' : '📋 Issue PCN (Queue for QC)'}
+                {busy ? '📋 Saving…' : '📋 Issue PCN'}
               </button>
             ) : null}
 
             {/* Convert to formal PCN if breach already in system */}
             {(selectedTracked?.lifecycle?.code === 'SUBMITTED' || selectedTracked?.payload?.breachId) ? (
-              <div className="pcn-convert-form">
-                <div className="detail-section-label">Convert to formal PCN</div>
-                <label>PCN number
-                  <input value={pcnNumberInput} onChange={e => setPcnNumberInput(e.target.value)} placeholder="Auto-generated" />
-                </label>
-                <label>Amount (£)
-                  <input value={pcnAmountInput} onChange={e => setPcnAmountInput(e.target.value)} type="number" min="0" />
-                </label>
-                <label>Reason
-                  <input value={pcnReasonInput} onChange={e => setPcnReasonInput(e.target.value)} />
-                </label>
-                {convertError ? <div className="notice notice-error">{convertError}</div> : null}
-                <button
-                  type="button"
-                  className="action-btn action-btn--issue"
-                  onClick={handleConvertToPcn}
-                  disabled={convertLoading}
-                >
-                  {convertLoading ? 'Converting…' : '📋 Convert to formal PCN'}
-                </button>
-              </div>
+              <button
+                type="button"
+                className="carcheck-open-btn"
+                onClick={() => {
+                  setConvertError('');
+                  setPcnDialogOpen(true);
+                }}
+              >
+                <span className="carcheck-open-btn-title">Convert to formal PCN</span>
+                <span className="carcheck-open-btn-sub">Open conversion dialog</span>
+                <span className="carcheck-open-btn-arrow">Open</span>
+              </button>
+            ) : null}
+
+            {['SUBMITTED', 'CONVERTED'].includes(selectedTracked?.lifecycle?.code) ? (
+              <button
+                type="button"
+                className="action-btn action-btn--secondary"
+                onClick={handleRestartSession}
+              >
+                Restart session
+              </button>
             ) : null}
 
           </div>
 
-          {message ? (
-            <div className="notice notice-info" style={{ marginTop: 12 }}>{message}</div>
+          {detailMessage ? (
+            <div className="notice notice-info" style={{ marginTop: 12 }}>{detailMessage}</div>
           ) : null}
 
           {/* Danger zone */}
@@ -1773,8 +2399,9 @@ export default function DashboardPage() {
                     <div className="sc-right">
                       <div className="sc-timer">
                         <span className="sc-timer-icon">⏱</span>
-                        <span className="sc-timer-val">{formatCountdown(timer.endsAt)}</span>
+                        <span className="sc-timer-val">{formatElapsed(timer.startsAt)}</span>
                       </div>
+                      {timer.requiredMinutes > 0 ? <div className="text-muted" style={{ fontSize: 11 }}>Baseline {timer.requiredMinutes}m</div> : null}
                     </div>
                   </article>
                 ))}
@@ -1785,12 +2412,142 @@ export default function DashboardPage() {
         </main>
       ) : null}
 
+      {/* ─── CAMERA RAW SCREEN ─────────────────────────────────────── */}
+      {currentScreen === 'camera' ? (
+        <main className="screen-body">
+          <div className="detail-section">
+            <div className="camera-raw-toolbar">
+              <div className="detail-section-label">Camera raw data feed</div>
+              {cameraRawFeed.length > 0 ? (
+                <div className="camera-raw-view-toggle" role="group" aria-label="Camera raw view mode">
+                  <button
+                    type="button"
+                    className={`camera-raw-view-btn ${cameraRawViewMode === 'grid' ? 'camera-raw-view-btn--active' : ''}`}
+                    onClick={() => setCameraRawViewMode('grid')}
+                  >
+                    Grid
+                  </button>
+                  <button
+                    type="button"
+                    className={`camera-raw-view-btn ${cameraRawViewMode === 'list' ? 'camera-raw-view-btn--active' : ''}`}
+                    onClick={() => setCameraRawViewMode('list')}
+                  >
+                    List
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            {cameraRawFeed.length > 0 ? (
+              <div className="camera-raw-filters" role="region" aria-label="Camera raw filters">
+                <input
+                  type="text"
+                  className="camera-raw-search"
+                  placeholder="Search by VRM"
+                  value={cameraRawVrmQuery}
+                  onChange={(event) => setCameraRawVrmQuery(event.target.value.toUpperCase())}
+                />
+                <select
+                  className="camera-raw-site-filter"
+                  value={cameraRawSiteFilter}
+                  onChange={(event) => setCameraRawSiteFilter(event.target.value)}
+                >
+                  <option value="all">All sites</option>
+                  {cameraRawSiteOptions.map((siteName) => (
+                    <option key={siteName} value={siteName}>
+                      {siteName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+            {filteredCameraRawFeed.length > 0 ? (
+              cameraRawViewMode === 'list' ? (
+                <div className="camera-raw-list">
+                  {filteredCameraRawFeed.map((item, index) => (
+                    <article className="camera-raw-list-item" key={item.recordKey || `camera-raw-${index}`}>
+                      {resolveCameraRawImageSrc(item) ? (
+                        <img
+                          src={resolveCameraRawImageSrc(item)}
+                          alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
+                          className="camera-raw-list-image"
+                        />
+                      ) : (
+                        <div className="camera-raw-list-placeholder">No image</div>
+                      )}
+                      <div className="camera-raw-meta camera-raw-meta--list">
+                        <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
+                          {item?.phase === 'closing' ? 'Closing' : 'Entry'}
+                        </span>
+                        <span className="camera-raw-filename">{item?.fileName || `Capture ${index + 1}`}</span>
+                        <span className="camera-raw-subline">
+                          {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
+                        </span>
+                        <span className="camera-raw-subline">
+                          {item?.capturedAt ? new Date(item.capturedAt).toLocaleString() : 'Capture time pending'}
+                        </span>
+                        <span className="camera-raw-subline">
+                          {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
+                        </span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className="camera-raw-grid">
+                  {filteredCameraRawFeed.map((item, index) => (
+                    <article className="camera-raw-card" key={item.recordKey || `camera-raw-${index}`}>
+                      {resolveCameraRawImageSrc(item) ? (
+                        <img
+                          src={resolveCameraRawImageSrc(item)}
+                          alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
+                          className="camera-raw-image"
+                        />
+                      ) : null}
+                      <div className="camera-raw-meta">
+                        <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
+                          {item?.phase === 'closing' ? 'Closing' : 'Entry'}
+                        </span>
+                        <span className="camera-raw-filename">{item?.fileName || `Capture ${index + 1}`}</span>
+                        <span className="camera-raw-subline">
+                          {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
+                        </span>
+                        <span className="camera-raw-subline">
+                          {item?.capturedAt ? new Date(item.capturedAt).toLocaleString() : 'Capture time pending'}
+                        </span>
+                        <span className="camera-raw-subline">
+                          {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
+                        </span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )
+            ) : (
+              <div className="empty-state" style={{ padding: '24px 12px' }}>
+                <div className="empty-icon">📷</div>
+                <p className="empty-title">No camera raw captures found</p>
+                <p className="empty-hint">
+                  {cameraRawFeed.length > 0
+                    ? 'Try a different VRM or site filter.'
+                    : 'Vehicle evidence captures will auto-populate here.'}
+                </p>
+              </div>
+            )}
+          </div>
+        </main>
+      ) : null}
+
       {/* ─── BOTTOM NAV ─────────────────────────────────────────────── */}
       <nav className="bottom-nav" aria-label="Main navigation">
         <button
           type="button"
           className={`bottom-nav-btn ${activeTab === 'tracked' ? 'bottom-nav-btn--active' : ''}`}
-          onClick={() => { setActiveTab('tracked'); setSelectedTrackedId(''); }}
+          onClick={() => {
+            setActiveTab('tracked');
+            setSelectedTrackedId('');
+            setDetailMessage('');
+            setMessage('');
+          }}
         >
           <span className="bottom-nav-icon" aria-hidden="true">🚗</span>
           <span className="bottom-nav-label">Sessions</span>
@@ -1811,7 +2568,106 @@ export default function DashboardPage() {
             <span className="bottom-nav-badge">{syncCandidates.length}</span>
           ) : null}
         </button>
+        <button
+          type="button"
+          className={`bottom-nav-btn ${activeTab === 'camera' ? 'bottom-nav-btn--active' : ''}`}
+          onClick={() => setActiveTab('camera')}
+        >
+          <span className="bottom-nav-icon" aria-hidden="true">📷</span>
+          <span className="bottom-nav-label">Camera</span>
+        </button>
       </nav>
+
+      {settingsOpen ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings"
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div className="carcheck-sheet" onClick={(event) => event.stopPropagation()}>
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-kicker">Preferences</div>
+                <div className="carcheck-sheet-title">Settings</div>
+              </div>
+              <button type="button" className="ghost-button stepper-close" onClick={() => setSettingsOpen(false)}>
+                ✕
+              </button>
+            </div>
+
+            <div className="carcheck-sheet-body settings-panel">
+              <div className="detail-section-label">Appearance</div>
+              <div className="settings-row">
+                <span className="settings-row-label">Theme</span>
+                <button
+                  type="button"
+                  className={`theme-toggle-btn ${darkMode ? 'theme-toggle-btn--dark' : 'theme-toggle-btn--light'}`}
+                  aria-pressed={darkMode}
+                  aria-label={`Switch to ${darkMode ? 'light' : 'dark'} mode`}
+                  onClick={() => setDarkMode((current) => !current)}
+                >
+                  <span className="theme-toggle-btn-track">
+                    <span className="theme-toggle-btn-thumb" />
+                  </span>
+                  <span className="theme-toggle-btn-label">{darkMode ? 'Dark' : 'Light'}</span>
+                </button>
+              </div>
+
+              <div className="detail-section-label" style={{ marginTop: 8 }}>Operations</div>
+              <div className="settings-row settings-row--stacked">
+                <span className="settings-row-label">Active site</span>
+                <select
+                  className="site-filter-select"
+                  value={selectedSiteId}
+                  onChange={(event) => {
+                    setSelectedSiteId(event.target.value);
+                    saveStoredSiteId(event.target.value);
+                  }}
+                >
+                  <option value="">Select site</option>
+                  {sites.map((site) => (
+                    <option key={site.id} value={site.id}>
+                      {site.displayName || site.name || site.id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <button
+                type="button"
+                className="action-btn action-btn--secondary"
+                onClick={syncQueue}
+                disabled={syncing}
+              >
+                {syncing ? 'Syncing...' : 'Sync now'}
+              </button>
+
+              <button
+                type="button"
+                className="action-btn action-btn--secondary"
+                onClick={() => {
+                  setActiveTab('tracked');
+                  setSelectedTrackedId('');
+                  setDetailMessage('');
+                  setSettingsOpen(false);
+                }}
+              >
+                Open sessions
+              </button>
+
+              <button
+                type="button"
+                className="action-btn action-btn--danger"
+                onClick={handleLogout}
+              >
+                Sign out
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {/* ─── FAB ────────────────────────────────────────────────────── */}
       {currentScreen !== 'detail' ? (
@@ -1835,6 +2691,230 @@ export default function DashboardPage() {
         contraventions={contraventions}
         selectedSiteId={selectedSiteId}
       />
+
+        {carcheckDialogOpen ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Carcheck result"
+            onClick={() => {
+              setCarcheckDialogOpen(false);
+              setCarcheckDialogMessage('');
+            }}
+        >
+          <div className="carcheck-sheet" onClick={(event) => event.stopPropagation()}>
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-kicker">Carcheck result</div>
+                <div className="carcheck-sheet-title">
+                    {selectedTrackedVehicleDetails?.make || vehicleLookup?.make || selectedTracked?.vrm || selectedVrm || 'Vehicle'} {selectedTrackedVehicleDetails?.model || vehicleLookup?.model || ''}
+                </div>
+              </div>
+                <button
+                  type="button"
+                  className="ghost-button stepper-close"
+                  onClick={() => {
+                    setCarcheckDialogOpen(false);
+                    setCarcheckDialogMessage('');
+                  }}
+                >
+                ✕
+              </button>
+            </div>
+
+            <div className="carcheck-sheet-body">
+                {carcheckDialogMessage ? <div className="notice notice-info">{carcheckDialogMessage}</div> : null}
+
+                {selectedTrackedVehicleDetails || vehicleLookup ? (
+                  <>
+                    {selectedTrackedVehicleImageUrl || vehicleLookup?.imageUrl || vehicleLookup?.imageUrls?.[0] ? (
+                      <img
+                        src={selectedTrackedVehicleImageUrl || vehicleLookup?.imageUrl || vehicleLookup?.imageUrls?.[0]}
+                        alt={`Vehicle ${selectedTrackedVehicleDetails?.vrm || vehicleLookup?.vrm || selectedTracked?.vrm || selectedVrm || 'lookup'}`}
+                        className="carcheck-sheet-image"
+                      />
+                    ) : null}
+
+                    <div className="carcheck-sheet-grid">
+                      <div className="carcheck-field">
+                        <span className="carcheck-field-label">VRM</span>
+                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.vrm || vehicleLookup?.vrm || selectedTracked?.vrm || selectedVrm || '—'}</span>
+                      </div>
+                      <div className="carcheck-field">
+                        <span className="carcheck-field-label">Colour</span>
+                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.color || vehicleLookup?.color || 'Unknown'}</span>
+                      </div>
+                      <div className="carcheck-field">
+                        <span className="carcheck-field-label">Year</span>
+                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.yearOfManufacture || vehicleLookup?.yearOfManufacture || 'Unknown'}</span>
+                      </div>
+                      <div className="carcheck-field">
+                        <span className="carcheck-field-label">Fuel</span>
+                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.fuelType || vehicleLookup?.fuelType || 'Unknown'}</span>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <p className="card-copy">No vehicle data returned for this lookup.</p>
+                )}
+
+              <div className="vehicle-result-actions">
+                <button
+                  type="button"
+                  className="action-btn action-btn--secondary"
+                  style={{ padding: '10px 14px', fontSize: 13 }}
+                  onClick={handleSaveCarcheckDetails}
+                >
+                  Save details
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pcnDialogOpen ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Convert to formal PCN"
+          onClick={() => setPcnDialogOpen(false)}
+        >
+          <div className="carcheck-sheet" onClick={(event) => event.stopPropagation()}>
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-kicker">PCN submission</div>
+                <div className="carcheck-sheet-title">Confirm and submit PCN</div>
+                <div className="pcn-sheet-subtitle">Review the case summary before final backend submission.</div>
+              </div>
+              <button type="button" className="ghost-button stepper-close" onClick={() => setPcnDialogOpen(false)}>
+                ✕
+              </button>
+            </div>
+
+            <div className="carcheck-sheet-body">
+              <div className="pcn-summary">
+                <div className="pcn-summary-title">Submission preview</div>
+                <div className="pcn-summary-grid">
+                  <div className="pcn-summary-row">
+                    <span className="pcn-summary-key">VRM</span>
+                    <span className="pcn-summary-value">{selectedTracked?.vrm || selectedTracked?.payload?.vrm || '—'}</span>
+                  </div>
+                  <div className="pcn-summary-row">
+                    <span className="pcn-summary-key">Contravention</span>
+                    <span className="pcn-summary-value">{selectedTracked?.reason || selectedTracked?.payload?.contraventionReason || '—'}</span>
+                  </div>
+                  <div className="pcn-summary-row">
+                    <span className="pcn-summary-key">Observation Time</span>
+                    <span className="pcn-summary-value">{pcnPreview.entryTime ? new Date(pcnPreview.entryTime).toLocaleString() : '—'}</span>
+                  </div>
+                  <div className="pcn-summary-row">
+                    <span className="pcn-summary-key">Contravention Time</span>
+                    <span className="pcn-summary-value">{pcnPreview.closingTime ? new Date(pcnPreview.closingTime).toLocaleString() : '—'}</span>
+                  </div>
+                  <div className="pcn-summary-row">
+                    <span className="pcn-summary-key">Observed Duration</span>
+                    <span className="pcn-summary-value">{pcnPreview.durationMinutes || 0} min</span>
+                  </div>
+                  <div className="pcn-summary-row">
+                    <span className="pcn-summary-key">E-permit</span>
+                    <span className={`pcn-summary-value pcn-status-pill ${pcnPreview.permitStatus === 'Matched' ? 'pcn-status-pill--ok' : 'pcn-status-pill--warn'}`}>
+                      {pcnPreview.permitStatus}
+                    </span>
+                  </div>
+                  <div className="pcn-summary-row">
+                    <span className="pcn-summary-key">Payment</span>
+                    <span className={`pcn-summary-value pcn-status-pill ${pcnPreview.paymentStatus === 'Matched' ? 'pcn-status-pill--ok' : 'pcn-status-pill--warn'}`}>
+                      {pcnPreview.paymentStatus}
+                    </span>
+                  </div>
+                </div>
+
+                {pcnPreview.observationCapture?.imageUrl || pcnPreview.contraventionCapture?.imageUrl ? (
+                  <div className="pcn-summary-images pcn-summary-images--timeline">
+                    <div className="pcn-summary-image-card">
+                      <div className="pcn-summary-image-label">Observation</div>
+                      <div className="pcn-summary-image-frame">
+                        {pcnPreview.observationCapture?.imageUrl ? (
+                          <img
+                            src={pcnPreview.observationCapture.imageUrl}
+                            alt="Observation capture"
+                            className="pcn-summary-image"
+                          />
+                        ) : (
+                          <div className="pcn-summary-image-empty">No observation image</div>
+                        )}
+                        <div className="pcn-summary-image-time pcn-summary-image-time--overlay">
+                          {pcnPreview.observationCapture?.capturedAt
+                            ? new Date(pcnPreview.observationCapture.capturedAt).toLocaleString()
+                            : 'Capture time unavailable'}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="pcn-summary-image-card">
+                      <div className="pcn-summary-image-label">Contravention</div>
+                      <div className="pcn-summary-image-frame">
+                        {pcnPreview.contraventionCapture?.imageUrl ? (
+                          <img
+                            src={pcnPreview.contraventionCapture.imageUrl}
+                            alt="Contravention capture"
+                            className="pcn-summary-image"
+                          />
+                        ) : (
+                          <div className="pcn-summary-image-empty">No contravention image</div>
+                        )}
+                        <div className="pcn-summary-image-time pcn-summary-image-time--overlay">
+                          {pcnPreview.contraventionCapture?.capturedAt
+                            ? new Date(pcnPreview.contraventionCapture.capturedAt).toLocaleString()
+                            : 'Capture time unavailable'}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-muted" style={{ fontSize: 12, margin: 0 }}>
+                    No preview images available yet.
+                  </p>
+                )}
+              </div>
+
+              <div className="pcn-convert-form">
+                <label className="pcn-form-label">Reason
+                  <textarea
+                    className="pcn-form-control pcn-form-control--textarea"
+                    value={pcnReasonInput}
+                    onChange={(event) => setPcnReasonInput(event.target.value)}
+                    rows={3}
+                  />
+                </label>
+                {convertError ? <div className="notice notice-error">{convertError}</div> : null}
+              </div>
+
+              <div className="vehicle-result-actions pcn-dialog-actions">
+                <button
+                  type="button"
+                  className="action-btn action-btn--secondary pcn-dialog-btn"
+                  onClick={() => setPcnDialogOpen(false)}
+                >
+                  Close
+                </button>
+                <button
+                  type="button"
+                  className="action-btn action-btn--issue pcn-dialog-btn"
+                  onClick={handleConvertToPcn}
+                  disabled={convertLoading}
+                >
+                  {convertLoading
+                    ? 'Submitting…'
+                    : (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {/* Hidden file inputs */}
       <input

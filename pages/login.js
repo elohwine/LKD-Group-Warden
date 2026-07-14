@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth } from '../lib/firebase-client.js';
 import { signInToWardenApp } from '../lib/auth';
-import { loadSession } from '../lib/session';
-import LoadingSpinner from '../components/LoadingSpinner.js';
+import { loadSession, restoreSession } from '../lib/session';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -13,31 +14,23 @@ export default function LoginPage() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    const session = loadSession();
-    if (session?.role && session?.token) {
-      router.replace('/dashboard');
-      return;
-    }
-    setReady(true);
+    let cancelled = false;
+
+    const unsubscribe = onAuthStateChanged(auth, async () => {
+      const session = loadSession() || await restoreSession();
+      if (cancelled) return;
+      if (session?.role) {
+        router.replace('/dashboard');
+        return;
+      }
+      setReady(true);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, [router]);
-
-  const passwordHint = useMemo(() => 'Use your warden account email and password.', []);
-
-  function formatLoginError(signinError) {
-    const code = String(signinError?.message || signinError?.code || '').toLowerCase();
-    if (code.includes('api_base_url_not_configured')) return 'Backend API is not configured. Contact administrator.';
-    if (code.includes('firebase_client_not_ready')) return 'Login configuration is missing. Contact support.';
-    if (code.includes('role_lookup_invalid_response')) return 'Login route misconfiguration detected. Contact support.';
-    if (code.includes('role_lookup_failed_')) return 'Failed to verify user role. Please try again.';
-    if (code.includes('insufficient_role')) return 'This account does not have warden access.';
-    if (code.includes('invalid_credentials') || code.includes('wrong_password') || code.includes('unauthorized')) {
-      return 'Invalid email or password.';
-    }
-    if (code.includes('email_and_password_required')) {
-      return 'Enter both email and password.';
-    }
-    return signinError?.message || 'Sign in failed. Check your credentials and try again.';
-  }
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -48,7 +41,12 @@ export default function LoginPage() {
       await signInToWardenApp(email.trim(), password);
       router.replace('/dashboard');
     } catch (signinError) {
-      setError(formatLoginError(signinError));
+      const code = String(signinError?.message || signinError?.code || '');
+      if (code.includes('insufficient_role')) {
+        setError('This account does not have warden access.');
+      } else {
+        setError('Sign in failed. Check your credentials and try again.');
+      }
     } finally {
       setLoading(false);
     }
@@ -59,36 +57,30 @@ export default function LoginPage() {
       <div className="auth-backdrop" />
       <div className="auth-grid auth-login-grid">
         <section className="auth-card auth-login-card">
-          <div className="auth-card-header">
-            <div className="auth-brand-lockup">
-              <img src="/brand/ldk-logo-bw.png" alt="LDK Group" className="auth-brand-logo" />
-            </div>
-            <p className="eyebrow">LDK Warden</p>
-            <h2>Sign in</h2>
-            <p>{passwordHint}</p>
+          <div className="auth-brand-row">
+            <img src="/brand/ldk-logo-color.png" alt="LDK Group" className="auth-brand-logo auth-brand-logo-login" />
           </div>
 
           {!ready ? (
             <div className="auth-loading">
-              <LoadingSpinner />
               <span>Preparing secure session…</span>
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="auth-form">
               <label>
                 Email
-                <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="name@ldkgroup.co.uk" required autoComplete="email" />
+                <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="warden@ldkgroup.co.uk" required />
               </label>
 
               <label>
                 Password
-                <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" placeholder="Enter your password" required autoComplete="current-password" />
+                <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" placeholder="••••••••" required />
               </label>
 
               {error ? <div className="notice notice-error">{error}</div> : null}
 
               <button type="submit" className="primary-button" disabled={loading}>
-                {loading ? 'Signing in…' : 'Continue'}
+                {loading ? 'Signing in…' : 'Enter Warden Mode'}
               </button>
             </form>
           )}

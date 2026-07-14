@@ -2,7 +2,7 @@
 
 # ========= CONFIGURATION =========
 APP_NAME="LDK Warden"
-PACKAGE_NAME="com.ldk.warden"
+PACKAGE_NAME="com.ldk.warden.mobile"
 SDK_VERSION="33.0.2"
 ANDROID_SDK_ROOT="$HOME/Android/Sdk"
 APP_PATH="android/app/build/outputs/apk/release/ldk-warden-v1.0-release-signed.apk"
@@ -124,7 +124,12 @@ print_step "Ensuring public Firebase client config..."
 ensure_public_firebase_config
 echo -e "${GREEN}Using NEXT_PUBLIC_FIREBASE_PROJECT_ID=${NEXT_PUBLIC_FIREBASE_PROJECT_ID}${NC}"
 
-print_step "Building PWA (Next build + export to out/)..."
+if [ -n "${CAPACITOR_SERVER_URL:-}" ]; then
+    echo -e "${YELLOW}Ignoring CAPACITOR_SERVER_URL for Warden APK bundled mode: ${CAPACITOR_SERVER_URL}${NC}"
+fi
+unset CAPACITOR_SERVER_URL
+
+print_step "Bundled mode enforced. Building PWA (Next build + export to out/)..."
 npm run build:web || { echo "${RED}PWA build/export failed${NC}"; exit 1; }
 
 # ========= STEP 4 — GENERATE NATIVE ASSETS & SYNC =========

@@ -7,8 +7,11 @@
     "dev": "next dev",
     "build": "next build",
     "build:web": "next build && next export",
-    "cap:copy": "npm run build:web && npx cap copy android",
-    "cap:sync": "npm run build:web && npx cap sync android",
+    "build:apk:sign": "npm run cap:sync && cd android && ./gradlew clean assembleRelease",
+    "cap:copy": "npx cap copy android",
+    "cap:sync": "npx cap sync android",
+    "cap:copy:static": "npm run build:web && npx cap copy android",
+    "cap:sync:static": "npm run build:web && npx cap sync android",
     "cap:open": "npx cap open android",
     "start": "next start"
   },

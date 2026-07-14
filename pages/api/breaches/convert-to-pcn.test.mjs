@@ -40,8 +40,6 @@ const mockRequest = (overrides = {}) => {
     },
     body: {
       breachId: 'breach-123',
-      pcnNumber: 'PCN-AB12-0001',
-      amount: 100,
       reason: 'No valid permit or payment found',
       notes: 'Escalated by warden',
       vrm: 'AB12CDE',
@@ -136,14 +134,15 @@ describe('POST /api/breaches/convert-to-pcn', () => {
     expect(res.json).toHaveBeenCalledWith({ error: 'Breach ID is required' });
   });
 
-  it('returns 400 when amount is invalid', async () => {
+  it('accepts conversion when amount is missing or invalid by applying backend default', async () => {
     const req = mockRequest({ body: { amount: 0 } });
     const res = mockResponse();
 
     await handler(req, res);
 
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({ error: 'A valid PCN amount is required' });
+    expect(res.status).toHaveBeenCalledWith(200);
+    const payload = res.json.mock.calls[0][0];
+    expect(payload.amount).toBe(100);
   });
 
   it('writes to pcns and pcnqa and updates breach on success', async () => {
@@ -156,13 +155,13 @@ describe('POST /api/breaches/convert-to-pcn', () => {
     expect(mockPcnQaCollection.add).toHaveBeenCalledTimes(1);
     expect(mockBreachRef.set).toHaveBeenCalledTimes(1);
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({
-      success: true,
-      message: 'Breach converted to PCN successfully',
-      pcnId: 'pcn-123',
-      pcnNumber: 'PCN-AB12-0001',
-      sameDayWarnings: null,
-    });
+    const payload = res.json.mock.calls[0][0];
+    expect(payload.success).toBe(true);
+    expect(payload.message).toBe('Breach converted to PCN successfully');
+    expect(payload.pcnId).toBe('pcn-123');
+    expect(payload.pcnNumber).toMatch(/^PCN-/);
+    expect(payload.amount).toBe(100);
+    expect(payload.sameDayWarnings).toBeNull();
   });
 
   it('returns 500 when conversion write fails', async () => {

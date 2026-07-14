@@ -9,14 +9,16 @@ if (backendBase) {
   }
 }
 
+const server = {
+  allowNavigation
+};
+
 module.exports = {
-  appId: 'com.ldk.warden',
+  appId: 'com.ldk.warden.mobile',
   appName: 'LKD Group Warden',
   webDir: 'out',
   bundledWebRuntime: false,
-  server: {
-    allowNavigation
-  },
+  server,
   plugins: {
     CapacitorHttp: {
       enabled: true

@@ -27,7 +27,6 @@ export default async function handler(req, res) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
     const {
       breachId,
-      pcnNumber,
       amount,
       reason,
       notes,
@@ -62,15 +61,16 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'VRM is required to convert breach to PCN' });
     }
 
-    const amountValue = Number(amount);
-    if (!Number.isFinite(amountValue) || amountValue <= 0) {
-      return res.status(400).json({ error: 'A valid PCN amount is required' });
-    }
+    const requestedAmount = Number(amount);
+    const breachAmount = Number(breachData?.pcnAmount || breachData?.amount || 100);
+    const amountValue = Number.isFinite(requestedAmount) && requestedAmount > 0
+      ? requestedAmount
+      : (Number.isFinite(breachAmount) && breachAmount > 0 ? breachAmount : 100);
 
     const now = new Date();
     const eventTime = timestamp ? new Date(timestamp) : now;
     const safeEventTime = Number.isNaN(eventTime.getTime()) ? now : eventTime;
-    const finalPcnNumber = (pcnNumber || '').trim() || buildPcnNumber(vrmValue);
+    const finalPcnNumber = buildPcnNumber(vrmValue);
     const mergedImages = [...(Array.isArray(images) ? images : []), ...(Array.isArray(imageUrls) ? imageUrls : [])]
       .filter((value) => typeof value === 'string' && value.length > 0)
       .filter((value, index, all) => all.indexOf(value) === index);
@@ -83,8 +83,8 @@ export default async function handler(req, res) {
       reason: reason || breachData?.contraventionReason || 'No valid permit or payment found',
       notes: notes || '',
       source: 'WARDEN',
-      status: 'PENDING_QA',
-      qaStatus: 'PENDING_REVIEW',
+      status: 'PENDING',
+      qaStatus: 'PENDING',
       siteId: siteId || breachData?.siteId || '',
       siteName: siteName || breachData?.siteName || '',
       evidence: evidence || breachData?.evidence || null,
@@ -106,7 +106,7 @@ export default async function handler(req, res) {
       pcnId: pcnRef.id,
       pcnNumber: finalPcnNumber,
       breachId,
-      status: 'PENDING_REVIEW',
+      status: 'PENDING',
       source: 'WARDEN',
       queue: 'PCN_ESCALATION',
       createdAt: Timestamp.fromDate(now),
@@ -132,6 +132,7 @@ export default async function handler(req, res) {
       message: 'Breach converted to PCN successfully',
       pcnId: pcnRef.id,
       pcnNumber: finalPcnNumber,
+      amount: amountValue,
       sameDayWarnings: null,
     });
   } catch (error) {
