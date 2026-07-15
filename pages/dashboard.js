@@ -807,6 +807,8 @@ export default function DashboardPage() {
   const [carcheckDialogOpen, setCarcheckDialogOpen] = useState(false);
   const [pcnDialogOpen, setPcnDialogOpen] = useState(false);
   const [stepperOpen, setStepperOpen] = useState(false);
+  const [captureStepperOpen, setCaptureStepperOpen] = useState(false);
+  const [captureStepperPhase, setCaptureStepperPhase] = useState('entry');
   const [breachStatusFilter, setBreachStatusFilter] = useState('all');
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
@@ -1336,7 +1338,14 @@ export default function DashboardPage() {
   }
 
   function openCaptureDialog(phase) {
-    capturePhaseRef.current = phase;
+    const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+    if (selectedTrackedId) {
+      setCaptureStepperPhase(normalizedPhase);
+      setCaptureStepperOpen(true);
+      return;
+    }
+
+    capturePhaseRef.current = normalizedPhase;
     fileInputRef.current?.click();
   }
 
@@ -1627,6 +1636,231 @@ export default function DashboardPage() {
     }
 
     event.target.value = '';
+  }
+
+  async function handleStepperCaptureComplete({ files = [], phase = 'entry' } = {}) {
+    const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+    const rawFiles = Array.isArray(files) ? files : [];
+    if (rawFiles.length === 0) {
+      setCaptureStepperOpen(false);
+      return;
+    }
+
+    const fallbackCapturedAt = new Date().toISOString();
+    const nextFiles = rawFiles.map((file) => {
+      const capturedAt = normalizeCapturedAt(file?.capturedAt) || fallbackCapturedAt;
+      file.capturedAt = capturedAt;
+      return file;
+    });
+    const capturedAt = normalizeCapturedAt(nextFiles[0]?.capturedAt) || fallbackCapturedAt;
+    const nextPreviews = await toPreviewSrcList(nextFiles);
+    let nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase: normalizedPhase, capturedAt });
+
+    let plateScanResult = null;
+    if (nextFiles[0]?.detectedPlateText || nextFiles[0]?.detectedPlateCutoffImage) {
+      plateScanResult = {
+        plateText: normalizeVrm(nextFiles[0]?.detectedPlateText || ''),
+        confidence: Number(nextFiles[0]?.detectedPlateConfidence || 0),
+        cutoffImage: nextFiles[0]?.detectedPlateCutoffImage || '',
+      };
+    } else if (nextFiles.length > 0) {
+      plateScanResult = await scanPlateFromImage(nextFiles[0]);
+    }
+
+    const hasCutoffFile = nextFiles.some((file) => String(file?.name || '').toLowerCase().includes('plate_cutoff_'));
+    if (!hasCutoffFile && plateScanResult?.cutoffImage) {
+      const cutoffFile = dataUrlToFile(
+        plateScanResult.cutoffImage,
+        `plate_cutoff_${normalizedPhase}_${Date.now()}.jpg`
+      );
+      if (cutoffFile) {
+        cutoffFile.capturedAt = capturedAt;
+        nextFiles.push(cutoffFile);
+        nextPreviews.push(plateScanResult.cutoffImage);
+      }
+    }
+
+    if (nextFiles[0]) {
+      nextFiles[0].detectedPlateText = normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || '');
+      nextFiles[0].detectedPlateCutoffImage = plateScanResult?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || '';
+      nextFiles[0].detectedPlateConfidence = Number(plateScanResult?.confidence || nextFiles[0]?.detectedPlateConfidence || 0);
+      nextFiles[0].detectedVehicleImage = nextPreviews[0] || '';
+    }
+
+    nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase: normalizedPhase, capturedAt });
+    if ((plateScanResult?.plateText || nextFiles[0]?.detectedPlateText) && nextCameraRawRecords[0]) {
+      nextCameraRawRecords[0] = {
+        ...nextCameraRawRecords[0],
+        plateText: normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || ''),
+        plateConfidence: Number(plateScanResult?.confidence || nextFiles[0]?.detectedPlateConfidence || 0),
+        plateCutoffImage: plateScanResult?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || '',
+      };
+    }
+
+    const nextPhaseFiles = nextFiles.map((file) => ({
+      name: file.name,
+      type: file.type,
+      blob: file,
+      phase: normalizedPhase,
+    }));
+
+    if (normalizedPhase === 'entry') {
+      const mergedEntryFiles = [...entryFiles, ...nextFiles];
+      const mergedEntryPreviews = [...entryPreviews, ...nextPreviews];
+      setEntryFiles(mergedEntryFiles);
+      setEntryPreviews(mergedEntryPreviews);
+      setMainEntryImageIndex((current) => (
+        mergedEntryFiles.length > 0
+          ? Math.min(current, mergedEntryFiles.length - 1)
+          : 0
+      ));
+      setEntryCapturedAt((current) => current || capturedAt);
+      setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'entry'));
+      if (plateScanResult?.plateText || nextFiles[0]?.detectedPlateText) {
+        setSelectedVrm(normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || ''));
+      }
+
+      if (selectedTrackedId) {
+        const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+        const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
+        const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
+        const preservedFiles = existingFiles.filter((file) => file?.phase !== 'entry');
+        const existingEntryFiles = existingFiles.filter((file) => file?.phase === 'entry');
+        const mergedTrackedEntryFiles = [...existingEntryFiles, ...nextPhaseFiles];
+        const selectedMainEntryIndex = Number.isFinite(Number(selectedPayload?.mainEntryImageIndex))
+          ? Number(selectedPayload.mainEntryImageIndex)
+          : mainEntryImageIndex;
+
+        const entryPhaseEvidence = buildPhaseSessionEvidence({
+          phase: 'entry',
+          capturedAt,
+          detection: {
+            plateText: normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || selectedPayload?.detectedEntryPlateText || ''),
+            plateCutoffImage: plateScanResult?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || selectedPayload?.detectedEntryPlateCutoffImage || '',
+            plateConfidence: Number(plateScanResult?.confidence || nextFiles[0]?.detectedPlateConfidence || selectedPayload?.detectedEntryPlateConfidence || 0),
+            vehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedEntryVehicleImage || selectedPayload?.startVehicleImage || '',
+          },
+        });
+
+        await updateQueueItem(selectedTrackedId, {
+          payload: {
+            ...selectedPayload,
+            observationStartTime: capturedAt,
+            observationEndTime: null,
+            entryCapturedAt: capturedAt,
+            closingCapturedAt: null,
+            breachLifecycle: 'DRAFT_OPEN',
+            mainEntryImageIndex: Math.min(
+              Math.max(0, selectedMainEntryIndex),
+              Math.max(0, mergedTrackedEntryFiles.length - 1)
+            ),
+            detectedEntryPlateText: normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || selectedPayload?.detectedEntryPlateText || ''),
+            detectedEntryPlateCutoffImage: plateScanResult?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || selectedPayload?.detectedEntryPlateCutoffImage || '',
+            detectedEntryPlateConfidence: Number(plateScanResult?.confidence || nextFiles[0]?.detectedPlateConfidence || selectedPayload?.detectedEntryPlateConfidence || 0),
+            detectedEntryVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedEntryVehicleImage || '',
+            startVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.startVehicleImage || '',
+            sessionEvidence: mergeSessionEvidence(selectedPayload?.sessionEvidence, entryPhaseEvidence),
+            cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'entry'),
+          },
+          files: [...preservedFiles, ...mergedTrackedEntryFiles],
+          updatedAt: new Date().toISOString(),
+        });
+        await refreshQueue();
+      }
+
+      setMessage(`Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`);
+    } else {
+      const mergedClosingFiles = [...closingFiles, ...nextFiles];
+      const mergedClosingPreviews = [...closingPreviews, ...nextPreviews];
+      setClosingFiles(mergedClosingFiles);
+      setClosingPreviews(mergedClosingPreviews);
+      setMainClosingImageIndex((current) => (
+        mergedClosingFiles.length > 0
+          ? Math.min(current, mergedClosingFiles.length - 1)
+          : 0
+      ));
+      setClosingCapturedAt(capturedAt);
+      setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'closing'));
+      setMonitoringSessionActive(false);
+      setMonitoringSessionStartedAt('');
+      if (plateScanResult?.plateText || nextFiles[0]?.detectedPlateText) {
+        setSelectedVrm(normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || ''));
+      }
+
+      if (selectedTrackedId) {
+        const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+        const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
+        const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
+        const preservedFiles = existingFiles.filter((file) => file?.phase !== 'closing');
+        const existingClosingFiles = existingFiles.filter((file) => file?.phase === 'closing');
+        const mergedTrackedClosingFiles = [...existingClosingFiles, ...nextPhaseFiles];
+        const selectedMainClosingIndex = Number.isFinite(Number(selectedPayload?.mainClosingImageIndex))
+          ? Number(selectedPayload.mainClosingImageIndex)
+          : mainClosingImageIndex;
+        const entryTime =
+          entryCapturedAt ||
+          selectedPayload.entryCapturedAt ||
+          selectedPayload.observationStartTime ||
+          monitoringSessionStartedAt ||
+          capturedAt;
+        const computedMinutes = diffMinutes(entryTime, capturedAt);
+
+        const closingPhaseEvidence = buildPhaseSessionEvidence({
+          phase: 'closing',
+          capturedAt,
+          detection: {
+            plateText: normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || selectedPayload?.detectedClosingPlateText || ''),
+            plateCutoffImage: plateScanResult?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || selectedPayload?.detectedClosingPlateCutoffImage || '',
+            plateConfidence: Number(plateScanResult?.confidence || nextFiles[0]?.detectedPlateConfidence || selectedPayload?.detectedClosingPlateConfidence || 0),
+            vehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedClosingVehicleImage || '',
+          },
+        });
+
+        await updateQueueItem(selectedTrackedId, {
+          payload: {
+            ...selectedPayload,
+            observationStartTime: entryTime,
+            observationEndTime: capturedAt,
+            entryCapturedAt: entryTime,
+            closingCapturedAt: capturedAt,
+            actualMinutes: computedMinutes,
+            mainClosingImageIndex: Math.min(
+              Math.max(0, selectedMainClosingIndex),
+              Math.max(0, mergedTrackedClosingFiles.length - 1)
+            ),
+            breachLifecycle: computedMinutes > 0 ? 'READY_FOR_SYNC' : selectedPayload.breachLifecycle,
+            detectedClosingPlateText: normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || selectedPayload?.detectedClosingPlateText || ''),
+            detectedClosingPlateCutoffImage: plateScanResult?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || selectedPayload?.detectedClosingPlateCutoffImage || '',
+            detectedClosingPlateConfidence: Number(plateScanResult?.confidence || nextFiles[0]?.detectedPlateConfidence || selectedPayload?.detectedClosingPlateConfidence || 0),
+            detectedClosingVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedClosingVehicleImage || '',
+            sessionEvidence: mergeSessionEvidence(selectedPayload?.sessionEvidence, closingPhaseEvidence),
+            cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'closing'),
+          },
+          files: [...preservedFiles, ...mergedTrackedClosingFiles],
+          updatedAt: new Date().toISOString(),
+        });
+        await refreshQueue();
+      }
+
+      const capturedMessage = plateScanResult?.plateText || nextFiles[0]?.detectedPlateText
+        ? `Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}. Plate detected: ${normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || '')}.`
+        : `Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`;
+      const shouldAutoSubmit = autoSubmitOnClosingCapture && Boolean(selectedTrackedId);
+
+      if (shouldAutoSubmit && !online) {
+        setMessage(`${capturedMessage} Auto-submit is enabled but you are offline; review and submit manually when online.`);
+      } else if (shouldAutoSubmit) {
+        setMessage(`${capturedMessage} Auto-submitting evidence package...`);
+        await queueOrSendCapture({
+          targetItemId: selectedTrackedId,
+          openPcnDialogAfterSync: false,
+        });
+      } else {
+        setMessage(`${capturedMessage} Review and submit manually when ready.`);
+      }
+    }
+
+    setCaptureStepperOpen(false);
   }
 
   async function uploadEvidenceFiles(evidenceFiles, manualVrm) {
@@ -3723,6 +3957,18 @@ export default function DashboardPage() {
         contraventions={contraventions}
         selectedSiteId={selectedSiteId}
         onPlateScan={scanPlateFromImage}
+      />
+
+      <BreachStepper
+        open={captureStepperOpen}
+        onClose={() => setCaptureStepperOpen(false)}
+        onCaptureComplete={handleStepperCaptureComplete}
+        sites={sites}
+        contraventions={contraventions}
+        selectedSiteId={selectedSiteId}
+        onPlateScan={scanPlateFromImage}
+        mode="capture-only"
+        capturePhase={captureStepperPhase}
       />
 
         {carcheckDialogOpen ? (

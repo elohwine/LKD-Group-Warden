@@ -286,11 +286,17 @@ export default function BreachStepper({
     open,
     onClose,
     onComplete,
+    onCaptureComplete,
     sites = [],
     contraventions = [],
     selectedSiteId: defaultSiteId = '',
     onPlateScan,
+    mode = 'full',
+    capturePhase = 'entry',
 }) {
+    const captureOnly = mode === 'capture-only';
+    const evidencePhase = capturePhase === 'closing' ? 'closing' : 'entry';
+    const evidenceLabel = evidencePhase === 'closing' ? 'Closing' : 'Entry';
     const [step, setStep] = useState(0);
     const [vrm, setVrm] = useState('');
     const [contraventionCode, setContraventionCode] = useState(contraventions[0]?.code || '');
@@ -489,7 +495,7 @@ export default function BreachStepper({
         const stampedCaptured = await Promise.all(
             captured.map(async (file) => {
                 const capturedAt = await resolveCameraCaptureTimestamp(file, fallbackCapturedAt);
-                const stamped = await stampEvidenceImage(file, { capturedAt, phase: 'entry' });
+                const stamped = await stampEvidenceImage(file, { capturedAt, phase: evidencePhase });
                 stamped.capturedAt = normalizeCapturedAt(capturedAt) || fallbackCapturedAt;
                 return stamped;
             })
@@ -540,7 +546,7 @@ export default function BreachStepper({
         }
 
         if (result?.cutoffImage) {
-            const cutoffFile = dataUrlToFile(result.cutoffImage, `plate_cutoff_entry_${Date.now()}.jpg`);
+            const cutoffFile = dataUrlToFile(result.cutoffImage, `plate_cutoff_${evidencePhase}_${Date.now()}.jpg`);
             if (cutoffFile) {
                 nextFiles.push(cutoffFile);
                 nextPreviews.push(result.cutoffImage);
@@ -819,6 +825,20 @@ export default function BreachStepper({
         reset();
     }
 
+    function handleCaptureOnlyComplete() {
+        if (!files.length) return;
+        onCaptureComplete?.({
+            phase: evidencePhase,
+            files,
+            previews,
+            scan: {
+                plateText: normalizeVrm(scanState.text),
+                confidence: Number(scanState.confidence || 0),
+            },
+        });
+        reset();
+    }
+
     function openCamera() {
         fileInputRef.current?.click();
     }
@@ -976,9 +996,9 @@ export default function BreachStepper({
                 {/* Header */}
                 <div className="stepper-header">
                     <button type="button" className="ghost-button stepper-close" onClick={handleClose}>✕</button>
-                    <h3 className="stepper-title">Draft Parking Charge</h3>
+                    <h3 className="stepper-title">{captureOnly ? `${evidenceLabel} evidence capture` : 'Draft Parking Charge'}</h3>
                     <div className="stepper-dots">
-                        {[0, 1, 2].map((i) => (
+                        {(captureOnly ? [0] : [0, 1, 2]).map((i) => (
                             <span
                                 key={i}
                                 className={`stepper-dot ${step === i ? 'stepper-dot-active' : ''} ${step > i ? 'stepper-dot-done' : ''}`}
@@ -1001,7 +1021,7 @@ export default function BreachStepper({
                 {/* Step 0: Entry evidence capture first */}
                 {step === 0 ? (
                     <div className="stepper-step">
-                        <p className="stepper-step-label">Step 1 — Capture full evidence image</p>
+                        <p className="stepper-step-label">Step 1 — Capture full {evidenceLabel.toLowerCase()} evidence image</p>
                         <div className="stepper-fixed-site">
                             <span className="stepper-fixed-site-label">Patrol site</span>
                             <strong className="stepper-fixed-site-value">
@@ -1042,9 +1062,9 @@ export default function BreachStepper({
                                     <button
                                         type="button"
                                         className="primary-button"
-                                        onClick={() => setStep(1)}
+                                        onClick={captureOnly ? handleCaptureOnlyComplete : () => setStep(1)}
                                     >
-                                        Next — Vehicle details →
+                                        {captureOnly ? `Use ${evidenceLabel.toLowerCase()} evidence` : 'Next — Vehicle details →'}
                                     </button>
                                 ) : null}
                             </div>
@@ -1053,7 +1073,7 @@ export default function BreachStepper({
                 ) : null}
 
                 {/* Step 1: Vehicle identification + contravention */}
-                {step === 1 ? (
+                {!captureOnly && step === 1 ? (
                     <div className="stepper-step">
                         <p className="stepper-step-label">Step 2 — Vehicle details</p>
                         <div className="stepper-vrm-banner">
@@ -1106,7 +1126,7 @@ export default function BreachStepper({
                 ) : null}
 
                 {/* Step 2: Confirm */}
-                {step === 2 ? (
+                {!captureOnly && step === 2 ? (
                     <div className="stepper-step">
                         <p className="stepper-step-label">Step 3 — Confirm Parking Charge</p>
 
