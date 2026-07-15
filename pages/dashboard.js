@@ -441,6 +441,32 @@ function getPhaseDetectionFromCameraRaw(records, phase, fallbackVrm = '') {
   };
 }
 
+function buildPhaseSessionEvidence({ phase, detection, capturedAt = '' } = {}) {
+  const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+  return {
+    phase: normalizedPhase,
+    capturedAt: normalizeCapturedAt(capturedAt) || '',
+    plateText: normalizeVrm(detection?.plateText || ''),
+    plateCutoffImage: String(detection?.plateCutoffImage || '').trim(),
+    plateConfidence: Number(detection?.plateConfidence || 0),
+    vehicleImage: String(detection?.vehicleImage || '').trim(),
+  };
+}
+
+function mergeSessionEvidence(existingEvidence, phaseEvidence) {
+  const existing = existingEvidence && typeof existingEvidence === 'object'
+    ? existingEvidence
+    : {};
+  const phase = phaseEvidence?.phase === 'closing' ? 'closing' : 'entry';
+  return {
+    ...existing,
+    [phase]: {
+      ...(existing[phase] || {}),
+      ...phaseEvidence,
+    },
+  };
+}
+
 function reorderEvidenceByMainIndex(files, mainIndex) {
   const safeFiles = Array.isArray(files) ? files : [];
   if (safeFiles.length <= 1) return safeFiles;
@@ -1460,6 +1486,17 @@ export default function DashboardPage() {
             ? Number(selectedPayload.mainEntryImageIndex)
             : mainEntryImageIndex;
 
+          const entryPhaseEvidence = buildPhaseSessionEvidence({
+            phase: 'entry',
+            capturedAt,
+            detection: {
+              plateText: plateScanResult?.plateText || selectedPayload?.detectedEntryPlateText || '',
+              plateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedEntryPlateCutoffImage || '',
+              plateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedEntryPlateConfidence || 0),
+              vehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedEntryVehicleImage || selectedPayload?.startVehicleImage || '',
+            },
+          });
+
           await updateQueueItem(selectedTrackedId, {
             payload: {
               ...selectedPayload,
@@ -1477,6 +1514,7 @@ export default function DashboardPage() {
               detectedEntryPlateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedEntryPlateConfidence || 0),
               detectedEntryVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedEntryVehicleImage || '',
               startVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.startVehicleImage || '',
+              sessionEvidence: mergeSessionEvidence(selectedPayload?.sessionEvidence, entryPhaseEvidence),
               cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'entry'),
             },
             files: [...preservedFiles, ...mergedTrackedEntryFiles],
@@ -1524,6 +1562,17 @@ export default function DashboardPage() {
             capturedAt;
           const computedMinutes = diffMinutes(entryTime, capturedAt);
 
+          const closingPhaseEvidence = buildPhaseSessionEvidence({
+            phase: 'closing',
+            capturedAt,
+            detection: {
+              plateText: plateScanResult?.plateText || selectedPayload?.detectedClosingPlateText || '',
+              plateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedClosingPlateCutoffImage || '',
+              plateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedClosingPlateConfidence || 0),
+              vehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedClosingVehicleImage || '',
+            },
+          });
+
           await updateQueueItem(selectedTrackedId, {
             payload: {
               ...selectedPayload,
@@ -1541,6 +1590,7 @@ export default function DashboardPage() {
               detectedClosingPlateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedClosingPlateCutoffImage || '',
               detectedClosingPlateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedClosingPlateConfidence || 0),
               detectedClosingVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedClosingVehicleImage || '',
+              sessionEvidence: mergeSessionEvidence(selectedPayload?.sessionEvidence, closingPhaseEvidence),
               cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'closing'),
             },
             files: [...preservedFiles, ...mergedTrackedClosingFiles],
@@ -1842,6 +1892,10 @@ export default function DashboardPage() {
     const closingTime = closingCapturedAt || now.toISOString();
     const entryDetection = getPhaseDetectionFromCameraRaw(cameraRawData, 'entry', selectedVrm);
     const closingDetection = getPhaseDetectionFromCameraRaw(cameraRawData, 'closing');
+    const sessionEvidence = {
+      entry: buildPhaseSessionEvidence({ phase: 'entry', detection: entryDetection, capturedAt: entryTime }),
+      closing: buildPhaseSessionEvidence({ phase: 'closing', detection: closingDetection, capturedAt: closingTime }),
+    };
     const elapsedMinutes = diffMinutes(entryTime, closingTime);
 
     if (!elapsedMinutes) {
@@ -1881,6 +1935,7 @@ export default function DashboardPage() {
       detectedClosingPlateCutoffImage: closingDetection.plateCutoffImage,
       detectedClosingPlateConfidence: closingDetection.plateConfidence,
       detectedClosingVehicleImage: closingDetection.vehicleImage,
+      sessionEvidence,
       cameraRawData,
     });
 
@@ -1954,6 +2009,11 @@ export default function DashboardPage() {
     const nowIso = new Date().toISOString();
     const entryTime = entryCapturedAt || nowIso;
     const entryDetection = getPhaseDetectionFromCameraRaw(cameraRawData, 'entry', selectedVrm);
+    const entrySessionEvidence = buildPhaseSessionEvidence({
+      phase: 'entry',
+      detection: entryDetection,
+      capturedAt: entryTime,
+    });
     const draftPayload = stripCarcheckFromPayload({
       vrm: normalizeVrm(selectedVrm),
       siteId: selectedSiteId,
@@ -1979,6 +2039,7 @@ export default function DashboardPage() {
       detectedEntryPlateConfidence: entryDetection.plateConfidence,
       detectedEntryVehicleImage: entryDetection.vehicleImage,
       startVehicleImage: entryDetection.vehicleImage,
+      sessionEvidence: mergeSessionEvidence(selectedTracked?.payload?.sessionEvidence, entrySessionEvidence),
       cameraRawData,
     });
 
@@ -2044,6 +2105,12 @@ export default function DashboardPage() {
       const stepperPreviews = await toPreviewSrcList(files);
       const entryFile = files?.[0] || null;
       const stepperEntryVehicleImage = stepperPreviews[0] || '';
+      const stepperEntryDetection = {
+        plateText: normalizeVrm(entryFile?.detectedPlateText || vrm),
+        plateCutoffImage: String(entryFile?.detectedPlateCutoffImage || ''),
+        plateConfidence: Number(entryFile?.detectedPlateConfidence || 0),
+        vehicleImage: stepperEntryVehicleImage,
+      };
 
       const draftPayload = {
         vrm,
@@ -2055,11 +2122,15 @@ export default function DashboardPage() {
         siteId,
         siteName,
         note,
-        detectedEntryPlateText: normalizeVrm(entryFile?.detectedPlateText || vrm),
-        detectedEntryPlateCutoffImage: String(entryFile?.detectedPlateCutoffImage || ''),
-        detectedEntryPlateConfidence: Number(entryFile?.detectedPlateConfidence || 0),
+        detectedEntryPlateText: stepperEntryDetection.plateText,
+        detectedEntryPlateCutoffImage: stepperEntryDetection.plateCutoffImage,
+        detectedEntryPlateConfidence: stepperEntryDetection.plateConfidence,
         detectedEntryVehicleImage: stepperEntryVehicleImage,
         startVehicleImage: stepperEntryVehicleImage,
+        sessionEvidence: {
+          entry: buildPhaseSessionEvidence({ phase: 'entry', detection: stepperEntryDetection, capturedAt: entryTime }),
+          closing: buildPhaseSessionEvidence({ phase: 'closing', detection: {}, capturedAt: '' }),
+        },
         cameraRawData: buildCameraRawRecords(files, stepperPreviews, { phase: 'entry', capturedAt: entryTime, source: 'WARDEN_STEPPER' }),
       };
 
@@ -2236,6 +2307,28 @@ export default function DashboardPage() {
       );
       const cameraRawDataForSubmission = sanitizeCameraRawRecordsForSubmission(cameraRawDataForLos);
       const safeQueuedPayload = stripCarcheckFromPayload(queuedItem.payload);
+      const sessionEvidence = {
+        entry: buildPhaseSessionEvidence({
+          phase: 'entry',
+          capturedAt: entryTime,
+          detection: {
+            plateText: safeQueuedPayload?.detectedEntryPlateText,
+            plateCutoffImage: safeQueuedPayload?.detectedEntryPlateCutoffImage,
+            plateConfidence: safeQueuedPayload?.detectedEntryPlateConfidence,
+            vehicleImage: entryFrame?.imageUrl || safeQueuedPayload?.detectedEntryVehicleImage || safeQueuedPayload?.startVehicleImage || payloadEntryImage,
+          },
+        }),
+        closing: buildPhaseSessionEvidence({
+          phase: 'closing',
+          capturedAt: closingTime,
+          detection: {
+            plateText: safeQueuedPayload?.detectedClosingPlateText,
+            plateCutoffImage: safeQueuedPayload?.detectedClosingPlateCutoffImage,
+            plateConfidence: safeQueuedPayload?.detectedClosingPlateConfidence,
+            vehicleImage: closingFrame?.imageUrl || safeQueuedPayload?.detectedClosingVehicleImage || payloadClosingImage,
+          },
+        }),
+      };
       const breachPayload = {
         ...safeQueuedPayload,
         vrm,
@@ -2269,6 +2362,7 @@ export default function DashboardPage() {
         closedAt: closingTime,
         lastSeen: closingTime,
         actualMinutes: diffMinutes(entryTime, closingTime),
+        sessionEvidence,
         cameraRawData: cameraRawDataForSubmission,
       };
 
