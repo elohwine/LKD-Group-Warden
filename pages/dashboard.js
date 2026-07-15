@@ -1435,6 +1435,12 @@ export default function DashboardPage() {
 
       const refreshedPreviews = await toPreviewSrcList(nextFiles);
       nextPreviews.splice(0, nextPreviews.length, ...refreshedPreviews);
+      if (nextFiles[0]) {
+        nextFiles[0].detectedPlateText = normalizeVrm(plateScanResult?.plateText || '');
+        nextFiles[0].detectedPlateCutoffImage = plateScanResult?.cutoffImage || '';
+        nextFiles[0].detectedPlateConfidence = Number(plateScanResult?.confidence || 0);
+        nextFiles[0].detectedVehicleImage = nextPreviews[0] || '';
+      }
       nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase, capturedAt });
       if (plateScanResult?.plateText && nextCameraRawRecords[0]) {
         nextCameraRawRecords[0] = {
