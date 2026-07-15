@@ -576,7 +576,7 @@ export default function BreachStepper({
         setFiles((prev) => [...prev, ...nextFiles]);
         setPreviews((prev) => [...prev, ...nextPreviews]);
 
-        if (step === 0) {
+        if (step === 0 && !captureOnly) {
             setTimeout(() => setStep(1), 150);
         }
     }
