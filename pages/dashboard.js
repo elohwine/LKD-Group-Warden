@@ -423,6 +423,24 @@ function mergeCameraRawRecords(existing, incoming, phase) {
   return [...safeExisting, ...normalizedIncoming];
 }
 
+function getPhasePrimaryCameraRawRecord(records, phase) {
+  const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+  const safeRecords = Array.isArray(records) ? records : [];
+  return safeRecords.find((record) => (record?.phase === 'closing' ? 'closing' : 'entry') === normalizedPhase) || null;
+}
+
+function getPhaseDetectionFromCameraRaw(records, phase, fallbackVrm = '') {
+  const record = getPhasePrimaryCameraRawRecord(records, phase);
+  const fallbackPlate = phase === 'entry' ? normalizeVrm(fallbackVrm) : '';
+
+  return {
+    plateText: normalizeVrm(record?.plateText || fallbackPlate || ''),
+    plateCutoffImage: String(record?.plateCutoffImage || '').trim(),
+    plateConfidence: Number(record?.plateConfidence || 0),
+    vehicleImage: resolveCameraRawImageSrc(record) || '',
+  };
+}
+
 function reorderEvidenceByMainIndex(files, mainIndex) {
   const safeFiles = Array.isArray(files) ? files : [];
   if (safeFiles.length <= 1) return safeFiles;
@@ -1822,6 +1840,8 @@ export default function DashboardPage() {
     const locationSnapshot = location || (await getCurrentLocation());
     const entryTime = entryCapturedAt || now.toISOString();
     const closingTime = closingCapturedAt || now.toISOString();
+    const entryDetection = getPhaseDetectionFromCameraRaw(cameraRawData, 'entry', selectedVrm);
+    const closingDetection = getPhaseDetectionFromCameraRaw(cameraRawData, 'closing');
     const elapsedMinutes = diffMinutes(entryTime, closingTime);
 
     if (!elapsedMinutes) {
@@ -1852,6 +1872,15 @@ export default function DashboardPage() {
       selectedContraventionCode,
       mainEntryImageIndex,
       mainClosingImageIndex,
+      detectedEntryPlateText: entryDetection.plateText,
+      detectedEntryPlateCutoffImage: entryDetection.plateCutoffImage,
+      detectedEntryPlateConfidence: entryDetection.plateConfidence,
+      detectedEntryVehicleImage: entryDetection.vehicleImage,
+      startVehicleImage: entryDetection.vehicleImage,
+      detectedClosingPlateText: closingDetection.plateText,
+      detectedClosingPlateCutoffImage: closingDetection.plateCutoffImage,
+      detectedClosingPlateConfidence: closingDetection.plateConfidence,
+      detectedClosingVehicleImage: closingDetection.vehicleImage,
       cameraRawData,
     });
 
@@ -1924,6 +1953,7 @@ export default function DashboardPage() {
 
     const nowIso = new Date().toISOString();
     const entryTime = entryCapturedAt || nowIso;
+    const entryDetection = getPhaseDetectionFromCameraRaw(cameraRawData, 'entry', selectedVrm);
     const draftPayload = stripCarcheckFromPayload({
       vrm: normalizeVrm(selectedVrm),
       siteId: selectedSiteId,
@@ -1944,6 +1974,11 @@ export default function DashboardPage() {
       selectedContraventionCode,
       mainEntryImageIndex,
       mainClosingImageIndex,
+      detectedEntryPlateText: entryDetection.plateText,
+      detectedEntryPlateCutoffImage: entryDetection.plateCutoffImage,
+      detectedEntryPlateConfidence: entryDetection.plateConfidence,
+      detectedEntryVehicleImage: entryDetection.vehicleImage,
+      startVehicleImage: entryDetection.vehicleImage,
       cameraRawData,
     });
 
@@ -2007,6 +2042,8 @@ export default function DashboardPage() {
       const entryTime = normalizeCapturedAt(files?.[0]?.capturedAt) || new Date().toISOString();
       const requiredObservationMinutes = 0;
       const stepperPreviews = await toPreviewSrcList(files);
+      const entryFile = files?.[0] || null;
+      const stepperEntryVehicleImage = stepperPreviews[0] || '';
 
       const draftPayload = {
         vrm,
@@ -2018,6 +2055,11 @@ export default function DashboardPage() {
         siteId,
         siteName,
         note,
+        detectedEntryPlateText: normalizeVrm(entryFile?.detectedPlateText || vrm),
+        detectedEntryPlateCutoffImage: String(entryFile?.detectedPlateCutoffImage || ''),
+        detectedEntryPlateConfidence: Number(entryFile?.detectedPlateConfidence || 0),
+        detectedEntryVehicleImage: stepperEntryVehicleImage,
+        startVehicleImage: stepperEntryVehicleImage,
         cameraRawData: buildCameraRawRecords(files, stepperPreviews, { phase: 'entry', capturedAt: entryTime, source: 'WARDEN_STEPPER' }),
       };
 

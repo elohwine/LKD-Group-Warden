@@ -526,6 +526,10 @@ export default function BreachStepper({
         if (result?.plateText) {
             const cleanedPlate = fixUkPlateOcr(normalizeVrm(result.plateText));
             setVrm(cleanedPlate);
+            if (nextFiles[0]) {
+                nextFiles[0].detectedPlateText = cleanedPlate;
+                nextFiles[0].detectedPlateConfidence = Number(result.confidence || 0);
+            }
             setScanState({
                 loading: false,
                 text: cleanedPlate,
@@ -540,6 +544,9 @@ export default function BreachStepper({
             if (cutoffFile) {
                 nextFiles.push(cutoffFile);
                 nextPreviews.push(result.cutoffImage);
+            }
+            if (nextFiles[0]) {
+                nextFiles[0].detectedPlateCutoffImage = result.cutoffImage;
             }
         }
 
