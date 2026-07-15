@@ -68,6 +68,17 @@ require_env() {
     fi
 }
 
+normalize_signing_env() {
+    local repo_root
+    repo_root="$(pwd)"
+    local local_keystore="$repo_root/.keystore/warden-release.jks"
+
+    if [ -n "${WARDEN_KEYSTORE_PATH:-}" ] && [ ! -f "$WARDEN_KEYSTORE_PATH" ] && [ -f "$local_keystore" ]; then
+        echo -e "${YELLOW}Adjusting WARDEN_KEYSTORE_PATH to local keystore: $local_keystore${NC}"
+        export WARDEN_KEYSTORE_PATH="$local_keystore"
+    fi
+}
+
 # ========= COLORS =========
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -123,6 +134,8 @@ echo -e "${GREEN}Using NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}${NC}
 print_step "Ensuring public Firebase client config..."
 ensure_public_firebase_config
 echo -e "${GREEN}Using NEXT_PUBLIC_FIREBASE_PROJECT_ID=${NEXT_PUBLIC_FIREBASE_PROJECT_ID}${NC}"
+
+normalize_signing_env
 
 if [ -n "${CAPACITOR_SERVER_URL:-}" ]; then
     echo -e "${YELLOW}Ignoring CAPACITOR_SERVER_URL for Warden APK bundled mode: ${CAPACITOR_SERVER_URL}${NC}"

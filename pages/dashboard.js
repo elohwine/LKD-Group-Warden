@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/router';
 import { fetchJson } from '../lib/api';
 import { clearSession, getStoredSiteId, loadSession, restoreSession, saveStoredSiteId } from '../lib/session';
-import { signOutFromWardenApp, getStoredToken } from '../lib/auth';
+import { signOutFromWardenApp, getStoredToken, getValidToken } from '../lib/auth';
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
@@ -58,6 +58,78 @@ function fileToDataUrl(file) {
   });
 }
 
+function loadImageElement(file) {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('image_load_failed'));
+    };
+    image.src = objectUrl;
+  });
+}
+
+function formatCaptureTimestamp(capturedAt) {
+  const date = new Date(capturedAt || Date.now());
+  if (Number.isNaN(date.getTime())) return '';
+  const yyyy = String(date.getFullYear());
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const sec = String(date.getSeconds()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd} ${hh}:${min}:${sec}`;
+}
+
+async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
+  if (!file || !(file.type || '').startsWith('image/')) return file;
+
+  try {
+    const image = await loadImageElement(file);
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth || image.width;
+    canvas.height = image.naturalHeight || image.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx || !canvas.width || !canvas.height) return file;
+
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+    const label = phase === 'closing' ? 'CLOSING' : 'ENTRY';
+    const stampText = `${label} ${formatCaptureTimestamp(capturedAt)}`;
+    const baseFont = Math.max(24, Math.floor(canvas.width / 40));
+    ctx.font = `700 ${baseFont}px Arial, sans-serif`;
+    const paddingX = Math.max(16, Math.floor(baseFont * 0.6));
+    const paddingY = Math.max(12, Math.floor(baseFont * 0.45));
+    const textMetrics = ctx.measureText(stampText);
+    const boxWidth = Math.ceil(textMetrics.width + paddingX * 2);
+    const boxHeight = Math.ceil(baseFont + paddingY * 2);
+    const boxX = Math.max(12, Math.floor(canvas.width * 0.03));
+    const boxY = Math.max(12, canvas.height - boxHeight - Math.floor(canvas.height * 0.03));
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+    ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.textBaseline = 'top';
+    ctx.fillText(stampText, boxX + paddingX, boxY + paddingY);
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, file.type || 'image/jpeg', 0.92));
+    if (!blob) return file;
+
+    return new File([blob], file.name, {
+      type: blob.type || file.type || 'image/jpeg',
+      lastModified: file.lastModified || Date.now(),
+    });
+  } catch (_) {
+    return file;
+  }
+}
+
 async function toPreviewSrcList(files) {
   const resolved = await Promise.all(
     files.map(async (file) => {
@@ -71,8 +143,227 @@ async function toPreviewSrcList(files) {
   return resolved.filter(Boolean);
 }
 
+function normalizeCapturedAt(value) {
+  if (!value) return '';
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return '';
+    return value.toISOString();
+  }
+
+  const asDate = new Date(value);
+  if (Number.isNaN(asDate.getTime())) return '';
+  return asDate.toISOString();
+}
+
+async function resolveCameraCaptureTimestamp(file, fallbackIso) {
+  const fallback = normalizeCapturedAt(fallbackIso) || new Date().toISOString();
+  if (!file || typeof window === 'undefined') return fallback;
+
+  try {
+    const exifr = await import('exifr');
+    const metadata = await exifr.parse(file, {
+      pick: ['DateTimeOriginal', 'CreateDate', 'ModifyDate'],
+    });
+
+    const exifIso =
+      normalizeCapturedAt(metadata?.DateTimeOriginal) ||
+      normalizeCapturedAt(metadata?.CreateDate) ||
+      normalizeCapturedAt(metadata?.ModifyDate);
+
+    return exifIso || fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+async function resolveImageDimensions(src) {
+  const candidate = String(src || '').trim();
+  if (!candidate || typeof window === 'undefined') return null;
+
+  return new Promise((resolve) => {
+    const image = new Image();
+    image.onload = () => {
+      resolve({
+        width: Number(image.naturalWidth || image.width || 0),
+        height: Number(image.naturalHeight || image.height || 0),
+      });
+    };
+    image.onerror = () => resolve(null);
+    image.src = candidate;
+  });
+}
+
 function normalizeVrm(value) {
   return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+let ocrWorkerPromise = null;
+const TESSERACT_WORKER_PATH = 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/worker.min.js';
+
+async function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = (async () => {
+      if (typeof window === 'undefined') {
+        throw new Error('ocr_worker_browser_only');
+      }
+
+      const { createWorker } = await import('tesseract.js');
+      const worker = await createWorker('eng', 1, {
+        workerPath: TESSERACT_WORKER_PATH,
+      });
+      try {
+        await worker.setParameters({
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+          preserve_interword_spaces: '0',
+        });
+      } catch (_) {}
+      return worker;
+    })();
+  }
+
+  return ocrWorkerPromise;
+}
+
+function isLikelyUkVrm(value) {
+  return /^[A-Z]{2}[0-9]{2}[A-Z]{3}$/.test(value);
+}
+
+function buildPlateCandidatesFromWords(words) {
+  const safeWords = Array.isArray(words) ? words : [];
+  const candidates = [];
+
+  for (let i = 0; i < safeWords.length; i += 1) {
+    const first = safeWords[i];
+    const second = safeWords[i + 1];
+    const third = safeWords[i + 2];
+
+    const variants = [
+      [first],
+      second ? [first, second] : null,
+      third ? [first, second, third] : null,
+    ].filter(Boolean);
+
+    variants.forEach((parts) => {
+      const raw = parts
+        .map((part) => String(part?.text || ''))
+        .join('')
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, '');
+
+      if (!raw || raw.length < 5 || raw.length > 8) return;
+
+      const confidences = parts
+        .map((part) => Number(part?.confidence || 0))
+        .filter((value) => Number.isFinite(value));
+      const avgConfidence = confidences.length > 0
+        ? confidences.reduce((sum, value) => sum + value, 0) / confidences.length
+        : 0;
+
+      const boxes = parts
+        .map((part) => part?.bbox)
+        .filter((bbox) => bbox && Number.isFinite(bbox.x0) && Number.isFinite(bbox.y0) && Number.isFinite(bbox.x1) && Number.isFinite(bbox.y1));
+
+      if (boxes.length === 0) return;
+
+      const bbox = {
+        x0: Math.min(...boxes.map((box) => box.x0)),
+        y0: Math.min(...boxes.map((box) => box.y0)),
+        x1: Math.max(...boxes.map((box) => box.x1)),
+        y1: Math.max(...boxes.map((box) => box.y1)),
+      };
+
+      const formatBonus = isLikelyUkVrm(raw) ? 100 : 0;
+      const lengthPenalty = Math.abs(raw.length - 7) * 2;
+      const score = formatBonus + avgConfidence - lengthPenalty;
+
+      candidates.push({
+        text: raw,
+        confidence: avgConfidence,
+        score,
+        bbox,
+      });
+    });
+  }
+
+  return candidates.sort((left, right) => right.score - left.score);
+}
+
+async function createPlateCutoutDataUrl(file, bbox) {
+  if (!file || !bbox) return '';
+
+  try {
+    const image = await loadImageElement(file);
+    const imageWidth = image.naturalWidth || image.width;
+    const imageHeight = image.naturalHeight || image.height;
+    if (!imageWidth || !imageHeight) return '';
+
+    const rawWidth = Math.max(1, bbox.x1 - bbox.x0);
+    const rawHeight = Math.max(1, bbox.y1 - bbox.y0);
+    const padX = Math.max(4, Math.round(rawWidth * 0.2));
+    const padY = Math.max(4, Math.round(rawHeight * 0.35));
+
+    const sx = Math.max(0, Math.floor(bbox.x0 - padX));
+    const sy = Math.max(0, Math.floor(bbox.y0 - padY));
+    const ex = Math.min(imageWidth, Math.ceil(bbox.x1 + padX));
+    const ey = Math.min(imageHeight, Math.ceil(bbox.y1 + padY));
+    const sw = Math.max(1, ex - sx);
+    const sh = Math.max(1, ey - sy);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = sw;
+    canvas.height = sh;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return '';
+
+    ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
+    return canvas.toDataURL('image/jpeg', 0.92);
+  } catch (_) {
+    return '';
+  }
+}
+
+function dataUrlToFile(dataUrl, filename) {
+  if (!dataUrl || typeof dataUrl !== 'string') return null;
+  const parts = dataUrl.split(',');
+  if (parts.length < 2) return null;
+  const mimeMatch = parts[0].match(/data:(.*?);base64/);
+  const mime = mimeMatch?.[1] || 'image/jpeg';
+
+  try {
+    const binary = atob(parts[1]);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new File([bytes], filename, { type: mime, lastModified: Date.now() });
+  } catch (_) {
+    return null;
+  }
+}
+
+async function scanPlateFromImage(file) {
+  if (!file || !(file.type || '').startsWith('image/')) return null;
+
+  try {
+    const worker = await getOcrWorker();
+    const result = await worker.recognize(file);
+    const words = Array.isArray(result?.data?.words) ? result.data.words : [];
+    const candidates = buildPlateCandidatesFromWords(words);
+    if (candidates.length === 0) return null;
+
+    const best = candidates[0];
+    if (!best?.text) return null;
+
+    const cutoffImage = await createPlateCutoutDataUrl(file, best.bbox);
+    return {
+      plateText: normalizeVrm(best.text),
+      confidence: Number(best.confidence || 0),
+      cutoffImage,
+      bbox: best.bbox,
+    };
+  } catch (_) {
+    return null;
+  }
 }
 
 function buildEvidenceFrame(imageUrl, timestamp) {
@@ -94,7 +385,7 @@ function buildCameraRawRecords(files, previews, { phase, capturedAt, source = 'W
     id: `${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`,
     phase: phase === 'closing' ? 'closing' : 'entry',
     source,
-    capturedAt: nowIso,
+    capturedAt: normalizeCapturedAt(file?.capturedAt) || nowIso,
     fileName: file?.name || `capture_${index + 1}.jpg`,
     mimeType: file?.type || '',
     sizeBytes: Number(file?.size || 0),
@@ -130,6 +421,19 @@ function mergeCameraRawRecords(existing, incoming, phase) {
     phase: item?.phase === 'closing' ? 'closing' : normalizedPhase,
   }));
   return [...safeExisting, ...normalizedIncoming];
+}
+
+function reorderEvidenceByMainIndex(files, mainIndex) {
+  const safeFiles = Array.isArray(files) ? files : [];
+  if (safeFiles.length <= 1) return safeFiles;
+
+  const index = Number.isFinite(Number(mainIndex)) ? Number(mainIndex) : 0;
+  if (index <= 0 || index >= safeFiles.length) return safeFiles;
+
+  const reordered = [...safeFiles];
+  const [selected] = reordered.splice(index, 1);
+  if (!selected) return safeFiles;
+  return [selected, ...reordered];
 }
 
 async function backfillCameraRawPreviewUrls(records, files) {
@@ -190,6 +494,23 @@ function enrichCameraRawRecordsWithUploadedUrls(records, entryUrls, closingUrls)
     const uploadedUrl = safeClosingUrls[closingIndex] || '';
     closingIndex += 1;
     return uploadedUrl ? { ...record, uploadedUrl, targetSystem: 'LOS' } : record;
+  });
+}
+
+function sanitizeCameraRawRecordsForSubmission(records) {
+  const safeRecords = Array.isArray(records) ? records : [];
+
+  return safeRecords.map((record) => {
+    if (!record || typeof record !== 'object') return record;
+
+    const {
+      localPreviewUrl,
+      previewUrl,
+      imageUrl,
+      ...rest
+    } = record;
+
+    return rest;
   });
 }
 
@@ -270,7 +591,7 @@ function getBreachLifecycle(item) {
     return { code: 'SUBMITTED', label: 'Submitted', syncable: false };
   }
   if (entryCount > 0 && closingCount === 0) {
-    return { code: 'DRAFT_OPEN', label: 'Open draft', syncable: false };
+    return { code: 'DRAFT_OPEN', label: 'Draft Parking Charge', syncable: false };
   }
   if (entryCount > 0 && closingCount > 0) {
     return { code: 'READY', label: 'Ready to submit', syncable: true };
@@ -416,6 +737,8 @@ export default function DashboardPage() {
   const [closingFiles, setClosingFiles] = useState([]);
   const [closingPreviews, setClosingPreviews] = useState([]);
   const [closingCapturedAt, setClosingCapturedAt] = useState('');
+  const [mainEntryImageIndex, setMainEntryImageIndex] = useState(0);
+  const [mainClosingImageIndex, setMainClosingImageIndex] = useState(0);
   const [cameraRawData, setCameraRawData] = useState([]);
   const [authorization, setAuthorization] = useState(null);
   const [authorizationByVrm, setAuthorizationByVrm] = useState({});
@@ -436,6 +759,7 @@ export default function DashboardPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedTrackedId, setSelectedTrackedId] = useState('');
   const [darkMode, setDarkMode] = useState(true);
+  const [autoSubmitOnClosingCapture, setAutoSubmitOnClosingCapture] = useState(false);
   const [carcheckDialogOpen, setCarcheckDialogOpen] = useState(false);
   const [pcnDialogOpen, setPcnDialogOpen] = useState(false);
   const [stepperOpen, setStepperOpen] = useState(false);
@@ -448,10 +772,34 @@ export default function DashboardPage() {
   const [cameraRawViewMode, setCameraRawViewMode] = useState('grid');
   const [cameraRawVrmQuery, setCameraRawVrmQuery] = useState('');
   const [cameraRawSiteFilter, setCameraRawSiteFilter] = useState('all');
+  const [imageDetailDialog, setImageDetailDialog] = useState({
+    open: false,
+    fullscreen: true,
+    loading: false,
+    src: '',
+    label: '',
+    phase: '',
+    isMain: false,
+    fileName: '',
+    mimeType: '',
+    sizeBytes: 0,
+    capturedAt: '',
+    embeddedCapturedAt: '',
+    dimensions: null,
+    error: '',
+  });
   const fileInputRef = useRef(null);
   const qrFileInputRef = useRef(null);
   const authReadyRef = useRef(false);
   const capturePhaseRef = useRef('entry');
+
+  async function resolveAuthToken({ forceRefresh = false } = {}) {
+    const token = await getValidToken({ forceRefresh });
+    const nextToken = token || authToken || getStoredToken();
+    if (!nextToken) throw new Error('auth_missing');
+    if (nextToken !== authToken) setAuthToken(nextToken);
+    return nextToken;
+  }
 
   const selectedSite = useMemo(() => sites.find((site) => String(site.id) === String(selectedSiteId)) || null, [sites, selectedSiteId]);
   const contraventions = useMemo(() => getContraventionOptions(selectedSite), [selectedSite]);
@@ -532,6 +880,12 @@ export default function DashboardPage() {
   const selectedTracked = useMemo(
     () => trackedBreaches.find((entry) => entry.id === selectedTrackedId) || null,
     [trackedBreaches, selectedTrackedId]
+  );
+  const selectedLifecycleCode = selectedTracked?.lifecycle?.code || '';
+  const selectedConvertedToPcn = selectedLifecycleCode === 'CONVERTED';
+  const canIssuePcnFromCurrentState = !selectedConvertedToPcn && (
+    canFinalizeBreach ||
+    (selectedLifecycleCode === 'SUBMITTED' && Boolean(selectedTracked?.payload?.breachId))
   );
   const selectedTrackedVehicleLookup = useMemo(() => {
     const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm);
@@ -704,12 +1058,12 @@ export default function DashboardPage() {
       return { key: 'capture-entry', label: 'Capture entry evidence' };
     }
     if (!monitoringSessionActive && !hasClosingEvidence) {
-      return { key: 'start-monitoring', label: 'Start monitoring session' };
+      return { key: 'start-monitoring', label: 'Start Draft Parking Charge' };
     }
     if (monitoringSessionActive && !hasClosingEvidence) {
       return { key: 'capture-closing', label: 'Capture closing evidence' };
     }
-    return { key: 'finalize', label: selectedTracked ? 'Finalize selected draft' : 'Finalize breach' };
+    return { key: 'finalize', label: selectedTracked ? 'Finalize Draft Parking Charge' : 'Finalize Parking Charge' };
   }, [hasEntryEvidence, hasClosingEvidence, monitoringSessionActive, selectedTracked]);
 
   const filteredBreaches = useMemo(() => {
@@ -739,7 +1093,7 @@ export default function DashboardPage() {
 
   function getPrimaryActionLabel(item) {
     if (!item) return 'Review';
-    if (item.lifecycle.code === 'DRAFT_OPEN') return 'Continue draft';
+    if (item.lifecycle.code === 'DRAFT_OPEN') return 'Continue Draft Parking Charge';
     if (item.lifecycle.code === 'READY') return 'Submit now';
     if (item.lifecycle.code === 'FAILED') return 'Retry submit';
     if (item.lifecycle.code === 'SUBMITTED') return 'Open conversion';
@@ -862,9 +1216,23 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem('warden-auto-submit-on-closing-capture');
+    setAutoSubmitOnClosingCapture(stored === 'true');
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
     document.documentElement.classList.toggle('theme-light', !darkMode);
     window.localStorage.setItem('warden-theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(
+      'warden-auto-submit-on-closing-capture',
+      autoSubmitOnClosingCapture ? 'true' : 'false'
+    );
+  }, [autoSubmitOnClosingCapture]);
 
   useEffect(() => {
     const vrm = normalizeVrm(selectedVrm);
@@ -928,33 +1296,208 @@ export default function DashboardPage() {
     fileInputRef.current?.click();
   }
 
+  function closeImageDetailDialog() {
+    setImageDetailDialog((current) => ({ ...current, open: false }));
+  }
+
+  function toggleImageDetailFullscreen() {
+    setImageDetailDialog((current) => ({ ...current, fullscreen: !current.fullscreen }));
+  }
+
+  async function openImageDetailDialog({
+    src,
+    label,
+    phase,
+    isMain = false,
+    file = null,
+    capturedAt = '',
+    fileName = '',
+    mimeType = '',
+    sizeBytes = 0,
+    record = null,
+  } = {}) {
+    const imageSrc = String(src || '').trim();
+    if (!imageSrc) return;
+
+    setImageDetailDialog({
+      open: true,
+      fullscreen: true,
+      loading: true,
+      src: imageSrc,
+      label: label || 'Evidence image',
+      phase: phase || '',
+      isMain: Boolean(isMain),
+      fileName: fileName || file?.name || '',
+      mimeType: mimeType || file?.type || '',
+      sizeBytes: Number(sizeBytes || file?.size || 0),
+      capturedAt: normalizeCapturedAt(capturedAt || file?.capturedAt) || '',
+      embeddedCapturedAt: '',
+      dimensions: null,
+      error: '',
+    });
+
+    try {
+      const dimensions = await resolveImageDimensions(imageSrc);
+
+      setImageDetailDialog((current) => {
+        if (!current.open || current.src !== imageSrc) return current;
+        return {
+          ...current,
+          loading: false,
+          dimensions: dimensions || null,
+        };
+      });
+    } catch (_) {
+      setImageDetailDialog((current) => {
+        if (!current.open || current.src !== imageSrc) return current;
+        return {
+          ...current,
+          loading: false,
+          error: 'Unable to load image details.',
+        };
+      });
+    }
+  }
+
   async function handleFileSelection(event) {
-    const nextFiles = Array.from(event.target.files || []);
-    const nextPreviews = await toPreviewSrcList(nextFiles);
-    const capturedAt = new Date().toISOString();
+    const rawFiles = Array.from(event.target.files || []);
+    const fallbackCapturedAt = new Date().toISOString();
     const phase = capturePhaseRef.current === 'closing' ? 'closing' : 'entry';
-    const nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase, capturedAt });
+    const nextFiles = await Promise.all(
+      rawFiles.map(async (file) => {
+        const capturedAt = await resolveCameraCaptureTimestamp(file, fallbackCapturedAt);
+        const stamped = await stampEvidenceImage(file, { capturedAt, phase });
+        stamped.capturedAt = capturedAt;
+        return stamped;
+      })
+    );
+    const capturedAt = normalizeCapturedAt(nextFiles[0]?.capturedAt) || fallbackCapturedAt;
+    const nextPreviews = await toPreviewSrcList(nextFiles);
+    let nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase, capturedAt });
+    let plateScanResult = null;
+
+    if (nextFiles.length > 0) {
+      plateScanResult = await scanPlateFromImage(nextFiles[0]);
+      if (plateScanResult?.cutoffImage) {
+        const cutoffFile = dataUrlToFile(
+          plateScanResult.cutoffImage,
+          `plate_cutoff_${phase}_${Date.now()}.jpg`
+        );
+        if (cutoffFile) {
+          cutoffFile.capturedAt = capturedAt;
+          nextFiles.push(cutoffFile);
+        }
+      }
+
+      const refreshedPreviews = await toPreviewSrcList(nextFiles);
+      nextPreviews.splice(0, nextPreviews.length, ...refreshedPreviews);
+      nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase, capturedAt });
+      if (plateScanResult?.plateText && nextCameraRawRecords[0]) {
+        nextCameraRawRecords[0] = {
+          ...nextCameraRawRecords[0],
+          plateText: plateScanResult.plateText,
+          plateConfidence: plateScanResult.confidence,
+          plateCutoffImage: plateScanResult.cutoffImage || '',
+          plateBbox: plateScanResult.bbox || null,
+        };
+      }
+    }
+    const nextPhaseFiles = nextFiles.map((file) => ({
+      name: file.name,
+      type: file.type,
+      blob: file,
+      phase,
+    }));
 
     if (phase === 'entry') {
-      setEntryFiles(nextFiles);
-      setEntryPreviews(nextPreviews);
+      const mergedEntryFiles = [...entryFiles, ...nextFiles];
+      const mergedEntryPreviews = [...entryPreviews, ...nextPreviews];
+      setEntryFiles(mergedEntryFiles);
+      setEntryPreviews(mergedEntryPreviews);
+      setMainEntryImageIndex((current) => (
+        mergedEntryFiles.length > 0
+          ? Math.min(current, mergedEntryFiles.length - 1)
+          : 0
+      ));
       setEntryCapturedAt((current) => current || capturedAt);
-      setClosingFiles([]);
-      setClosingPreviews([]);
-      setClosingCapturedAt('');
       setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'entry'));
-      setMessage(`Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`);
+      if (plateScanResult?.plateText) {
+        setSelectedVrm(plateScanResult.plateText);
+      }
+
+      const entryCaptureMessage = plateScanResult?.plateText
+        ? `Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}. Plate detected: ${plateScanResult.plateText}.`
+        : `Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`;
+      setMessage(entryCaptureMessage);
+
+      if (selectedTrackedId) {
+        try {
+          const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+          const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
+          const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
+          const preservedFiles = existingFiles.filter((file) => file?.phase !== 'entry');
+          const existingEntryFiles = existingFiles.filter((file) => file?.phase === 'entry');
+          const mergedTrackedEntryFiles = [...existingEntryFiles, ...nextPhaseFiles];
+          const selectedMainEntryIndex = Number.isFinite(Number(selectedPayload?.mainEntryImageIndex))
+            ? Number(selectedPayload.mainEntryImageIndex)
+            : mainEntryImageIndex;
+
+          await updateQueueItem(selectedTrackedId, {
+            payload: {
+              ...selectedPayload,
+              observationStartTime: capturedAt,
+              observationEndTime: null,
+              entryCapturedAt: capturedAt,
+              closingCapturedAt: null,
+              breachLifecycle: 'DRAFT_OPEN',
+              mainEntryImageIndex: Math.min(
+                Math.max(0, selectedMainEntryIndex),
+                Math.max(0, mergedTrackedEntryFiles.length - 1)
+              ),
+              detectedEntryPlateText: plateScanResult?.plateText || selectedPayload?.detectedEntryPlateText || '',
+              detectedEntryPlateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedEntryPlateCutoffImage || '',
+              detectedEntryPlateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedEntryPlateConfidence || 0),
+              detectedEntryVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedEntryVehicleImage || '',
+              startVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.startVehicleImage || '',
+              cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'entry'),
+            },
+            files: [...preservedFiles, ...mergedTrackedEntryFiles],
+            updatedAt: new Date().toISOString(),
+          });
+          await refreshQueue();
+        } catch (persistError) {
+          console.error('[warden] failed to persist entry capture evidence', persistError);
+        }
+      }
     } else {
-      setClosingFiles(nextFiles);
-      setClosingPreviews(nextPreviews);
+      const mergedClosingFiles = [...closingFiles, ...nextFiles];
+      const mergedClosingPreviews = [...closingPreviews, ...nextPreviews];
+      setClosingFiles(mergedClosingFiles);
+      setClosingPreviews(mergedClosingPreviews);
+      setMainClosingImageIndex((current) => (
+        mergedClosingFiles.length > 0
+          ? Math.min(current, mergedClosingFiles.length - 1)
+          : 0
+      ));
       setClosingCapturedAt(capturedAt);
       setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'closing'));
       setMonitoringSessionActive(false);
       setMonitoringSessionStartedAt('');
+      if (plateScanResult?.plateText) {
+        setSelectedVrm(plateScanResult.plateText);
+      }
 
       if (selectedTrackedId) {
         try {
-          const selectedPayload = selectedTracked?.payload || {};
+          const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+          const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
+          const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
+          const preservedFiles = existingFiles.filter((file) => file?.phase !== 'closing');
+          const existingClosingFiles = existingFiles.filter((file) => file?.phase === 'closing');
+          const mergedTrackedClosingFiles = [...existingClosingFiles, ...nextPhaseFiles];
+          const selectedMainClosingIndex = Number.isFinite(Number(selectedPayload?.mainClosingImageIndex))
+            ? Number(selectedPayload.mainClosingImageIndex)
+            : mainClosingImageIndex;
           const entryTime =
             entryCapturedAt ||
             selectedPayload.entryCapturedAt ||
@@ -971,9 +1514,18 @@ export default function DashboardPage() {
               entryCapturedAt: entryTime,
               closingCapturedAt: capturedAt,
               actualMinutes: computedMinutes,
+              mainClosingImageIndex: Math.min(
+                Math.max(0, selectedMainClosingIndex),
+                Math.max(0, mergedTrackedClosingFiles.length - 1)
+              ),
               breachLifecycle: computedMinutes > 0 ? 'READY_FOR_SYNC' : selectedPayload.breachLifecycle,
+              detectedClosingPlateText: plateScanResult?.plateText || selectedPayload?.detectedClosingPlateText || '',
+              detectedClosingPlateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedClosingPlateCutoffImage || '',
+              detectedClosingPlateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedClosingPlateConfidence || 0),
+              detectedClosingVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedClosingVehicleImage || '',
               cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'closing'),
             },
+            files: [...preservedFiles, ...mergedTrackedClosingFiles],
             updatedAt: new Date().toISOString(),
           });
           await refreshQueue();
@@ -982,26 +1534,48 @@ export default function DashboardPage() {
         }
       }
 
-      setMessage(`Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`);
+      const capturedMessage = plateScanResult?.plateText
+        ? `Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}. Plate detected: ${plateScanResult.plateText}.`
+        : `Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`;
+      const shouldAutoSubmit = autoSubmitOnClosingCapture && Boolean(selectedTrackedId);
+
+      if (shouldAutoSubmit && !online) {
+        setMessage(`${capturedMessage} Auto-submit is enabled but you are offline; review and submit manually when online.`);
+      } else if (shouldAutoSubmit) {
+        setMessage(`${capturedMessage} Auto-submitting evidence package...`);
+        await queueOrSendCapture({
+          targetItemId: selectedTrackedId,
+          openPcnDialogAfterSync: false,
+        });
+      } else {
+        setMessage(`${capturedMessage} Review and submit manually when ready.`);
+      }
     }
 
     event.target.value = '';
   }
 
   async function uploadEvidenceFiles(evidenceFiles, manualVrm) {
-    const token = authToken || getStoredToken();
-    if (!token) throw new Error('auth_missing');
-
     const formData = new FormData();
     evidenceFiles.forEach((file) => formData.append('file', file.blob || file, file.name));
     formData.append('siteId', selectedSiteId);
     formData.append('manualVrm', manualVrm || selectedVrm);
 
-    const response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+    let token = await resolveAuthToken();
+    let response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       body: formData,
     });
+
+    if (response.status === 401) {
+      token = await resolveAuthToken({ forceRefresh: true });
+      response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+    }
 
     const data = await response.json();
     if (!response.ok) {
@@ -1037,8 +1611,7 @@ export default function DashboardPage() {
   async function checkAuthorization(nextVrm) {
     const vrm = normalizeVrm(nextVrm || selectedVrm);
     if (!vrm || !selectedSiteId) return null;
-    const token = authToken || getStoredToken();
-    if (!token) throw new Error('auth_missing');
+    const token = await resolveAuthToken();
     const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, {
       token
     });
@@ -1067,7 +1640,7 @@ export default function DashboardPage() {
   function startMonitoringSession() {
     const startedAt = entryCapturedAt || new Date().toISOString();
     if (!selectedSiteId || !selectedVrm || !hasEntryEvidence) {
-      setMessage('Capture entry evidence with site and VRM before starting a monitoring session.');
+      setMessage('Capture entry evidence with site and VRM before starting a Draft Parking Charge.');
       return;
     }
     if (!entryCapturedAt) {
@@ -1075,7 +1648,7 @@ export default function DashboardPage() {
     }
     setMonitoringSessionStartedAt(startedAt);
     setMonitoringSessionActive(true);
-    setMessage(`Monitoring session started for ${selectedVrm}.`);
+    setMessage(`Draft Parking Charge started for ${selectedVrm}.`);
   }
 
   function stopMonitoringSession() {
@@ -1083,7 +1656,7 @@ export default function DashboardPage() {
     if (!closingCapturedAt) {
       setClosingCapturedAt(new Date().toISOString());
     }
-    setMessage('Monitoring session ended. Capture closing evidence and finalize when ready.');
+    setMessage('Draft Parking Charge ended. Capture closing evidence and finalize when ready.');
   }
 
   function openPermitQrDialog() {
@@ -1147,8 +1720,7 @@ export default function DashboardPage() {
 
     setVehicleLookupLoading(true);
     try {
-      const token = authToken || getStoredToken();
-      if (!token) throw new Error('auth_missing');
+      const token = await resolveAuthToken();
       const result = await fetchJson(`/api/vehicle/lookup?vrm=${encodeURIComponent(vrm)}`, { token });
 
       const responseInfo = result?.ResponseInformation || result?.responseInformation || null;
@@ -1190,7 +1762,7 @@ export default function DashboardPage() {
     }
 
     if (!selectedTrackedId) {
-      setDetailMessage('Open a session before saving carcheck details.');
+      setDetailMessage('Open a Draft Parking Charge before saving carcheck details.');
       return;
     }
 
@@ -1214,10 +1786,18 @@ export default function DashboardPage() {
       updatedAt: nowIso,
     });
     await refreshQueue();
-    setDetailMessage('Vehicle details saved. Reopen anytime from this session.');
+    setDetailMessage('Vehicle details saved. Reopen anytime from this Draft Parking Charge.');
   }
 
   async function queueOrSendCapture({ immediate = false, targetItemId = '', openPcnDialogAfterSync = false } = {}) {
+    if (targetItemId) {
+      const existing = (await listQueueItems()).find((item) => item.id === targetItemId);
+      if (existing) {
+        await syncQueueItem(targetItemId, { openPcnDialogAfterSuccess: openPcnDialogAfterSync });
+        return;
+      }
+    }
+
     if (!selectedSiteId) {
       setMessage('Choose a patrol site before submitting.');
       return;
@@ -1270,6 +1850,8 @@ export default function DashboardPage() {
       manualNote,
       authorization,
       selectedContraventionCode,
+      mainEntryImageIndex,
+      mainClosingImageIndex,
       cameraRawData,
     });
 
@@ -1319,7 +1901,7 @@ export default function DashboardPage() {
     await refreshQueue();
 
     if (!online && !immediate) {
-      setMessage('Captured offline. The breach is ready and queued for sync.');
+      setMessage('Captured offline. The Parking Charge is ready and queued for sync.');
       return;
     }
 
@@ -1360,6 +1942,8 @@ export default function DashboardPage() {
       manualNote,
       authorization,
       selectedContraventionCode,
+      mainEntryImageIndex,
+      mainClosingImageIndex,
       cameraRawData,
     });
 
@@ -1403,7 +1987,7 @@ export default function DashboardPage() {
     setClosingCapturedAt('');
     setMonitoringSessionStartedAt(entryTime);
     setMonitoringSessionActive(true);
-    setMessage('Open draft saved. Capture closing evidence later to finalise.');
+    setMessage('Draft Parking Charge saved. Capture closing evidence later to finalise.');
   }
 
   async function handleStepperComplete({
@@ -1418,9 +2002,9 @@ export default function DashboardPage() {
   }) {
     try {
       setBusy(true);
-      setMessage(`Saving new tracking session for VRM ${vrm}…`);
+      setMessage(`Saving Draft Parking Charge for VRM ${vrm}…`);
 
-      const entryTime = new Date().toISOString();
+      const entryTime = normalizeCapturedAt(files?.[0]?.capturedAt) || new Date().toISOString();
       const requiredObservationMinutes = 0;
       const stepperPreviews = await toPreviewSrcList(files);
 
@@ -1456,47 +2040,145 @@ export default function DashboardPage() {
 
       // Pre-load the new item into active workflow state using handleReviewTracked
       handleReviewTracked(item);
-      setMessage(`Started tracking session for vehicle ${vrm}.`);
+      setMessage(`Draft Parking Charge started for vehicle ${vrm}.`);
     } catch (e) {
       console.error('[warden] failed to create stepper draft', e);
-      setMessage(e.message || 'Error occurred starting stepper session.');
+      setMessage(e.message || 'Error occurred starting Draft Parking Charge.');
     } finally {
       setBusy(false);
     }
   }
 
-  async function syncQueueItem(itemId, { openPcnDialogAfterSuccess = false } = {}) {
+  async function syncQueueItem(itemId, { openPcnDialogAfterSuccess = false, forceBreachCapture = false } = {}) {
     const queuedItem = (await listQueueItems()).find((item) => item.id === itemId);
-    if (!queuedItem) return;
+    if (!queuedItem) {
+      return { ok: false, error: 'Draft Parking Charge not found for sync' };
+    }
 
     const lifecycle = getBreachLifecycle(queuedItem);
-    if (!lifecycle.syncable && queuedItem.status !== 'syncing') {
-      setMessage('This breach is still a draft and needs both opening and closing evidence before submission.');
-      return;
+    const missingBreachId = !queuedItem?.payload?.breachId;
+    const canForceBreachCapture = forceBreachCapture && missingBreachId;
+
+    if (!lifecycle.syncable && queuedItem.status !== 'syncing' && !canForceBreachCapture) {
+      setMessage('This Parking Charge is still a draft and needs both opening and closing evidence before submission.');
+      return {
+        ok: false,
+        error: 'This Parking Charge is still a draft and needs both opening and closing evidence before submission.',
+      };
     }
 
     try {
       await updateQueueItem(itemId, { status: 'syncing', attempts: queuedItem.attempts + 1, updatedAt: new Date().toISOString(), lastError: null });
       await refreshQueue();
 
-      const token = authToken || getStoredToken();
-      if (!token) throw new Error('auth_missing');
+      const token = await resolveAuthToken();
 
       const storedFiles = Array.isArray(queuedItem.files) ? queuedItem.files : [];
       let entryEvidenceFiles = storedFiles.filter((file) => file.phase === 'entry');
       let closingEvidenceFiles = storedFiles.filter((file) => file.phase === 'closing');
+      const mainEntryIndex = Number.isFinite(Number(queuedItem?.payload?.mainEntryImageIndex))
+        ? Number(queuedItem.payload.mainEntryImageIndex)
+        : 0;
+      const mainClosingIndex = Number.isFinite(Number(queuedItem?.payload?.mainClosingImageIndex))
+        ? Number(queuedItem.payload.mainClosingImageIndex)
+        : 0;
 
       if (entryEvidenceFiles.length === 0 && closingEvidenceFiles.length === 0 && storedFiles.length >= 2) {
         entryEvidenceFiles = [storedFiles[0]];
         closingEvidenceFiles = storedFiles.slice(1);
       }
 
-      if (entryEvidenceFiles.length === 0 || closingEvidenceFiles.length === 0) {
+      entryEvidenceFiles = reorderEvidenceByMainIndex(entryEvidenceFiles, mainEntryIndex);
+      closingEvidenceFiles = reorderEvidenceByMainIndex(closingEvidenceFiles, mainClosingIndex);
+
+      // If queue persistence is stale, use current in-memory captures for the selected session.
+      if ((entryEvidenceFiles.length === 0 || closingEvidenceFiles.length === 0) && itemId === selectedTrackedId) {
+        if (entryEvidenceFiles.length === 0 && Array.isArray(entryFiles) && entryFiles.length > 0) {
+          entryEvidenceFiles = entryFiles.map((file) => ({
+            name: file?.name,
+            type: file?.type,
+            blob: file,
+            phase: 'entry',
+          }));
+        }
+
+        if (closingEvidenceFiles.length === 0 && Array.isArray(closingFiles) && closingFiles.length > 0) {
+          closingEvidenceFiles = closingFiles.map((file) => ({
+            name: file?.name,
+            type: file?.type,
+            blob: file,
+            phase: 'closing',
+          }));
+        }
+
+        if (entryEvidenceFiles.length > 0 && closingEvidenceFiles.length > 0) {
+          const existingFiles = Array.isArray(queuedItem.files) ? queuedItem.files : [];
+          const preservedFiles = existingFiles.filter((file) => file?.phase !== 'entry' && file?.phase !== 'closing');
+          entryEvidenceFiles = reorderEvidenceByMainIndex(entryEvidenceFiles, mainEntryIndex);
+          closingEvidenceFiles = reorderEvidenceByMainIndex(closingEvidenceFiles, mainClosingIndex);
+          await updateQueueItem(itemId, {
+            files: [...preservedFiles, ...entryEvidenceFiles, ...closingEvidenceFiles],
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      }
+
+      const hasLocalPairedEvidence = entryEvidenceFiles.length > 0 && closingEvidenceFiles.length > 0;
+      const existingPayloadImages = [
+        ...(Array.isArray(queuedItem?.payload?.images) ? queuedItem.payload.images : []),
+        ...(Array.isArray(queuedItem?.payload?.imageUrls) ? queuedItem.payload.imageUrls : []),
+      ]
+        .filter((url) => typeof url === 'string' && /^https?:\/\//i.test(url))
+        .filter((url, index, all) => all.indexOf(url) === index);
+
+      const cameraRawRecords = Array.isArray(queuedItem?.payload?.cameraRawData)
+        ? queuedItem.payload.cameraRawData
+        : [];
+
+      const pickFirstHttpUrl = (...candidates) => {
+        for (const value of candidates) {
+          const candidate = String(value || '').trim();
+          if (/^https?:\/\//i.test(candidate)) return candidate;
+        }
+        return '';
+      };
+
+      const payloadEntryCameraRawImage = cameraRawRecords
+        .filter((record) => record?.phase === 'entry')
+        .map((record) => pickFirstHttpUrl(record?.uploadedUrl, record?.imageUrl, record?.url, record?.publicUrl))
+        .find(Boolean) || '';
+
+      const payloadClosingCameraRawImage = cameraRawRecords
+        .filter((record) => record?.phase === 'closing')
+        .map((record) => pickFirstHttpUrl(record?.uploadedUrl, record?.imageUrl, record?.url, record?.publicUrl))
+        .find(Boolean) || '';
+
+      const payloadEntryImage =
+        queuedItem?.payload?.evidence?.entry?.imageUrl ||
+        queuedItem?.payload?.evidence?.entry?.vehicleImage ||
+        payloadEntryCameraRawImage ||
+        existingPayloadImages[0] ||
+        '';
+      const payloadClosingImage =
+        queuedItem?.payload?.evidence?.exit?.imageUrl ||
+        queuedItem?.payload?.closingEvidence?.imageUrl ||
+        queuedItem?.payload?.evidence?.latest?.imageUrl ||
+        payloadClosingCameraRawImage ||
+        existingPayloadImages[1] ||
+        '';
+
+      const hasPayloadPairedEvidence = Boolean(payloadEntryImage && payloadClosingImage);
+
+      if (!hasLocalPairedEvidence && !hasPayloadPairedEvidence) {
         throw new Error('Paired opening and closing evidence is required before sync');
       }
 
-      const entryEvidence = await uploadEvidenceFiles(entryEvidenceFiles, queuedItem.payload.vrm);
-      const closingEvidence = await uploadEvidenceFiles(closingEvidenceFiles, queuedItem.payload.vrm);
+      const entryEvidence = hasLocalPairedEvidence
+        ? await uploadEvidenceFiles(entryEvidenceFiles, queuedItem.payload.vrm)
+        : { vrm: queuedItem.payload.vrm, images: [payloadEntryImage] };
+      const closingEvidence = hasLocalPairedEvidence
+        ? await uploadEvidenceFiles(closingEvidenceFiles, queuedItem.payload.vrm)
+        : { vrm: queuedItem.payload.vrm, images: [payloadClosingImage] };
 
       const vrm = normalizeVrm(closingEvidence.vrm || entryEvidence.vrm || queuedItem.payload.vrm);
       const authData = await checkAuthorization(vrm);
@@ -1510,6 +2192,7 @@ export default function DashboardPage() {
         entryEvidence.images || [],
         closingEvidence.images || []
       );
+      const cameraRawDataForSubmission = sanitizeCameraRawRecordsForSubmission(cameraRawDataForLos);
       const safeQueuedPayload = stripCarcheckFromPayload(queuedItem.payload);
       const breachPayload = {
         ...safeQueuedPayload,
@@ -1544,7 +2227,7 @@ export default function DashboardPage() {
         closedAt: closingTime,
         lastSeen: closingTime,
         actualMinutes: diffMinutes(entryTime, closingTime),
-        cameraRawData: cameraRawDataForLos,
+        cameraRawData: cameraRawDataForSubmission,
       };
 
       const breachResult = await fetchJson('/api/breaches/wardencapture', {
@@ -1575,11 +2258,11 @@ export default function DashboardPage() {
           setActiveTab('tracked');
           setPcnReasonInput(submittedItem?.payload?.pcnReason || 'No valid permit or payment found');
           setConvertError('');
-          setPcnDialogOpen(true);
+          setMessage('Parking Charge submitted. Use the primary action to complete final PCN submission.');
         }
       }
 
-      setMessage(`Breach submitted successfully: ${breachId || vrm}`);
+      setMessage(`Parking Charge submitted successfully: ${breachId || vrm}`);
       setSelectedVrm('');
       setEntryFiles([]);
       setEntryPreviews([]);
@@ -1594,14 +2277,17 @@ export default function DashboardPage() {
       setMonitoringSessionActive(false);
       setMonitoringSessionStartedAt('');
       if (fileInputRef.current) fileInputRef.current.value = '';
+      return { ok: true, breachId, vrm };
     } catch (error) {
       console.error('[warden] sync failed', error);
+      const failureMessage = error?.message || 'Sync failed';
       await updateQueueItem(itemId, {
         status: 'failed',
-        lastError: error?.message || 'Sync failed',
+        lastError: failureMessage,
         updatedAt: new Date().toISOString()
       });
-      setMessage(error?.message || 'Sync failed');
+      setMessage(failureMessage);
+      return { ok: false, error: failureMessage };
     } finally {
       await refreshQueue();
     }
@@ -1609,22 +2295,37 @@ export default function DashboardPage() {
 
   async function handleConvertToPcn() {
     if (!selectedTracked) return;
+    if (convertLoading) return;
 
     setConvertLoading(true);
     setConvertError('');
     try {
+      setPcnDialogOpen(false);
+      const trackedItemId = selectedTrackedId || selectedTracked?.id || '';
+      if (!trackedItemId) {
+        throw new Error('No tracked session selected for final PCN submission.');
+      }
+
       let workingItem = selectedTracked;
       let breachId = workingItem?.payload?.breachId || '';
 
       if (!breachId) {
         setMessage('Submitting evidence package before final PCN submission...');
-        await queueOrSendCapture({
-          targetItemId: selectedTrackedId || '',
-          openPcnDialogAfterSync: false,
+        const syncResult = await syncQueueItem(trackedItemId, {
+          openPcnDialogAfterSuccess: false,
+          forceBreachCapture: true,
         });
 
+        if (syncResult?.ok === false) {
+          throw new Error(syncResult.error || 'Failed to create breach record during sync');
+        }
+
+        if (!breachId && syncResult?.breachId) {
+          breachId = syncResult.breachId;
+        }
+
         const refreshedItems = await listQueueItems();
-        const refreshed = refreshedItems.find((item) => item.id === (selectedTrackedId || '')) || null;
+        const refreshed = refreshedItems.find((item) => item.id === trackedItemId) || null;
         if (refreshed) {
           workingItem = {
             ...selectedTracked,
@@ -1640,8 +2341,8 @@ export default function DashboardPage() {
         throw new Error('Could not create breach record before final PCN submission. Please retry.');
       }
 
-      const token = authToken || getStoredToken();
-      if (!token) throw new Error('auth_missing');
+      const token = await resolveAuthToken();
+      setMessage('Submitting PCN to backend...');
 
       const images = [
         ...(Array.isArray(workingItem?.payload?.images) ? workingItem.payload.images : []),
@@ -1689,7 +2390,9 @@ export default function DashboardPage() {
       setMonitoringSessionStartedAt('');
     } catch (error) {
       console.error('[warden] convert breach failed', error);
-      setConvertError(error?.message || 'Failed to convert breach to PCN');
+      const failureMessage = error?.message || 'Failed to convert breach to PCN';
+      setConvertError(failureMessage);
+      setMessage(`PCN submission failed: ${failureMessage}`);
     } finally {
       setConvertLoading(false);
     }
@@ -1771,6 +2474,8 @@ export default function DashboardPage() {
     setEntryPreviews(nextEntryPreviews);
     setClosingPreviews(nextClosingPreviews);
     setCameraRawData(Array.isArray(item?.payload?.cameraRawData) ? item.payload.cameraRawData : []);
+    setMainEntryImageIndex(Number.isFinite(Number(item?.payload?.mainEntryImageIndex)) ? Number(item.payload.mainEntryImageIndex) : 0);
+    setMainClosingImageIndex(Number.isFinite(Number(item?.payload?.mainClosingImageIndex)) ? Number(item.payload.mainClosingImageIndex) : 0);
     setEntryCapturedAt(item?.payload?.entryCapturedAt || item?.payload?.observationStartTime || '');
     setClosingCapturedAt(item?.payload?.closingCapturedAt || item?.payload?.observationEndTime || '');
 
@@ -1786,6 +2491,30 @@ export default function DashboardPage() {
     setMessage(`Loaded ${lifecycleLabel} ${itemVrm} for review.`);
   }
 
+  async function handleSetMainEvidenceImage(phase, index) {
+    const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+    const targetIndex = Math.max(0, Number(index) || 0);
+
+    if (normalizedPhase === 'entry') {
+      setMainEntryImageIndex(targetIndex);
+    } else {
+      setMainClosingImageIndex(targetIndex);
+    }
+
+    if (!selectedTrackedId) return;
+
+    const payloadKey = normalizedPhase === 'entry' ? 'mainEntryImageIndex' : 'mainClosingImageIndex';
+    const selectedPayload = selectedTracked?.payload || {};
+    await updateQueueItem(selectedTrackedId, {
+      payload: {
+        ...selectedPayload,
+        [payloadKey]: targetIndex,
+      },
+      updatedAt: new Date().toISOString(),
+    });
+    await refreshQueue();
+  }
+
   async function handleFinalize({ openPcnDialogAfterSync = false } = {}) {
     setBusy(true);
     try {
@@ -1798,12 +2527,6 @@ export default function DashboardPage() {
     } finally {
       setBusy(false);
     }
-  }
-
-  function openPcnSubmissionDialog() {
-    setPcnReasonInput(selectedTracked?.payload?.pcnReason || 'No valid permit or payment found');
-    setConvertError('');
-    setPcnDialogOpen(true);
   }
 
   async function handleRestartSession() {
@@ -1847,15 +2570,17 @@ export default function DashboardPage() {
     setEntryFiles([]);
     setEntryPreviews([]);
     setEntryCapturedAt('');
+    setMainEntryImageIndex(0);
     setClosingFiles([]);
     setClosingPreviews([]);
     setClosingCapturedAt('');
+    setMainClosingImageIndex(0);
     setCameraRawData([]);
     setMonitoringSessionActive(false);
     setMonitoringSessionStartedAt('');
     setPcnDialogOpen(false);
     setConvertError('');
-    setMessage(`Restarted session for ${restartPayload.vrm || selectedTracked.vrm}. Capture opening evidence to begin a new observation.`);
+    setMessage(`Restarted Draft Parking Charge for ${restartPayload.vrm || selectedTracked.vrm}. Capture opening evidence to begin a new observation.`);
   }
 
   async function handlePrimaryCaptureAction() {
@@ -2013,8 +2738,8 @@ export default function DashboardPage() {
           {filteredBreaches.length === 0 ? (
             <div className="empty-state">
               <div className="empty-icon">🚗</div>
-              <p className="empty-title">No sessions yet</p>
-              <p className="empty-hint">Tap <strong>+</strong> to start tracking a vehicle</p>
+              <p className="empty-title">No parking charges yet</p>
+              <p className="empty-hint">Tap <strong>+</strong> to create a Draft Parking Charge</p>
             </div>
           ) : (
             <div className="sessions-list">
@@ -2213,8 +2938,42 @@ export default function DashboardPage() {
                 {entryPreviews.length > 0 ? (
                   <>
                     <div className="evidence-thumbs">
-                      {entryPreviews.slice(0, 4).map((p, i) => (
-                        <img key={i} src={p} alt={`Entry ${i + 1}`} className="evidence-thumb" />
+                      {entryPreviews.map((p, i) => (
+                        <div
+                          key={i}
+                          className="evidence-thumb-stack"
+                          style={{ border: mainEntryImageIndex === i ? '2px solid #00d084' : '1px solid transparent' }}
+                        >
+                          <button
+                            type="button"
+                            className="evidence-thumb-button"
+                            onClick={() => openImageDetailDialog({
+                              src: p,
+                              label: `Entry ${i + 1}`,
+                              phase: 'entry',
+                              isMain: mainEntryImageIndex === i,
+                              file: entryFiles[i] || null,
+                              capturedAt: entryFiles[i]?.capturedAt || entryCapturedAt,
+                              fileName: entryFiles[i]?.name || `entry_${i + 1}.jpg`,
+                              mimeType: entryFiles[i]?.type || '',
+                              sizeBytes: Number(entryFiles[i]?.size || 0),
+                            })}
+                            title="Open image details"
+                          >
+                            <img src={p} alt={`Entry ${i + 1}`} className="evidence-thumb" />
+                            <span className="evidence-thumb-badge">
+                              {mainEntryImageIndex === i ? 'MAIN' : 'VIEW'}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            className={`evidence-main-btn ${mainEntryImageIndex === i ? 'evidence-main-btn--active' : ''}`}
+                            onClick={() => handleSetMainEvidenceImage('entry', i)}
+                            title={mainEntryImageIndex === i ? 'Main entry image' : 'Set as main entry image'}
+                          >
+                            {mainEntryImageIndex === i ? 'Main image' : 'Set main'}
+                          </button>
+                        </div>
                       ))}
                     </div>
                     <div className="evidence-count">{entryFiles.length} photo{entryFiles.length !== 1 ? 's' : ''}</div>
@@ -2238,8 +2997,42 @@ export default function DashboardPage() {
                 {closingPreviews.length > 0 ? (
                   <>
                     <div className="evidence-thumbs">
-                      {closingPreviews.slice(0, 4).map((p, i) => (
-                        <img key={i} src={p} alt={`Closing ${i + 1}`} className="evidence-thumb" />
+                      {closingPreviews.map((p, i) => (
+                        <div
+                          key={i}
+                          className="evidence-thumb-stack"
+                          style={{ border: mainClosingImageIndex === i ? '2px solid #00d084' : '1px solid transparent' }}
+                        >
+                          <button
+                            type="button"
+                            className="evidence-thumb-button"
+                            onClick={() => openImageDetailDialog({
+                              src: p,
+                              label: `Closing ${i + 1}`,
+                              phase: 'closing',
+                              isMain: mainClosingImageIndex === i,
+                              file: closingFiles[i] || null,
+                              capturedAt: closingFiles[i]?.capturedAt || closingCapturedAt,
+                              fileName: closingFiles[i]?.name || `closing_${i + 1}.jpg`,
+                              mimeType: closingFiles[i]?.type || '',
+                              sizeBytes: Number(closingFiles[i]?.size || 0),
+                            })}
+                            title="Open image details"
+                          >
+                            <img src={p} alt={`Closing ${i + 1}`} className="evidence-thumb" />
+                            <span className="evidence-thumb-badge">
+                              {mainClosingImageIndex === i ? 'MAIN' : 'VIEW'}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            className={`evidence-main-btn ${mainClosingImageIndex === i ? 'evidence-main-btn--active' : ''}`}
+                            onClick={() => handleSetMainEvidenceImage('closing', i)}
+                            title={mainClosingImageIndex === i ? 'Main closing image' : 'Set as main closing image'}
+                          >
+                            {mainClosingImageIndex === i ? 'Main image' : 'Set main'}
+                          </button>
+                        </div>
                       ))}
                     </div>
                     <div className="evidence-count">{closingFiles.length} photo{closingFiles.length !== 1 ? 's' : ''}</div>
@@ -2269,33 +3062,21 @@ export default function DashboardPage() {
               </button>
             ) : null}
 
-            {/* Issue PCN — only when both evidence types present */}
-            {canFinalizeBreach ? (
+            {/* Single submit flow: sync evidence (if needed) and submit PCN once */}
+            {canIssuePcnFromCurrentState ? (
               <button
                 type="button"
                 className="action-btn action-btn--issue"
-                onClick={openPcnSubmissionDialog}
-                disabled={busy}
+                onClick={handleConvertToPcn}
+                disabled={busy || convertLoading}
               >
-                {busy ? '📋 Saving…' : '📋 Issue PCN'}
+                {convertLoading
+                  ? 'Submitting...'
+                  : (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')}
               </button>
             ) : null}
 
-            {/* Convert to formal PCN if breach already in system */}
-            {(selectedTracked?.lifecycle?.code === 'SUBMITTED' || selectedTracked?.payload?.breachId) ? (
-              <button
-                type="button"
-                className="carcheck-open-btn"
-                onClick={() => {
-                  setConvertError('');
-                  setPcnDialogOpen(true);
-                }}
-              >
-                <span className="carcheck-open-btn-title">Convert to formal PCN</span>
-                <span className="carcheck-open-btn-sub">Open conversion dialog</span>
-                <span className="carcheck-open-btn-arrow">Open</span>
-              </button>
-            ) : null}
+            {convertError ? <div className="notice notice-error">{convertError}</div> : null}
 
             {['SUBMITTED', 'CONVERTED'].includes(selectedTracked?.lifecycle?.code) ? (
               <button
@@ -2466,11 +3247,27 @@ export default function DashboardPage() {
                   {filteredCameraRawFeed.map((item, index) => (
                     <article className="camera-raw-list-item" key={item.recordKey || `camera-raw-${index}`}>
                       {resolveCameraRawImageSrc(item) ? (
-                        <img
-                          src={resolveCameraRawImageSrc(item)}
-                          alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
-                          className="camera-raw-list-image"
-                        />
+                        <button
+                          type="button"
+                          className="camera-raw-image-btn"
+                          onClick={() => openImageDetailDialog({
+                            src: resolveCameraRawImageSrc(item),
+                            label: `${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`,
+                            phase: item?.phase === 'closing' ? 'closing' : 'entry',
+                            isMain: false,
+                            capturedAt: item?.capturedAt || '',
+                            fileName: item?.fileName || `capture_${index + 1}.jpg`,
+                            mimeType: item?.mimeType || '',
+                            sizeBytes: Number(item?.sizeBytes || 0),
+                            record: item,
+                          })}
+                        >
+                          <img
+                            src={resolveCameraRawImageSrc(item)}
+                            alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
+                            className="camera-raw-list-image"
+                          />
+                        </button>
                       ) : (
                         <div className="camera-raw-list-placeholder">No image</div>
                       )}
@@ -2497,11 +3294,27 @@ export default function DashboardPage() {
                   {filteredCameraRawFeed.map((item, index) => (
                     <article className="camera-raw-card" key={item.recordKey || `camera-raw-${index}`}>
                       {resolveCameraRawImageSrc(item) ? (
-                        <img
-                          src={resolveCameraRawImageSrc(item)}
-                          alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
-                          className="camera-raw-image"
-                        />
+                        <button
+                          type="button"
+                          className="camera-raw-image-btn"
+                          onClick={() => openImageDetailDialog({
+                            src: resolveCameraRawImageSrc(item),
+                            label: `${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`,
+                            phase: item?.phase === 'closing' ? 'closing' : 'entry',
+                            isMain: false,
+                            capturedAt: item?.capturedAt || '',
+                            fileName: item?.fileName || `capture_${index + 1}.jpg`,
+                            mimeType: item?.mimeType || '',
+                            sizeBytes: Number(item?.sizeBytes || 0),
+                            record: item,
+                          })}
+                        >
+                          <img
+                            src={resolveCameraRawImageSrc(item)}
+                            alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
+                            className="camera-raw-image"
+                          />
+                        </button>
                       ) : null}
                       <div className="camera-raw-meta">
                         <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
@@ -2578,6 +3391,68 @@ export default function DashboardPage() {
         </button>
       </nav>
 
+      {imageDetailDialog.open ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Image viewer"
+          onClick={closeImageDetailDialog}
+        >
+          <div
+            className={`carcheck-sheet image-detail-sheet ${imageDetailDialog.fullscreen ? 'image-detail-sheet--fullscreen' : ''}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-kicker">Evidence image</div>
+                <div className="carcheck-sheet-title">{imageDetailDialog.label || 'Image details'}</div>
+                <div className="image-detail-subtitle">
+                  {imageDetailDialog.phase ? `${imageDetailDialog.phase === 'closing' ? 'Closing' : 'Entry'} evidence` : 'Capture'}
+                  {imageDetailDialog.isMain ? ' · Main image' : ''}
+                </div>
+              </div>
+              <div className="image-detail-actions">
+                <button type="button" className="ghost-button" onClick={toggleImageDetailFullscreen}>
+                  {imageDetailDialog.fullscreen ? 'Window' : 'Full'}
+                </button>
+                <button type="button" className="ghost-button stepper-close" onClick={closeImageDetailDialog}>
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="carcheck-sheet-body">
+              <img
+                src={imageDetailDialog.src}
+                alt={imageDetailDialog.label || 'Evidence image'}
+                className="image-detail-preview"
+              />
+
+              {imageDetailDialog.loading ? (
+                <div className="notice notice-info">Preparing image…</div>
+              ) : null}
+              {imageDetailDialog.error ? (
+                <div className="notice notice-error">{imageDetailDialog.error}</div>
+              ) : null}
+
+              <div className="image-detail-meta-strip">
+                <span>
+                  {imageDetailDialog.capturedAt
+                    ? `Captured ${new Date(imageDetailDialog.capturedAt).toLocaleString()}`
+                    : 'Capture time unavailable'}
+                </span>
+                <span>
+                  {imageDetailDialog.dimensions?.width && imageDetailDialog.dimensions?.height
+                    ? `${imageDetailDialog.dimensions.width} × ${imageDetailDialog.dimensions.height}`
+                    : ''}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {settingsOpen ? (
         <div
           className="carcheck-overlay"
@@ -2616,6 +3491,21 @@ export default function DashboardPage() {
               </div>
 
               <div className="detail-section-label" style={{ marginTop: 8 }}>Operations</div>
+              <div className="settings-row">
+                <span className="settings-row-label">Auto-submit after closing capture</span>
+                <button
+                  type="button"
+                  className={`theme-toggle-btn ${autoSubmitOnClosingCapture ? 'theme-toggle-btn--dark' : 'theme-toggle-btn--light'}`}
+                  aria-pressed={autoSubmitOnClosingCapture}
+                  aria-label="Toggle auto-submit after closing capture"
+                  onClick={() => setAutoSubmitOnClosingCapture((current) => !current)}
+                >
+                  <span className="theme-toggle-btn-track">
+                    <span className="theme-toggle-btn-thumb" />
+                  </span>
+                  <span className="theme-toggle-btn-label">{autoSubmitOnClosingCapture ? 'On' : 'Off'}</span>
+                </button>
+              </div>
               <div className="settings-row settings-row--stacked">
                 <span className="settings-row-label">Active site</span>
                 <select
@@ -2654,7 +3544,7 @@ export default function DashboardPage() {
                   setSettingsOpen(false);
                 }}
               >
-                Open sessions
+                Open parking charges
               </button>
 
               <button
@@ -2675,8 +3565,8 @@ export default function DashboardPage() {
           type="button"
           className="fab-new-breach"
           onClick={() => setStepperOpen(true)}
-          aria-label="Start new breach session"
-          title="Start new breach session"
+          aria-label="Start Draft Parking Charge"
+          title="Start Draft Parking Charge"
         >
           +
         </button>
@@ -2690,6 +3580,7 @@ export default function DashboardPage() {
         sites={sites}
         contraventions={contraventions}
         selectedSiteId={selectedSiteId}
+        onPlateScan={scanPlateFromImage}
       />
 
         {carcheckDialogOpen ? (
@@ -2774,7 +3665,7 @@ export default function DashboardPage() {
         </div>
       ) : null}
 
-      {pcnDialogOpen ? (
+      {false ? (
         <div
           className="carcheck-overlay"
           role="dialog"
