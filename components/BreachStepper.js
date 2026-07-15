@@ -2,7 +2,7 @@ import { useRef, useState, useMemo, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { Capacitor } from '@capacitor/core';
 import { isMlKitReady, scanPlateWithMlKit } from '../lib/mlkitLpr';
-import { canUseNativeCameraPreview, captureNativeCameraSample, startNativeCameraPreview, stopNativeCameraPreview } from '../lib/nativeCameraPreview';
+import { canUseNativeCameraPreview, captureNativeCameraSample, setNativeCameraTorchEnabled, startNativeCameraPreview, stopNativeCameraPreview } from '../lib/nativeCameraPreview';
 
 function fileToDataUrl(file) {
     return new Promise((resolve, reject) => {
@@ -228,6 +228,23 @@ async function waitForVideoDimensions(video, timeoutMs = 2500) {
         await new Promise((resolve) => window.setTimeout(resolve, 80));
     }
     return false;
+}
+
+function shouldEnableNightTorch(now = new Date()) {
+    const hour = Number(now.getHours());
+    return hour >= 18 || hour < 6;
+}
+
+async function setWebTrackTorch(track, enabled) {
+    if (!track || typeof track.applyConstraints !== 'function') return;
+
+    try {
+        const capabilities = typeof track.getCapabilities === 'function' ? track.getCapabilities() : null;
+        if (!capabilities?.torch) return;
+        await track.applyConstraints({ advanced: [{ torch: Boolean(enabled) }] });
+    } catch (_) {
+        // Ignore torch failures on browsers/devices without writable torch controls.
+    }
 }
 
 // Correct common OCR character confusions ONLY inside the digit sections of
@@ -573,6 +590,7 @@ export default function BreachStepper({
 
     async function startLiveCamera() {
         if (liveCameraActive) return;
+        const autoNightTorch = shouldEnableNightTorch();
 
         const runScanLoop = () => {
             liveScanStartedAtRef.current = Date.now();
@@ -738,6 +756,7 @@ export default function BreachStepper({
         if (canUseNativeCameraPreview()) {
             try {
                 await startNativeCameraPreview();
+                await setNativeCameraTorchEnabled(autoNightTorch);
                 nativePreviewActiveRef.current = true;
                 setLiveCameraActive(true);
                 setLiveEngine('native-preview');
@@ -762,6 +781,11 @@ export default function BreachStepper({
                     height: { ideal: 720 },
                 },
             });
+
+            const [videoTrack] = stream.getVideoTracks();
+            if (videoTrack) {
+                await setWebTrackTorch(videoTrack, autoNightTorch);
+            }
 
             liveStreamRef.current = stream;
             const video = liveVideoRef.current;
