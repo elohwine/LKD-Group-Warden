@@ -15,7 +15,7 @@ const server = {
 
 module.exports = {
   appId: 'com.ldk.warden.mobile',
-  appName: 'LKD Group Warden',
+  appName: 'LDK Warden',
   webDir: 'out',
   bundledWebRuntime: false,
   server,
@@ -29,6 +29,9 @@ module.exports = {
       androidSplashResourceName: 'splash',
       androidScaleType: 'CENTER_CROP',
       showSpinner: false
+    },
+    StatusBar: {
+      overlaysWebView: false
     }
   }
 };

@@ -199,15 +199,18 @@ function computeIou(a, b) {
     return intersection / union;
 }
 
-// Scan interval and lock thresholds — tuned for quick UX on patrol:
-// 350 ms interval × 2 lock frames = 0.7 s minimum lock time.
-// Hard fallback capture at ~3.5 s if OCR does not settle.
-const LIVE_SCAN_INTERVAL_MS = 350;
-const LIVE_REQUIRED_LOCK_FRAMES = 2;
+// Scan interval and lock thresholds:
+// - Warm-up allows user to center the vehicle before lock/fallback counters begin.
+// - Stable lock requires multiple consistent frames before auto-capture.
+// - Hard fallback captures a frame without OCR if no plate is found within the window.
+const LIVE_SCAN_INTERVAL_MS = 300;
+const LIVE_REQUIRED_LOCK_FRAMES = 3;
 const LIVE_MIN_CONFIDENCE = 52;
 const LIVE_IOU_THRESHOLD = 0.46;
-const LIVE_MAX_NO_PLATE_FRAMES = 7;
-const LIVE_MAX_SCAN_MS = 3500;
+const LIVE_MAX_NO_PLATE_FRAMES = 15;
+const LIVE_LOCK_WARMUP_MS = 900;
+const LIVE_MIN_LOCK_MS = 1200;
+const LIVE_MAX_SCAN_MS = 5200;
 const IMAGE_SCAN_TIMEOUT_MS = 12000;
 
 function withTimeout(promise, timeoutMs) {
@@ -473,6 +476,7 @@ export default function BreachStepper({
     async function appendCapturedFiles(captured, initialScanResult = null, options = {}) {
         if (!captured.length) return;
         const allowWebFallback = Boolean(options.allowWebFallback);
+        const skipOcr = Boolean(options.skipOcr);
 
         const fallbackCapturedAt = new Date().toISOString();
         const stampedCaptured = await Promise.all(
@@ -498,7 +502,7 @@ export default function BreachStepper({
         const nextPreviews = [...newPreviews];
 
         let result = initialScanResult;
-        if (!result && captured[0]) {
+        if (!skipOcr && !result && captured[0]) {
             try {
                 setScanState((prev) => ({ ...prev, loading: true }));
                 if (mlkitReadyRef.current) {
@@ -571,7 +575,7 @@ export default function BreachStepper({
                     return;
                 }
                 stopLiveCamera();
-                await appendCapturedFiles([fallbackFrame], null, { allowWebFallback: false });
+                await appendCapturedFiles([fallbackFrame], null, { allowWebFallback: false, skipOcr: true });
                 setScanState({ loading: false, text: 'No plate detected. Enter VRM manually.', confidence: 0 });
             };
 
@@ -629,12 +633,15 @@ export default function BreachStepper({
                     const plateText = normalizeVrm(result?.plateText || '');
                     const bbox = result?.bbox || null;
                     const confidence = Number(result?.confidence || 0);
+                    const warmupActive = elapsedMs < LIVE_LOCK_WARMUP_MS;
 
                     if (!plateText || !bbox) {
-                        liveNoPlateFramesRef.current += 1;
-                        if (liveNoPlateFramesRef.current >= LIVE_MAX_NO_PLATE_FRAMES) {
-                            await fallbackToManual(frameFile);
-                            return;
+                        if (!warmupActive) {
+                            liveNoPlateFramesRef.current += 1;
+                            if (liveNoPlateFramesRef.current >= LIVE_MAX_NO_PLATE_FRAMES) {
+                                await fallbackToManual(frameFile);
+                                return;
+                            }
                         }
                         const prev = liveStableRef.current;
                         const downshift = Math.max(0, Number(prev.frames || 0) - 1);
@@ -656,10 +663,12 @@ export default function BreachStepper({
                     const plausiblePlate = isLikelyPlateFormat(plateText);
                     const boostedConfidence = Math.min(100, confidence + (plausiblePlate ? 8 : 0));
                     if (!plausiblePlate || boostedConfidence < 40) {
-                        liveNoPlateFramesRef.current += 1;
-                        if (liveNoPlateFramesRef.current >= LIVE_MAX_NO_PLATE_FRAMES) {
-                            await fallbackToManual(frameFile);
-                            return;
+                        if (!warmupActive) {
+                            liveNoPlateFramesRef.current += 1;
+                            if (liveNoPlateFramesRef.current >= LIVE_MAX_NO_PLATE_FRAMES) {
+                                await fallbackToManual(frameFile);
+                                return;
+                            }
                         }
                         const prev = liveStableRef.current;
                         const downshift = Math.max(0, Number(prev.frames || 0) - 1);
@@ -700,14 +709,10 @@ export default function BreachStepper({
                     };
                     setLockFrames(nextFrames);
 
-                    // Fast lock: if confidence is already very high, accept immediately.
-                    if (boostedConfidence >= 82) {
-                        stopLiveCamera();
-                        await appendCapturedFiles([frameFile], result, { allowWebFallback: false });
-                        return;
-                    }
+                    const warmupSatisfied = elapsedMs >= LIVE_LOCK_WARMUP_MS;
+                    const minLockSatisfied = elapsedMs >= LIVE_MIN_LOCK_MS;
 
-                    if (nextFrames >= LIVE_REQUIRED_LOCK_FRAMES && averageConfidence >= LIVE_MIN_CONFIDENCE) {
+                    if (warmupSatisfied && minLockSatisfied && nextFrames >= LIVE_REQUIRED_LOCK_FRAMES && averageConfidence >= LIVE_MIN_CONFIDENCE) {
                         stopLiveCamera();
                         await appendCapturedFiles([frameFile], result, { allowWebFallback: false });
                     }

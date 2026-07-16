@@ -8,12 +8,8 @@ def keystorePath = envOrProperty('WARDEN_KEYSTORE_PATH')
 def keystoreAlias = envOrProperty('WARDEN_KEYSTORE_ALIAS')
 def keystorePassword = envOrProperty('WARDEN_KEYSTORE_PASSWORD')
 def keystoreAliasPassword = envOrProperty('WARDEN_KEY_PASSWORD')
-def isReleaseBuildRequested = gradle.startParameter.taskNames.any { taskName ->
-    def normalized = String.valueOf(taskName).toLowerCase()
-    normalized.contains('release') || normalized.contains('bundle')
-}
 
-if (isReleaseBuildRequested && (!keystorePath || !keystoreAlias || !keystorePassword || !keystoreAliasPassword)) {
+if (!keystorePath || !keystoreAlias || !keystorePassword || !keystoreAliasPassword) {
     throw new GradleException('Missing WARDEN_KEYSTORE_* environment variables. Export WARDEN_KEYSTORE_PATH, WARDEN_KEYSTORE_ALIAS, WARDEN_KEYSTORE_PASSWORD, and WARDEN_KEY_PASSWORD before building.')
 }
 
@@ -23,16 +19,14 @@ android {
 
     signingConfigs {
             release {
-                if (keystorePath && keystoreAlias && keystorePassword && keystoreAliasPassword) {
-                    storeFile file(keystorePath)
-                    storePassword keystorePassword
-                    keyAlias keystoreAlias
-                    keyPassword keystoreAliasPassword
-                }
+                storeFile file(keystorePath)
+                storePassword keystorePassword
+                keyAlias keystoreAlias
+                keyPassword keystoreAliasPassword
             }
         }
     defaultConfig {
-        applicationId "com.ldk.warden.mobile"
+        applicationId "com.ldk.warden"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
@@ -84,10 +78,6 @@ dependencies {
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
-    implementation "androidx.camera:camera-core:1.4.2"
-    implementation "androidx.camera:camera-camera2:1.4.2"
-    implementation "androidx.camera:camera-lifecycle:1.4.2"
-    implementation "com.google.mlkit:text-recognition:16.0.1"
     implementation project(':capacitor-android')
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"

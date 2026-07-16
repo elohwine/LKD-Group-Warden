@@ -1,0 +1,23 @@
+{
+	"appId": "com.ldk.warden",
+	"appName": "LKD Group Warden",
+	"webDir": "out",
+	"bundledWebRuntime": false,
+	"server": {
+		"allowNavigation": [
+			"www.ldkgroup.co.uk"
+		]
+	},
+	"plugins": {
+		"CapacitorHttp": {
+			"enabled": true
+		},
+		"SplashScreen": {
+			"launchShowDuration": 0,
+			"backgroundColor": "#08111d",
+			"androidSplashResourceName": "splash",
+			"androidScaleType": "CENTER_CROP",
+			"showSpinner": false
+		}
+	}
+}

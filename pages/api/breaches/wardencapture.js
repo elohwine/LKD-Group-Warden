@@ -2,6 +2,14 @@ import { adminAuth, adminDb } from '../../../lib/firebase-admin.mjs';
 import { Timestamp } from 'firebase-admin/firestore';
 import normalizeVrm from '../../../lib/normalizeVrm.mjs';
 
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+  },
+};
+
 /**
  * POST /api/breaches/wardencapture
  * Accept a breach report from a warden (parking enforcement officer).
