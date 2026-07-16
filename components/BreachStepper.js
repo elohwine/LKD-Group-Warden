@@ -205,12 +205,15 @@ function computeIou(a, b) {
 // - Hard fallback captures a frame without OCR if no plate is found within the window.
 const LIVE_SCAN_INTERVAL_MS = 300;
 const LIVE_REQUIRED_LOCK_FRAMES = 3;
+const LIVE_PROTECTED_CANDIDATE_FRAMES = 2;
 const LIVE_MIN_CONFIDENCE = 52;
 const LIVE_IOU_THRESHOLD = 0.46;
 const LIVE_MAX_NO_PLATE_FRAMES = 15;
 const LIVE_LOCK_WARMUP_MS = 900;
 const LIVE_MIN_LOCK_MS = 1200;
 const LIVE_MAX_SCAN_MS = 5200;
+const LIVE_REPLACEMENT_REQUIRED_FRAMES = 2;
+const LIVE_REPLACEMENT_CONFIDENCE_MARGIN = 10;
 const IMAGE_SCAN_TIMEOUT_MS = 12000;
 
 function withTimeout(promise, timeoutMs) {
@@ -302,6 +305,7 @@ export default function BreachStepper({
     const liveStreamRef = useRef(null);
     const liveScanBusyRef = useRef(false);
     const liveStableRef = useRef({ plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 });
+    const liveReplacementRef = useRef({ plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 });
     const liveNoPlateFramesRef = useRef(0);
     const liveScanStartedAtRef = useRef(0);
     const liveLastFrameRef = useRef(null);
@@ -399,6 +403,7 @@ export default function BreachStepper({
         liveStreamRef.current = null;
         liveScanBusyRef.current = false;
         liveStableRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
+        liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
         liveNoPlateFramesRef.current = 0;
         liveScanStartedAtRef.current = 0;
         liveLastFrameRef.current = null;
@@ -652,6 +657,7 @@ export default function BreachStepper({
                             confidence: 0,
                             confidenceSum: Math.max(0, Number(prev.confidenceSum || 0) - Number(prev.confidence || 0)),
                         };
+                        liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
                         setLivePlateBox(null);
                         setLockFrames(downshift);
                         setScanState({ loading: false, text: '', confidence: 0 });
@@ -661,8 +667,8 @@ export default function BreachStepper({
                     liveNoPlateFramesRef.current = 0;
 
                     const plausiblePlate = isLikelyPlateFormat(plateText);
-                    const boostedConfidence = Math.min(100, confidence + (plausiblePlate ? 8 : 0));
-                    if (!plausiblePlate || boostedConfidence < 40) {
+                    const effectiveConfidence = Math.min(100, confidence);
+                    if (!plausiblePlate || effectiveConfidence < 40) {
                         if (!warmupActive) {
                             liveNoPlateFramesRef.current += 1;
                             if (liveNoPlateFramesRef.current >= LIVE_MAX_NO_PLATE_FRAMES) {
@@ -676,43 +682,105 @@ export default function BreachStepper({
                             plateText: '',
                             bbox: null,
                             frames: downshift,
-                            confidence: boostedConfidence,
+                            confidence: effectiveConfidence,
                             confidenceSum: Math.max(0, Number(prev.confidenceSum || 0) - Number(prev.confidence || 0)),
                         };
+                        liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
                         setLockFrames(downshift);
-                        setScanState({ loading: false, text: plateText, confidence: boostedConfidence });
+                        setScanState({ loading: false, text: plateText, confidence: effectiveConfidence });
                         return;
                     }
 
-                    setScanState({ loading: false, text: plateText, confidence: boostedConfidence });
-                    setLivePlateBox(null);
-
                     const prev = liveStableRef.current;
-                    const sameText = prev.plateText === plateText;
                     const overlap = computeIou(prev.bbox, bbox);
-                    const confidenceDrift = Math.abs(Number(prev.confidence || 0) - boostedConfidence);
+                    const confidenceDrift = Math.abs(Number(prev.confidence || 0) - effectiveConfidence);
                     const confidenceConsistent = confidenceDrift <= 24;
-                    const nextFrames = sameText && overlap >= LIVE_IOU_THRESHOLD && confidenceConsistent
-                        ? prev.frames + 1
-                        : 1;
-                    const nextConfidenceSum = nextFrames > 1
-                        ? Number(prev.confidenceSum || 0) + boostedConfidence
-                        : boostedConfidence;
-                    const averageConfidence = nextFrames > 0 ? nextConfidenceSum / nextFrames : 0;
+                    const hasProtectedCandidate = Boolean(prev.plateText) && Number(prev.frames || 0) >= LIVE_PROTECTED_CANDIDATE_FRAMES;
 
-                    liveStableRef.current = {
-                        plateText,
-                        bbox,
-                        frames: nextFrames,
-                        confidence: boostedConfidence,
-                        confidenceSum: nextConfidenceSum,
-                    };
-                    setLockFrames(nextFrames);
+                    if (hasProtectedCandidate && prev.plateText !== plateText && overlap >= LIVE_IOU_THRESHOLD) {
+                        const challengerPrev = liveReplacementRef.current;
+                        const challengerOverlap = computeIou(challengerPrev.bbox, bbox);
+                        const challengerSameText = challengerPrev.plateText === plateText;
+                        const challengerDrift = Math.abs(Number(challengerPrev.confidence || 0) - effectiveConfidence);
+                        const challengerConsistent = challengerDrift <= 24;
+                        const challengerFrames = challengerSameText && challengerOverlap >= LIVE_IOU_THRESHOLD && challengerConsistent
+                            ? Number(challengerPrev.frames || 0) + 1
+                            : 1;
+                        const challengerConfidenceSum = challengerFrames > 1
+                            ? Number(challengerPrev.confidenceSum || 0) + effectiveConfidence
+                            : effectiveConfidence;
+                        const challengerAverageConfidence = challengerFrames > 0 ? challengerConfidenceSum / challengerFrames : 0;
+                        const stableAverageConfidence = Number(prev.frames || 0) > 0
+                            ? Number(prev.confidenceSum || 0) / Number(prev.frames || 1)
+                            : Number(prev.confidence || 0);
+
+                        liveReplacementRef.current = {
+                            plateText,
+                            bbox,
+                            frames: challengerFrames,
+                            confidence: effectiveConfidence,
+                            confidenceSum: challengerConfidenceSum,
+                        };
+
+                        const challengerIsStronger = challengerAverageConfidence >= stableAverageConfidence + LIVE_REPLACEMENT_CONFIDENCE_MARGIN;
+                        if (!challengerIsStronger || challengerFrames < LIVE_REPLACEMENT_REQUIRED_FRAMES) {
+                            setScanState({ loading: false, text: prev.plateText, confidence: stableAverageConfidence });
+                            setLockFrames(Number(prev.frames || 0));
+                            setLivePlateBox(null);
+                            return;
+                        }
+
+                        liveStableRef.current = {
+                            plateText,
+                            bbox,
+                            frames: challengerFrames,
+                            confidence: effectiveConfidence,
+                            confidenceSum: challengerConfidenceSum,
+                        };
+                        liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
+                        setScanState({ loading: false, text: plateText, confidence: challengerAverageConfidence });
+                        setLockFrames(challengerFrames);
+                        setLivePlateBox(null);
+                    } else {
+                        const sameText = prev.plateText === plateText;
+                        const nextFrames = sameText && overlap >= LIVE_IOU_THRESHOLD && confidenceConsistent
+                            ? prev.frames + 1
+                            : 1;
+                        const nextConfidenceSum = nextFrames > 1
+                            ? Number(prev.confidenceSum || 0) + effectiveConfidence
+                            : effectiveConfidence;
+                        const averageConfidence = nextFrames > 0 ? nextConfidenceSum / nextFrames : 0;
+
+                        liveStableRef.current = {
+                            plateText,
+                            bbox,
+                            frames: nextFrames,
+                            confidence: effectiveConfidence,
+                            confidenceSum: nextConfidenceSum,
+                        };
+                        liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
+                        setScanState({ loading: false, text: plateText, confidence: averageConfidence });
+                        setLockFrames(nextFrames);
+                        setLivePlateBox(null);
+
+                        const warmupSatisfied = elapsedMs >= LIVE_LOCK_WARMUP_MS;
+                        const minLockSatisfied = elapsedMs >= LIVE_MIN_LOCK_MS;
+
+                        if (warmupSatisfied && minLockSatisfied && nextFrames >= LIVE_REQUIRED_LOCK_FRAMES && averageConfidence >= LIVE_MIN_CONFIDENCE) {
+                            stopLiveCamera();
+                            await appendCapturedFiles([frameFile], result, { allowWebFallback: false });
+                        }
+                        return;
+                    }
 
                     const warmupSatisfied = elapsedMs >= LIVE_LOCK_WARMUP_MS;
                     const minLockSatisfied = elapsedMs >= LIVE_MIN_LOCK_MS;
 
-                    if (warmupSatisfied && minLockSatisfied && nextFrames >= LIVE_REQUIRED_LOCK_FRAMES && averageConfidence >= LIVE_MIN_CONFIDENCE) {
+                    if (warmupSatisfied && minLockSatisfied && Number(liveStableRef.current.frames || 0) >= LIVE_REQUIRED_LOCK_FRAMES) {
+                        const stableAverageConfidence = Number(liveStableRef.current.frames || 0) > 0
+                            ? Number(liveStableRef.current.confidenceSum || 0) / Number(liveStableRef.current.frames || 1)
+                            : Number(liveStableRef.current.confidence || 0);
+                        if (stableAverageConfidence < LIVE_MIN_CONFIDENCE) return;
                         stopLiveCamera();
                         await appendCapturedFiles([frameFile], result, { allowWebFallback: false });
                     }

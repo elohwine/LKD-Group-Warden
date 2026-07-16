@@ -4,20 +4,54 @@ import { Capacitor } from '@capacitor/core';
 import ErrorBoundary from '../components/ErrorBoundary.js';
 import '../styles/globals.css';
 
+const DARK_THEME_COLOR = '#0d1b2a';
+const LIGHT_THEME_COLOR = '#f6f9fd';
+
 export default function WardenApp({ Component, pageProps }) {
   useEffect(() => {
     async function configureNativeStatusBar() {
-      if (!Capacitor.isNativePlatform()) return;
+      if (!Capacitor.isNativePlatform() || typeof document === 'undefined') return undefined;
 
       try {
-        const { StatusBar } = await import('@capacitor/status-bar');
+        const { StatusBar, Style } = await import('@capacitor/status-bar');
+        const root = document.documentElement;
+        const themeMeta = document.querySelector('meta[name="theme-color"]');
+
+        const syncNativeBars = async () => {
+          const lightTheme = root.classList.contains('theme-light');
+          if (themeMeta) {
+            themeMeta.setAttribute('content', lightTheme ? LIGHT_THEME_COLOR : DARK_THEME_COLOR);
+          }
+
+          await StatusBar.setStyle({
+            style: lightTheme ? Style.Light : Style.Dark,
+          });
+        };
+
         await StatusBar.setOverlaysWebView({ overlay: false });
+        await syncNativeBars();
+
+        const observer = new MutationObserver(() => {
+          syncNativeBars().catch((error) => {
+            console.warn('[status-bar] Native status bar theme sync failed', error);
+          });
+        });
+        observer.observe(root, { attributes: true, attributeFilter: ['class'] });
+        return () => observer.disconnect();
       } catch (error) {
         console.warn('[status-bar] Native status bar setup failed', error);
+        return undefined;
       }
     }
 
-    configureNativeStatusBar();
+    let cleanup = null;
+    configureNativeStatusBar().then((dispose) => {
+      cleanup = typeof dispose === 'function' ? dispose : null;
+    });
+
+    return () => {
+      if (cleanup) cleanup();
+    };
   }, []);
 
   return (

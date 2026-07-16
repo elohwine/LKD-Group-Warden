@@ -31,7 +31,8 @@ module.exports = {
       showSpinner: false
     },
     StatusBar: {
-      overlaysWebView: false
+      overlaysWebView: false,
+      style: 'DARK'
     }
   }
 };
