@@ -31,8 +31,15 @@
   --safe-right: env(safe-area-inset-right, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
+  --android-inset-top: 0px;
+  --android-inset-right: 0px;
+  --android-inset-bottom: 0px;
+  --android-inset-left: 0px;
   --safe-top-fallback: 0px;
-  --safe-top-effective: max(var(--safe-top), var(--safe-top-fallback));
+  --safe-top-effective: max(var(--safe-top), var(--android-inset-top), var(--safe-top-fallback));
+  --safe-right-effective: max(var(--safe-right), var(--android-inset-right));
+  --safe-bottom-effective: max(var(--safe-bottom), var(--android-inset-bottom));
+  --safe-left-effective: max(var(--safe-left), var(--android-inset-left));
 }
 
 :root.theme-light {
@@ -73,9 +80,9 @@ body,
 .warden-app-shell {
   padding:
     calc(12px + var(--safe-top-effective))
-    calc(12px + var(--safe-right))
-    calc(12px + var(--safe-bottom))
-    calc(12px + var(--safe-left));
+    calc(12px + var(--safe-right-effective))
+    calc(12px + var(--safe-bottom-effective))
+    calc(12px + var(--safe-left-effective));
 }
 
 body {
@@ -1778,8 +1785,8 @@ textarea {
 
 .fab-new-breach {
   position: fixed;
-  bottom: calc(82px + var(--safe-bottom));
-  right: 24px;
+  bottom: calc(82px + var(--safe-bottom-effective));
+  right: calc(24px + var(--safe-right-effective));
   z-index: 800;
   width: 56px;
   height: 56px;
@@ -1872,9 +1879,9 @@ textarea {
   gap: 10px;
   padding:
     var(--safe-top-effective)
-    calc(16px + var(--safe-right))
+    calc(16px + var(--safe-right-effective))
     0
-    calc(16px + var(--safe-left));
+    calc(16px + var(--safe-left-effective));
   height: calc(56px + var(--safe-top-effective));
   min-height: calc(56px + var(--safe-top-effective));
   background: var(--surface);
@@ -1980,9 +1987,9 @@ textarea {
   -webkit-overflow-scrolling: touch;
   padding:
     16px
-    calc(12px + var(--safe-right))
-    calc(88px + var(--safe-bottom))
-    calc(12px + var(--safe-left)); /* nav + safe area */
+    calc(12px + var(--safe-right-effective))
+    calc(88px + var(--safe-bottom-effective))
+    calc(12px + var(--safe-left-effective)); /* nav + safe area */
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -2349,6 +2356,54 @@ textarea {
   gap: 4px;
 }
 
+.evidence-thumb-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: 10px;
+  padding: 3px;
+  background: rgba(255,255,255,0.02);
+}
+
+.evidence-thumb-button {
+  position: relative;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.evidence-thumb-badge {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(0,0,0,0.68);
+  color: #fff;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.evidence-main-btn {
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: 7px;
+  background: rgba(255,255,255,0.05);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 5px 6px;
+  cursor: pointer;
+}
+
+.evidence-main-btn--active {
+  border-color: rgba(74,213,157,0.55);
+  color: #9de9ca;
+  background: rgba(74,213,157,0.16);
+}
+
 .evidence-thumb {
   width: 100%;
   aspect-ratio: 4/3;
@@ -2473,6 +2528,16 @@ textarea {
   aspect-ratio: 4 / 3;
   object-fit: cover;
   background: var(--mobile-soft-bg);
+}
+
+.camera-raw-image-btn {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: block;
+  width: 100%;
+  background: transparent;
+  cursor: pointer;
 }
 
 .camera-raw-meta {
@@ -2684,7 +2749,10 @@ textarea {
 
 .carcheck-overlay {
   position: fixed;
-  inset: 0;
+  top: var(--safe-top-effective);
+  right: var(--safe-right-effective);
+  bottom: var(--safe-bottom-effective);
+  left: var(--safe-left-effective);
   z-index: 260;
   background: var(--mobile-overlay-bg);
   backdrop-filter: blur(10px);
@@ -2692,7 +2760,7 @@ textarea {
   align-items: flex-end;
   justify-content: center;
   padding: 16px;
-  padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: calc(16px + var(--safe-bottom-effective));
 }
 
 .carcheck-sheet {
@@ -2741,6 +2809,128 @@ textarea {
   border-radius: 18px;
   border: 1px solid rgba(255,255,255,0.1);
   background: var(--mobile-soft-bg);
+}
+
+.image-detail-sheet {
+  max-height: min(92vh, 820px);
+}
+
+.image-detail-sheet--fullscreen {
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  height: calc(100dvh - var(--safe-top-effective) - var(--safe-bottom-effective));
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+}
+
+.image-detail-sheet--fullscreen .carcheck-sheet-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.image-detail-subtitle {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.image-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.image-detail-preview {
+  width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(7, 13, 22, 0.88);
+}
+
+.image-detail-sheet--fullscreen .image-detail-preview {
+  flex: 1;
+  max-height: none;
+  min-height: 240px;
+}
+
+.image-detail-meta-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.04);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.image-detail-sheet--fullscreen .image-detail-meta-strip {
+  margin-top: 0;
+}
+
+.image-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.image-detail-field {
+  display: grid;
+  gap: 4px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.03);
+  padding: 10px;
+}
+
+.image-detail-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.image-detail-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.image-detail-raw-block {
+  display: grid;
+  gap: 6px;
+}
+
+.image-detail-raw-title {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.image-detail-raw-json {
+  margin: 0;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(0,0,0,0.35);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 10px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .carcheck-sheet-grid {
@@ -2953,6 +3143,63 @@ textarea {
 
 .theme-light .camera-raw-filename {
   color: #1d2a3b;
+}
+
+.theme-light .evidence-thumb-stack {
+  background: rgba(255,255,255,0.92);
+}
+
+.theme-light .evidence-main-btn {
+  border-color: rgba(22, 44, 69, 0.2);
+  background: rgba(255,255,255,0.96);
+  color: rgba(35, 52, 71, 0.78);
+}
+
+.theme-light .evidence-main-btn--active {
+  border-color: rgba(31, 157, 107, 0.4);
+  background: rgba(31, 157, 107, 0.14);
+  color: #155039;
+}
+
+.theme-light .image-detail-preview {
+  border-color: rgba(22, 44, 69, 0.16);
+  background: rgba(242,247,253,0.95);
+}
+
+.theme-light .image-detail-field {
+  border-color: rgba(22, 44, 69, 0.14);
+  background: rgba(255,255,255,0.96);
+}
+
+.theme-light .image-detail-meta-strip {
+  border-color: rgba(22, 44, 69, 0.14);
+  background: rgba(255,255,255,0.96);
+  color: rgba(35, 52, 71, 0.78);
+}
+
+.theme-light .image-detail-label {
+  color: rgba(35, 52, 71, 0.64);
+}
+
+.theme-light .image-detail-value {
+  color: #1d2a3b;
+}
+
+.theme-light .image-detail-raw-json {
+  border-color: rgba(22, 44, 69, 0.14);
+  background: rgba(246, 250, 255, 0.98);
+  color: #1d2a3b;
+}
+
+@media (max-width: 520px) {
+  .image-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .image-detail-sheet--fullscreen {
+    height: calc(100dvh - var(--safe-top-effective) - var(--safe-bottom-effective));
+    padding: 12px;
+  }
 }
 
 .theme-light .camera-raw-subline {
@@ -3319,9 +3566,9 @@ textarea {
 /* ── Bottom navigation ──────────────────────────────────────────── */
 .bottom-nav {
   position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  bottom: var(--safe-bottom-effective);
+  left: var(--safe-left-effective);
+  right: var(--safe-right-effective);
   z-index: 200;
   height: 64px;
   display: flex;
@@ -3329,7 +3576,7 @@ textarea {
   background: var(--surface);
   backdrop-filter: blur(14px);
   border-top: 1px solid var(--border);
-  padding: 0 0 calc(var(--safe-bottom) + 2px);
+  padding: 0 0 2px;
 }
 
 .bottom-nav-btn {

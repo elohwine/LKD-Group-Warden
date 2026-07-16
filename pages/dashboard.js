@@ -558,6 +558,43 @@ function sanitizeCameraRawRecordsForSubmission(records) {
   });
 }
 
+function isHttpUrl(value) {
+  const candidate = String(value || '').trim();
+  return /^https?:\/\//i.test(candidate);
+}
+
+function sanitizeSessionEvidenceForSubmission(sessionEvidence) {
+  const safe = sessionEvidence && typeof sessionEvidence === 'object' ? sessionEvidence : {};
+
+  const sanitizePhase = (phaseValue) => {
+    const phase = phaseValue && typeof phaseValue === 'object' ? phaseValue : {};
+    return {
+      ...phase,
+      plateCutoffImage: isHttpUrl(phase.plateCutoffImage) ? phase.plateCutoffImage : '',
+      vehicleImage: isHttpUrl(phase.vehicleImage) ? phase.vehicleImage : '',
+    };
+  };
+
+  return {
+    entry: sanitizePhase(safe.entry),
+    closing: sanitizePhase(safe.closing),
+  };
+}
+
+function sanitizePayloadForSubmission(payload) {
+  const safe = payload && typeof payload === 'object' ? payload : {};
+
+  return {
+    ...safe,
+    detectedEntryPlateCutoffImage: isHttpUrl(safe.detectedEntryPlateCutoffImage) ? safe.detectedEntryPlateCutoffImage : '',
+    detectedClosingPlateCutoffImage: isHttpUrl(safe.detectedClosingPlateCutoffImage) ? safe.detectedClosingPlateCutoffImage : '',
+    detectedEntryVehicleImage: isHttpUrl(safe.detectedEntryVehicleImage) ? safe.detectedEntryVehicleImage : '',
+    startVehicleImage: isHttpUrl(safe.startVehicleImage) ? safe.startVehicleImage : '',
+    detectedClosingVehicleImage: isHttpUrl(safe.detectedClosingVehicleImage) ? safe.detectedClosingVehicleImage : '',
+    sessionEvidence: sanitizeSessionEvidenceForSubmission(safe.sessionEvidence),
+  };
+}
+
 function collectImageUrlsFromValue(root) {
   const found = [];
   const visited = new Set();
@@ -1928,6 +1965,31 @@ export default function DashboardPage() {
     return result;
   }
 
+  async function persistSelectedTrackedVrm() {
+    if (!selectedTrackedId) return;
+
+    const normalized = normalizeVrm(selectedVrm);
+    if (!normalized) {
+      setDetailMessage('Enter a valid VRM before saving changes.');
+      return;
+    }
+
+    const existing = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || '');
+    if (existing === normalized) return;
+
+    await updateQueueItem(selectedTrackedId, {
+      payload: {
+        ...(selectedTracked?.payload || {}),
+        vrm: normalized,
+      },
+      updatedAt: new Date().toISOString(),
+    });
+
+    setSelectedVrm(normalized);
+    await refreshQueue();
+    setDetailMessage(`VRM updated to ${normalized}.`);
+  }
+
   async function handlePermitLookup() {
     setBusy(true);
     try {
@@ -2547,30 +2609,31 @@ export default function DashboardPage() {
       );
       const cameraRawDataForSubmission = sanitizeCameraRawRecordsForSubmission(cameraRawDataForLos);
       const safeQueuedPayload = stripCarcheckFromPayload(queuedItem.payload);
+      const submissionSafePayload = sanitizePayloadForSubmission(safeQueuedPayload);
       const sessionEvidence = {
         entry: buildPhaseSessionEvidence({
           phase: 'entry',
           capturedAt: entryTime,
           detection: {
-            plateText: safeQueuedPayload?.detectedEntryPlateText,
-            plateCutoffImage: safeQueuedPayload?.detectedEntryPlateCutoffImage,
-            plateConfidence: safeQueuedPayload?.detectedEntryPlateConfidence,
-            vehicleImage: entryFrame?.imageUrl || safeQueuedPayload?.detectedEntryVehicleImage || safeQueuedPayload?.startVehicleImage || payloadEntryImage,
+            plateText: submissionSafePayload?.detectedEntryPlateText,
+            plateCutoffImage: submissionSafePayload?.detectedEntryPlateCutoffImage,
+            plateConfidence: submissionSafePayload?.detectedEntryPlateConfidence,
+            vehicleImage: entryFrame?.imageUrl || submissionSafePayload?.detectedEntryVehicleImage || submissionSafePayload?.startVehicleImage || payloadEntryImage,
           },
         }),
         closing: buildPhaseSessionEvidence({
           phase: 'closing',
           capturedAt: closingTime,
           detection: {
-            plateText: safeQueuedPayload?.detectedClosingPlateText,
-            plateCutoffImage: safeQueuedPayload?.detectedClosingPlateCutoffImage,
-            plateConfidence: safeQueuedPayload?.detectedClosingPlateConfidence,
-            vehicleImage: closingFrame?.imageUrl || safeQueuedPayload?.detectedClosingVehicleImage || payloadClosingImage,
+            plateText: submissionSafePayload?.detectedClosingPlateText,
+            plateCutoffImage: submissionSafePayload?.detectedClosingPlateCutoffImage,
+            plateConfidence: submissionSafePayload?.detectedClosingPlateConfidence,
+            vehicleImage: closingFrame?.imageUrl || submissionSafePayload?.detectedClosingVehicleImage || payloadClosingImage,
           },
         }),
       };
       const breachPayload = {
-        ...safeQueuedPayload,
+        ...submissionSafePayload,
         vrm,
         images: allImages,
         imageUrls: allImages,
@@ -2618,7 +2681,7 @@ export default function DashboardPage() {
         lastError: null,
         updatedAt: new Date().toISOString(),
         payload: {
-          ...safeQueuedPayload,
+          ...submissionSafePayload,
           ...breachPayload,
           breachId,
           breachLifecycle: 'SUBMITTED',
@@ -3228,6 +3291,27 @@ export default function DashboardPage() {
           {/* E-permit lookup */}
           <div className="detail-section">
             <div className="detail-section-label">E-permit lookup</div>
+            <label className="stepper-field" style={{ marginBottom: 8 }}>
+              <span className="stepper-field-label">VRM (editable)</span>
+              <input
+                className="stepper-vrm-input"
+                value={selectedVrm}
+                onChange={(event) => setSelectedVrm(normalizeVrm(event.target.value))}
+                onBlur={persistSelectedTrackedVrm}
+                placeholder="AB12CDE"
+                autoCapitalize="characters"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            </label>
+            <button
+              type="button"
+              className="action-btn action-btn--secondary"
+              disabled={!selectedVrm || busy}
+              onClick={persistSelectedTrackedVrm}
+            >
+              Save VRM
+            </button>
             <button
               type="button"
               className="action-btn action-btn--secondary"
