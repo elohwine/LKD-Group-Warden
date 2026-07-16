@@ -1675,7 +1675,7 @@ export default function DashboardPage() {
     event.target.value = '';
   }
 
-  async function handleStepperCaptureComplete({ files = [], phase = 'entry' } = {}) {
+  async function handleStepperCaptureComplete({ files = [], phase = 'entry', scan = null } = {}) {
     const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
     const rawFiles = Array.isArray(files) ? files : [];
     if (rawFiles.length === 0) {
@@ -1694,13 +1694,21 @@ export default function DashboardPage() {
     let nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase: normalizedPhase, capturedAt });
 
     let plateScanResult = null;
-    if (nextFiles[0]?.detectedPlateText || nextFiles[0]?.detectedPlateCutoffImage) {
+    const scanPlateText = normalizeVrm(scan?.plateText || '');
+    if (scanPlateText) {
+      plateScanResult = {
+        plateText: scanPlateText,
+        confidence: Number(scan?.confidence || 0),
+        cutoffImage: '',
+      };
+    }
+    if (!plateScanResult && (nextFiles[0]?.detectedPlateText || nextFiles[0]?.detectedPlateCutoffImage)) {
       plateScanResult = {
         plateText: normalizeVrm(nextFiles[0]?.detectedPlateText || ''),
         confidence: Number(nextFiles[0]?.detectedPlateConfidence || 0),
         cutoffImage: nextFiles[0]?.detectedPlateCutoffImage || '',
       };
-    } else if (nextFiles.length > 0) {
+    } else if (!plateScanResult && nextFiles.length > 0) {
       plateScanResult = await scanPlateFromImage(nextFiles[0]);
     }
 
@@ -2396,7 +2404,8 @@ export default function DashboardPage() {
     contraventionLabel,
     observationMinutes,
     files,
-    note
+    note,
+    scan = null
   }) {
     try {
       setBusy(true);
@@ -2407,10 +2416,11 @@ export default function DashboardPage() {
       const stepperPreviews = await toPreviewSrcList(files);
       const entryFile = files?.[0] || null;
       const stepperEntryVehicleImage = stepperPreviews[0] || '';
+      const stepperScanPlateText = normalizeVrm(scan?.plateText || '');
       const stepperEntryDetection = {
-        plateText: normalizeVrm(entryFile?.detectedPlateText || vrm),
+        plateText: stepperScanPlateText || normalizeVrm(entryFile?.detectedPlateText || vrm),
         plateCutoffImage: String(entryFile?.detectedPlateCutoffImage || ''),
-        plateConfidence: Number(entryFile?.detectedPlateConfidence || 0),
+        plateConfidence: Number(scan?.confidence || entryFile?.detectedPlateConfidence || 0),
         vehicleImage: stepperEntryVehicleImage,
       };
 

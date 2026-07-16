@@ -206,6 +206,7 @@ function computeIou(a, b) {
 const LIVE_SCAN_INTERVAL_MS = 300;
 const LIVE_REQUIRED_LOCK_FRAMES = 3;
 const LIVE_PROTECTED_CANDIDATE_FRAMES = 2;
+const LIVE_CANDIDATE_MISS_TOLERANCE = 2;
 const LIVE_MIN_CONFIDENCE = 52;
 const LIVE_IOU_THRESHOLD = 0.46;
 const LIVE_MAX_NO_PLATE_FRAMES = 15;
@@ -255,12 +256,12 @@ async function setWebTrackTorch(track, enabled) {
 
 function isLikelyPlateFormat(plate) {
     const value = String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!value || value.length < 5 || value.length > 8) return false;
+    if (!value || value.length < 3 || value.length > 12) return false;
 
     const ukCurrent = /^[A-Z]{2}[0-9]{2}[A-Z]{3}$/;
     const ukPrefix = /^[A-Z][0-9]{1,3}[A-Z]{3}$/;
     const ukSuffix = /^[A-Z]{3}[0-9]{1,3}[A-Z]$/;
-    const generic = /^[A-Z0-9]{5,8}$/;
+    const generic = /^[A-Z0-9]{3,12}$/;
     return ukCurrent.test(value) || ukPrefix.test(value) || ukSuffix.test(value) || generic.test(value);
 }
 
@@ -288,6 +289,7 @@ export default function BreachStepper({
     const evidenceLabel = evidencePhase === 'closing' ? 'Closing' : 'Entry';
     const [step, setStep] = useState(0);
     const [vrm, setVrm] = useState('');
+    const [capturedVrm, setCapturedVrm] = useState('');
     const [contraventionCode, setContraventionCode] = useState(contraventions[0]?.code || '');
     const [contraventionTouched, setContraventionTouched] = useState(false);
     const [files, setFiles] = useState([]);
@@ -313,6 +315,7 @@ export default function BreachStepper({
     const mlkitReadyRef = useRef(false);
 
     const normalizeVrm = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const stableCapturedVrm = normalizeVrm(capturedVrm || scanState.text || vrm);
 
     const selectedContravention = useMemo(
         () => contraventions.find((c) => c.code === contraventionCode) || contraventions[0] || {},
@@ -372,6 +375,7 @@ export default function BreachStepper({
     function reset() {
         setStep(0);
         setVrm('');
+        setCapturedVrm('');
         setContraventionCode(defaultContraventionCode || contraventions[0]?.code || '');
         setContraventionTouched(false);
         setFiles([]);
@@ -524,6 +528,7 @@ export default function BreachStepper({
         if (result?.plateText) {
             const cleanedPlate = normalizeVrm(result.plateText);
             setVrm(cleanedPlate);
+            setCapturedVrm(cleanedPlate);
             if (nextFiles[0]) {
                 nextFiles[0].detectedPlateText = cleanedPlate;
                 nextFiles[0].detectedPlateConfidence = Number(result.confidence || 0);
@@ -650,25 +655,26 @@ export default function BreachStepper({
                         }
                         const prev = liveStableRef.current;
                         const downshift = Math.max(0, Number(prev.frames || 0) - 1);
+                        const preserveCandidate = Boolean(prev.plateText) && downshift >= LIVE_CANDIDATE_MISS_TOLERANCE;
                         liveStableRef.current = {
-                            plateText: '',
-                            bbox: null,
+                            plateText: preserveCandidate ? prev.plateText : '',
+                            bbox: preserveCandidate ? prev.bbox : null,
                             frames: downshift,
                             confidence: 0,
                             confidenceSum: Math.max(0, Number(prev.confidenceSum || 0) - Number(prev.confidence || 0)),
                         };
                         liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
-                        setLivePlateBox(null);
+                        setLivePlateBox(preserveCandidate ? livePlateBox : null);
                         setLockFrames(downshift);
-                        setScanState({ loading: false, text: '', confidence: 0 });
+                        setScanState({ loading: false, text: preserveCandidate ? prev.plateText : '', confidence: preserveCandidate ? Number(prev.confidence || 0) : 0 });
                         return;
                     }
 
                     liveNoPlateFramesRef.current = 0;
 
-                    const plausiblePlate = isLikelyPlateFormat(plateText);
                     const effectiveConfidence = Math.min(100, confidence);
-                    if (!plausiblePlate || effectiveConfidence < 40) {
+                    setCapturedVrm((current) => current || plateText);
+                    if (!plateText) {
                         if (!warmupActive) {
                             liveNoPlateFramesRef.current += 1;
                             if (liveNoPlateFramesRef.current >= LIVE_MAX_NO_PLATE_FRAMES) {
@@ -678,16 +684,21 @@ export default function BreachStepper({
                         }
                         const prev = liveStableRef.current;
                         const downshift = Math.max(0, Number(prev.frames || 0) - 1);
+                        const preserveCandidate = Boolean(prev.plateText) && downshift >= LIVE_CANDIDATE_MISS_TOLERANCE;
                         liveStableRef.current = {
-                            plateText: '',
-                            bbox: null,
+                            plateText: preserveCandidate ? prev.plateText : '',
+                            bbox: preserveCandidate ? prev.bbox : null,
                             frames: downshift,
                             confidence: effectiveConfidence,
                             confidenceSum: Math.max(0, Number(prev.confidenceSum || 0) - Number(prev.confidence || 0)),
                         };
                         liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
                         setLockFrames(downshift);
-                        setScanState({ loading: false, text: plateText, confidence: effectiveConfidence });
+                        setScanState({
+                            loading: false,
+                            text: preserveCandidate ? prev.plateText : '',
+                            confidence: preserveCandidate ? Number(prev.confidence || 0) : effectiveConfidence,
+                        });
                         return;
                     }
 
@@ -883,6 +894,10 @@ export default function BreachStepper({
             contraventionLabel: getContraventionSelectionLabel(selectedContravention),
             observationMinutes,
             files,
+            scan: {
+                plateText: stableCapturedVrm,
+                confidence: Number(scanState.confidence || 0),
+            },
             note,
         });
         reset();
@@ -895,7 +910,7 @@ export default function BreachStepper({
             files,
             previews,
             scan: {
-                plateText: normalizeVrm(scanState.text),
+                plateText: stableCapturedVrm,
                 confidence: Number(scanState.confidence || 0),
             },
         });
@@ -1107,8 +1122,8 @@ export default function BreachStepper({
                         )}
 
                         {scanState.loading ? <div className="text-muted">Scanning image for VRM...</div> : null}
-                        {scanState.text ? (
-                            <div className="text-muted">Detected VRM: {scanState.text} (confidence {Math.round(scanState.confidence)}%)</div>
+                        {stableCapturedVrm ? (
+                            <div className="text-muted">Detected VRM: {stableCapturedVrm} (confidence {Math.round(scanState.confidence)}%)</div>
                         ) : null}
 
                         <div className="stepper-nav">
@@ -1140,7 +1155,7 @@ export default function BreachStepper({
                     <div className="stepper-step">
                         <p className="stepper-step-label">Step 2 — Vehicle details</p>
                         <div className="stepper-vrm-banner">
-                            <span className="stepper-vrm-text">{normalizeVrm(vrm) || 'Pending VRM'}</span>
+                            <span className="stepper-vrm-text">{stableCapturedVrm || normalizeVrm(vrm) || 'Pending VRM'}</span>
                             <span className="text-muted">{selectedSite?.displayName || selectedSite?.name || defaultSiteId}</span>
                         </div>
 
@@ -1178,11 +1193,14 @@ export default function BreachStepper({
                         <div className="stepper-nav">
                             <button type="button" className="ghost-button" onClick={() => setStep(0)}>← Back to capture</button>
                             <div className="stepper-nav-actions">
-                                {canAdvanceFromVrm ? (
-                                    <button type="button" className="primary-button" onClick={() => setStep(2)}>
-                                        Next — Confirm →
-                                    </button>
-                                ) : null}
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={() => setStep(2)}
+                                    disabled={!canAdvanceFromVrm}
+                                >
+                                    {canAdvanceFromVrm ? 'Next — Confirm →' : 'Enter VRM to continue'}
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -1196,7 +1214,7 @@ export default function BreachStepper({
                         <div className="stepper-summary-card">
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">VRM</span>
-                                <span className="stepper-summary-val" style={{ fontFamily: 'monospace', fontWeight: 800 }}>{normalizeVrm(vrm)}</span>
+                                <span className="stepper-summary-val" style={{ fontFamily: 'monospace', fontWeight: 800 }}>{stableCapturedVrm || normalizeVrm(vrm)}</span>
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Site</span>
