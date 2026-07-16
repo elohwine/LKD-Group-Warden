@@ -247,40 +247,6 @@ async function setWebTrackTorch(track, enabled) {
     }
 }
 
-// Correct common OCR character confusions ONLY inside the digit sections of
-// recognised UK plate formats. Letter sections are never touched, so valid
-// plate letters like G, D, O in area/sequence codes are preserved.
-//
-// Handled UK shapes:
-//   Modern  AA##AAA  (7)  e.g. AB12CDE  — fix positions 2-3
-//   Prefix  A###AAA  (5-7) e.g. A123BCD — fix the 1-3 digit middle
-//   Suffix  AAA###A  (5-7) e.g. ABC123D — fix the 1-3 digit middle
-//
-// Substitutions applied to digit sections only:
-//   O → 0   G → 0   D → 0   I → 1   L → 1
-function fixUkPlateOcr(raw) {
-    const v = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!v) return v;
-
-    const fixDigits = (s) =>
-        s.replace(/O/g, '0').replace(/G/g, '0').replace(/D/g, '0')
-         .replace(/I/g, '1').replace(/L/g, '1');
-
-    // UK Modern: AA##AAA
-    if (/^[A-Z]{2}[0-9A-Z]{2}[A-Z]{3}$/.test(v)) {
-        return v.slice(0, 2) + fixDigits(v.slice(2, 4)) + v.slice(4);
-    }
-    // UK Prefix: A#AAA – A###AAA
-    const pre = v.match(/^([A-Z])([0-9A-Z]{1,3})([A-Z]{3})$/);
-    if (pre) return pre[1] + fixDigits(pre[2]) + pre[3];
-
-    // UK Suffix: AAA#A – AAA###A
-    const suf = v.match(/^([A-Z]{3})([0-9A-Z]{1,3})([A-Z])$/);
-    if (suf) return suf[1] + fixDigits(suf[2]) + suf[3];
-
-    return v;
-}
-
 function isLikelyPlateFormat(plate) {
     const value = String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (!value || value.length < 5 || value.length > 8) return false;
@@ -547,7 +513,7 @@ export default function BreachStepper({
         }
 
         if (result?.plateText) {
-            const cleanedPlate = fixUkPlateOcr(normalizeVrm(result.plateText));
+            const cleanedPlate = normalizeVrm(result.plateText);
             setVrm(cleanedPlate);
             if (nextFiles[0]) {
                 nextFiles[0].detectedPlateText = cleanedPlate;
@@ -660,7 +626,7 @@ export default function BreachStepper({
                         result = await onPlateScan(frameFile);
                     }
 
-                    const plateText = fixUkPlateOcr(normalizeVrm(result?.plateText || ''));
+                    const plateText = normalizeVrm(result?.plateText || '');
                     const bbox = result?.bbox || null;
                     const confidence = Number(result?.confidence || 0);
 
