@@ -7,10 +7,15 @@ import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
 import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
+import { formatLocalTimestamp } from '../lib/ukTimestamp';
+import { getServerTimestamp, syncWithServerTime } from '../lib/timeSync';
+import { getBillableMinutes } from '../lib/duration';
+import { buildVehicleDetailsRecord } from '../lib/vehicleDetails';
 import AppShell from '../components/AppShell';
 import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
 import BreachStepper from '../components/BreachStepper';
+import PcnPreviewDialog from '../components/PcnPreviewDialog';
 
 function formatElapsed(startIso, endIso = '') {
   const startMs = new Date(startIso || '').getTime();
@@ -75,15 +80,9 @@ function loadImageElement(file) {
 }
 
 function formatCaptureTimestamp(capturedAt) {
-  const date = new Date(capturedAt || Date.now());
-  if (Number.isNaN(date.getTime())) return '';
-  const yyyy = String(date.getFullYear());
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const min = String(date.getMinutes()).padStart(2, '0');
-  const sec = String(date.getSeconds()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd} ${hh}:${min}:${sec}`;
+  // Use the device's local timezone so displayed times match the warden's clock.
+  // Europe/London (UK-only) is used exclusively for persisted PCN records on the backend.
+  return formatLocalTimestamp(capturedAt);
 }
 
 async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
@@ -101,22 +100,28 @@ async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
 
     const label = phase === 'closing' ? 'CLOSING' : 'ENTRY';
     const stampText = `${label} ${formatCaptureTimestamp(capturedAt)}`;
-    const baseFont = Math.max(24, Math.floor(canvas.width / 40));
+    const baseFont = Math.max(50, Math.floor((canvas.width / 30) * 1.4));
     ctx.font = `700 ${baseFont}px Arial, sans-serif`;
-    const paddingX = Math.max(16, Math.floor(baseFont * 0.6));
-    const paddingY = Math.max(12, Math.floor(baseFont * 0.45));
+    const paddingX = Math.max(32, Math.floor(baseFont * 1.08));
+    const paddingY = Math.max(16, Math.floor(baseFont * 0.58));
     const textMetrics = ctx.measureText(stampText);
-    const boxWidth = Math.ceil(textMetrics.width + paddingX * 2);
+    const boxWidth = Math.ceil(Math.max(textMetrics.width + paddingX * 2, canvas.width * 0.62));
     const boxHeight = Math.ceil(baseFont + paddingY * 2);
-    const boxX = Math.max(12, Math.floor(canvas.width * 0.03));
-    const boxY = Math.max(12, canvas.height - boxHeight - Math.floor(canvas.height * 0.03));
+    const boxX = Math.max(14, Math.floor(canvas.width * 0.03));
+    const boxY = Math.max(18, Math.floor(canvas.height * 0.035));
 
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
     ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.08));
+    ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
 
     ctx.fillStyle = '#ffffff';
     ctx.textBaseline = 'top';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.95)';
+    ctx.shadowBlur = Math.max(3, Math.floor(baseFont * 0.1));
     ctx.fillText(stampText, boxX + paddingX, boxY + paddingY);
+    ctx.shadowBlur = 0;
 
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, file.type || 'image/jpeg', 0.92));
     if (!blob) return file;
@@ -158,6 +163,10 @@ function normalizeCapturedAt(value) {
 async function resolveCameraCaptureTimestamp(file, fallbackIso) {
   const fallback = normalizeCapturedAt(fallbackIso) || new Date().toISOString();
   if (!file || typeof window === 'undefined') return fallback;
+
+  // Use the actual capture moment as the canonical timestamp. EXIF can drift by
+  // timezone/DST depending on camera metadata and device behavior.
+  if (fallback) return fallback;
 
   try {
     const exifr = await import('exifr');
@@ -216,7 +225,7 @@ async function getOcrWorker() {
           tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
           preserve_interword_spaces: '0',
         });
-      } catch (_) {}
+      } catch (_) { }
       return worker;
     })();
   }
@@ -368,11 +377,14 @@ async function scanPlateFromImage(file) {
 
 function buildEvidenceFrame(imageUrl, timestamp) {
   if (!imageUrl) return null;
+  const capturedAt = normalizeCapturedAt(timestamp) || null;
   return {
     imageUrl,
     vehicleImage: imageUrl,
     plateImage: imageUrl,
-    timestamp: timestamp || null,
+    timestamp: capturedAt,
+    capturedAt,
+    capturedAtUk: capturedAt ? formatCaptureTimestamp(capturedAt) : '',
   };
 }
 
@@ -381,16 +393,20 @@ function buildCameraRawRecords(files, previews, { phase, capturedAt, source = 'W
   const safePreviews = Array.isArray(previews) ? previews : [];
   const nowIso = capturedAt || new Date().toISOString();
 
-  return safeFiles.map((file, index) => ({
-    id: `${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`,
-    phase: phase === 'closing' ? 'closing' : 'entry',
-    source,
-    capturedAt: normalizeCapturedAt(file?.capturedAt) || nowIso,
-    fileName: file?.name || `capture_${index + 1}.jpg`,
-    mimeType: file?.type || '',
-    sizeBytes: Number(file?.size || 0),
-    localPreviewUrl: safePreviews[index] || '',
-  }));
+  return safeFiles.map((file, index) => {
+    const normalizedCapturedAt = normalizeCapturedAt(file?.capturedAt) || nowIso;
+    return {
+      id: `${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`,
+      phase: phase === 'closing' ? 'closing' : 'entry',
+      source,
+      capturedAt: normalizedCapturedAt,
+      capturedAtUk: formatCaptureTimestamp(normalizedCapturedAt),
+      fileName: file?.name || `capture_${index + 1}.jpg`,
+      mimeType: file?.type || '',
+      sizeBytes: Number(file?.size || 0),
+      localPreviewUrl: safePreviews[index] || '',
+    };
+  });
 }
 
 function resolveCameraRawImageSrc(record) {
@@ -443,9 +459,11 @@ function getPhaseDetectionFromCameraRaw(records, phase, fallbackVrm = '') {
 
 function buildPhaseSessionEvidence({ phase, detection, capturedAt = '' } = {}) {
   const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+  const normalizedCapturedAt = normalizeCapturedAt(capturedAt) || '';
   return {
     phase: normalizedPhase,
-    capturedAt: normalizeCapturedAt(capturedAt) || '',
+    capturedAt: normalizedCapturedAt,
+    capturedAtUk: normalizedCapturedAt ? formatCaptureTimestamp(normalizedCapturedAt) : '',
     plateText: normalizeVrm(detection?.plateText || ''),
     plateCutoffImage: String(detection?.plateCutoffImage || '').trim(),
     plateConfidence: Number(detection?.plateConfidence || 0),
@@ -640,10 +658,37 @@ function collectImageUrlsFromValue(root) {
 }
 
 function diffMinutes(startIso, endIso) {
-  if (!startIso || !endIso) return 0;
-  const diffMs = new Date(endIso).getTime() - new Date(startIso).getTime();
-  if (!Number.isFinite(diffMs) || diffMs <= 0) return 0;
-  return Math.round(diffMs / 60000);
+  return getBillableMinutes(startIso, endIso);
+}
+
+function resolveObservationWindow(payload = {}) {
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+  const records = Array.isArray(safePayload.cameraRawData) ? safePayload.cameraRawData : [];
+
+  const pickPhaseTime = (phase) => {
+    const matches = records
+      .filter((record) => String(record?.phase || '').toLowerCase() === phase)
+      .map((record) => normalizeCapturedAt(record?.capturedAt))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b));
+    return matches[0] || '';
+  };
+
+  const entryFromEvidence = pickPhaseTime('entry');
+  const closingFromEvidence = pickPhaseTime('closing');
+
+  const entryTime =
+    entryFromEvidence ||
+    normalizeCapturedAt(safePayload.entryCapturedAt) ||
+    normalizeCapturedAt(safePayload.observationStartTime) ||
+    '';
+  const closingTime =
+    closingFromEvidence ||
+    normalizeCapturedAt(safePayload.closingCapturedAt) ||
+    normalizeCapturedAt(safePayload.observationEndTime) ||
+    '';
+
+  return { entryTime, closingTime };
 }
 
 function getEvidencePhaseCounts(files) {
@@ -669,7 +714,7 @@ function getBreachLifecycle(item) {
     return { code: 'FAILED', label: 'Failed sync', syncable: true };
   }
   if (status === 'synced' || status === 'submitted') {
-    return { code: 'SUBMITTED', label: 'Submitted', syncable: false };
+    return { code: 'SUBMITTED', label: 'Submitted (Pending PCN)', syncable: false };
   }
   if (entryCount > 0 && closingCount === 0) {
     return { code: 'DRAFT_OPEN', label: 'Draft Parking Charge', syncable: false };
@@ -827,6 +872,8 @@ export default function DashboardPage() {
   const [vehicleLookupLoading, setVehicleLookupLoading] = useState(false);
   const [vehicleLookupByVrm, setVehicleLookupByVrm] = useState({});
   const [carcheckDialogMessage, setCarcheckDialogMessage] = useState('');
+  const [carcheckSaveLoading, setCarcheckSaveLoading] = useState(false);
+  const [carcheckSaveNotice, setCarcheckSaveNotice] = useState('');
   const [queueItems, setQueueItems] = useState([]);
   const [syncing, setSyncing] = useState(false);
   const [online, setOnline] = useState(true);
@@ -843,6 +890,8 @@ export default function DashboardPage() {
   const [autoSubmitOnClosingCapture, setAutoSubmitOnClosingCapture] = useState(false);
   const [carcheckDialogOpen, setCarcheckDialogOpen] = useState(false);
   const [pcnDialogOpen, setPcnDialogOpen] = useState(false);
+  const [pcnPreviewOpen, setPcnPreviewOpen] = useState(false);
+  const [pendingFinalize, setPendingFinalize] = useState(null);
   const [stepperOpen, setStepperOpen] = useState(false);
   const [captureStepperOpen, setCaptureStepperOpen] = useState(false);
   const [captureStepperPhase, setCaptureStepperPhase] = useState('entry');
@@ -1036,11 +1085,7 @@ export default function DashboardPage() {
     }
 
     const payload = selectedTracked?.payload || {};
-    const entryTime = payload?.entryCapturedAt || payload?.observationStartTime || '';
-    const closingTime = payload?.closingCapturedAt || payload?.observationEndTime || payload?.convertedAt || '';
-    const durationMinutes = Number(payload?.actualMinutes) > 0
-      ? Number(payload.actualMinutes)
-      : diffMinutes(entryTime, closingTime);
+    const { entryTime, closingTime } = resolveObservationWindow(payload);
     const imageUrls = collectImageUrlsFromValue([
       payload?.images,
       payload?.imageUrls,
@@ -1051,16 +1096,50 @@ export default function DashboardPage() {
     const cameraRecords = Array.isArray(payload?.cameraRawData) ? payload.cameraRawData : [];
     const entryRecord = cameraRecords.find((record) => String(record?.phase || '').toLowerCase() !== 'closing') || null;
     const closingRecord = cameraRecords.find((record) => String(record?.phase || '').toLowerCase() === 'closing') || null;
+    const trackedFiles = Array.isArray(selectedTracked?.files) ? selectedTracked.files : [];
+    const trackedEntryFiles = trackedFiles.filter((file) => file?.phase === 'entry');
+    const trackedClosingFiles = trackedFiles.filter((file) => file?.phase === 'closing');
+    const selectedMainEntryIndex = Number.isFinite(Number(payload?.mainEntryImageIndex))
+      ? Math.max(0, Number(payload.mainEntryImageIndex))
+      : 0;
+    const selectedMainClosingIndex = Number.isFinite(Number(payload?.mainClosingImageIndex))
+      ? Math.max(0, Number(payload.mainClosingImageIndex))
+      : 0;
+
+    const entryMainStampedAt =
+      normalizeCapturedAt(entryFiles?.[selectedMainEntryIndex]?.capturedAt) ||
+      normalizeCapturedAt(trackedEntryFiles?.[selectedMainEntryIndex]?.blob?.capturedAt) ||
+      normalizeCapturedAt(trackedEntryFiles?.[selectedMainEntryIndex]?.capturedAt) ||
+      '';
+    const closingMainStampedAt =
+      normalizeCapturedAt(closingFiles?.[selectedMainClosingIndex]?.capturedAt) ||
+      normalizeCapturedAt(trackedClosingFiles?.[selectedMainClosingIndex]?.blob?.capturedAt) ||
+      normalizeCapturedAt(trackedClosingFiles?.[selectedMainClosingIndex]?.capturedAt) ||
+      '';
+
+    const resolvedEntryTime = entryMainStampedAt || normalizeCapturedAt(entryRecord?.capturedAt) || entryTime || '';
+    const resolvedClosingTime = closingMainStampedAt || normalizeCapturedAt(closingRecord?.capturedAt) || closingTime || '';
+    const durationMinutes = Number(payload?.actualMinutes) > 0
+      ? Number(payload.actualMinutes)
+      : diffMinutes(resolvedEntryTime, resolvedClosingTime);
     const fallbackEntryImage = imageUrls[0] || '';
     const fallbackClosingImage = imageUrls[imageUrls.length > 1 ? 1 : 0] || '';
     const observationCapture = {
       imageUrl: resolveCameraRawImageSrc(entryRecord) || fallbackEntryImage,
-      capturedAt: entryRecord?.capturedAt || entryTime || '',
+      capturedAt: resolvedEntryTime,
+      capturedAtUk:
+        entryRecord?.capturedAtUk ||
+        payload?.sessionEvidence?.entry?.capturedAtUk ||
+        (resolvedEntryTime ? formatCaptureTimestamp(resolvedEntryTime) : ''),
       label: 'Observation capture',
     };
     const contraventionCapture = {
       imageUrl: resolveCameraRawImageSrc(closingRecord) || fallbackClosingImage,
-      capturedAt: closingRecord?.capturedAt || closingTime || '',
+      capturedAt: resolvedClosingTime,
+      capturedAtUk:
+        closingRecord?.capturedAtUk ||
+        payload?.sessionEvidence?.closing?.capturedAtUk ||
+        (resolvedClosingTime ? formatCaptureTimestamp(resolvedClosingTime) : ''),
       label: 'Contravention capture',
     };
 
@@ -1076,8 +1155,8 @@ export default function DashboardPage() {
       : 'No active payment';
 
     return {
-      entryTime,
-      closingTime,
+      entryTime: resolvedEntryTime,
+      closingTime: resolvedClosingTime,
       durationMinutes,
       imageUrls,
       observationCapture,
@@ -1085,7 +1164,7 @@ export default function DashboardPage() {
       permitStatus,
       paymentStatus,
     };
-  }, [selectedTracked, selectedTrackedAuthorization]);
+  }, [selectedTracked, selectedTrackedAuthorization, entryFiles, closingFiles]);
   const cameraRawFeed = useMemo(() => {
     const feed = [];
 
@@ -1177,17 +1256,38 @@ export default function DashboardPage() {
   function getPrimaryActionLabel(item) {
     if (!item) return 'Review';
     if (item.lifecycle.code === 'DRAFT_OPEN') return 'Continue Draft Parking Charge';
-    if (item.lifecycle.code === 'READY') return 'Submit now';
-    if (item.lifecycle.code === 'FAILED') return 'Retry submit';
-    if (item.lifecycle.code === 'SUBMITTED') return 'Open conversion';
+    if (item.lifecycle.code === 'READY') return 'Review and submit';
+    if (item.lifecycle.code === 'FAILED') return 'Review and retry';
+    if (item.lifecycle.code === 'SUBMITTED') return 'Finalize PCN';
     if (item.lifecycle.code === 'CONVERTED') return 'View card';
     return 'Review';
+  }
+
+  async function openSubmitPreviewForTracked(itemId) {
+    if (!itemId) return;
+    const items = await listQueueItems();
+    const item = items.find((entry) => entry.id === itemId);
+    if (!item) {
+      setMessage('Could not find the selected draft for submission.');
+      return;
+    }
+
+    await handleReviewTracked(item);
+    setPendingFinalize({
+      action: 'convert',
+      openPcnDialogAfterSync: false,
+    });
+    setPcnPreviewOpen(true);
   }
 
   async function handlePrimaryAction(item) {
     if (!item) return;
     if (item.lifecycle.code === 'READY' || item.lifecycle.code === 'FAILED') {
-      await handleRetryTracked(item.id);
+      await openSubmitPreviewForTracked(item.id);
+      return;
+    }
+    if (item.lifecycle.code === 'SUBMITTED') {
+      await openSubmitPreviewForTracked(item.id);
       return;
     }
     setSelectedTrackedId(item.id);
@@ -1272,12 +1372,15 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    const contravention = contraventions.find((item) => item.code === selectedContraventionCode) || contraventions[0];
+    const contravention = contraventions.find((item) => item.code === selectedContraventionCode);
     if (contravention) {
       setSelectedReason(contravention.label);
       setManualObservationMinutes(Number(contravention.defaultObservationMinutes ?? 0));
+    } else if (!selectedReason && contraventions[0]) {
+      setSelectedReason(contraventions[0].label || '');
+      setManualObservationMinutes(Number(contraventions[0].defaultObservationMinutes ?? 0));
     }
-  }, [contraventions, selectedContraventionCode]);
+  }, [contraventions, selectedContraventionCode, selectedReason]);
 
   useEffect(() => {
     if (selectedSiteId) {
@@ -1287,6 +1390,8 @@ export default function DashboardPage() {
 
   useEffect(() => {
     setCarcheckDialogOpen(false);
+    setCarcheckSaveLoading(false);
+    setCarcheckSaveNotice('');
     setPcnDialogOpen(false);
   }, [selectedTrackedId]);
 
@@ -1451,7 +1556,7 @@ export default function DashboardPage() {
 
   async function handleFileSelection(event) {
     const rawFiles = Array.from(event.target.files || []);
-    const fallbackCapturedAt = new Date().toISOString();
+    const fallbackCapturedAt = await getServerTimestamp();
     const phase = capturePhaseRef.current === 'closing' ? 'closing' : 'entry';
     const nextFiles = await Promise.all(
       rawFiles.map(async (file) => {
@@ -1580,6 +1685,7 @@ export default function DashboardPage() {
     } else {
       const mergedClosingFiles = [...closingFiles, ...nextFiles];
       const mergedClosingPreviews = [...closingPreviews, ...nextPreviews];
+      const closingTime = capturedAt;
       setClosingFiles(mergedClosingFiles);
       setClosingPreviews(mergedClosingPreviews);
       setMainClosingImageIndex((current) => (
@@ -1612,7 +1718,8 @@ export default function DashboardPage() {
             selectedPayload.observationStartTime ||
             monitoringSessionStartedAt ||
             capturedAt;
-          const computedMinutes = diffMinutes(entryTime, capturedAt);
+          const closingTime = capturedAt;
+          const computedMinutes = diffMinutes(entryTime, closingTime);
 
           const closingPhaseEvidence = buildPhaseSessionEvidence({
             phase: 'closing',
@@ -1629,9 +1736,9 @@ export default function DashboardPage() {
             payload: {
               ...selectedPayload,
               observationStartTime: entryTime,
-              observationEndTime: capturedAt,
+              observationEndTime: closingTime,
               entryCapturedAt: entryTime,
-              closingCapturedAt: capturedAt,
+              closingCapturedAt: closingTime,
               actualMinutes: computedMinutes,
               mainClosingImageIndex: Math.min(
                 Math.max(0, selectedMainClosingIndex),
@@ -1683,7 +1790,7 @@ export default function DashboardPage() {
       return;
     }
 
-    const fallbackCapturedAt = new Date().toISOString();
+    const fallbackCapturedAt = await getServerTimestamp();
     const nextFiles = rawFiles.map((file) => {
       const capturedAt = normalizeCapturedAt(file?.capturedAt) || fallbackCapturedAt;
       file.capturedAt = capturedAt;
@@ -1817,6 +1924,7 @@ export default function DashboardPage() {
     } else {
       const mergedClosingFiles = [...closingFiles, ...nextFiles];
       const mergedClosingPreviews = [...closingPreviews, ...nextPreviews];
+      const closingTime = capturedAt;
       setClosingFiles(mergedClosingFiles);
       setClosingPreviews(mergedClosingPreviews);
       setMainClosingImageIndex((current) => (
@@ -1848,7 +1956,7 @@ export default function DashboardPage() {
           selectedPayload.observationStartTime ||
           monitoringSessionStartedAt ||
           capturedAt;
-        const computedMinutes = diffMinutes(entryTime, capturedAt);
+        const computedMinutes = diffMinutes(entryTime, closingTime);
 
         const closingPhaseEvidence = buildPhaseSessionEvidence({
           phase: 'closing',
@@ -1865,9 +1973,9 @@ export default function DashboardPage() {
           payload: {
             ...selectedPayload,
             observationStartTime: entryTime,
-            observationEndTime: capturedAt,
+            observationEndTime: closingTime,
             entryCapturedAt: entryTime,
-            closingCapturedAt: capturedAt,
+            closingCapturedAt: closingTime,
             actualMinutes: computedMinutes,
             mainClosingImageIndex: Math.min(
               Math.max(0, selectedMainClosingIndex),
@@ -2031,9 +2139,6 @@ export default function DashboardPage() {
 
   function stopMonitoringSession() {
     setMonitoringSessionActive(false);
-    if (!closingCapturedAt) {
-      setClosingCapturedAt(new Date().toISOString());
-    }
     setMessage('Draft Parking Charge ended. Capture closing evidence and finalize when ready.');
   }
 
@@ -2090,6 +2195,7 @@ export default function DashboardPage() {
 
     const cachedLookup = vehicleLookupByVrm[vrm];
     if (cachedLookup && !forceRefresh) {
+      setCarcheckSaveNotice('');
       setVehicleLookup(cachedLookup);
       setCarcheckDialogMessage(`Loaded from app memory${cachedLookup?.make || cachedLookup?.model ? `: ${[cachedLookup.make, cachedLookup.model].filter(Boolean).join(' ')}` : ''}.`);
       setCarcheckDialogOpen(true);
@@ -2108,6 +2214,7 @@ export default function DashboardPage() {
       }
 
       const normalized = normalizeVehicleLookup(result, vrm);
+      setCarcheckSaveNotice('');
       setVehicleLookup(normalized);
       setVehicleLookupByVrm((current) => ({ ...current, [vrm]: normalized }));
       setCarcheckDialogMessage(`Carcheck complete${normalized?.make || normalized?.model ? `: ${[normalized.make, normalized.model].filter(Boolean).join(' ')}` : ''}.`);
@@ -2128,6 +2235,7 @@ export default function DashboardPage() {
 
   async function handleSaveCarcheckDetails() {
     const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm);
+    setCarcheckSaveNotice('');
     if (!trackedVrm) {
       setDetailMessage('Run carcheck before saving details.');
       return;
@@ -2144,27 +2252,40 @@ export default function DashboardPage() {
       return;
     }
 
-    const nowIso = new Date().toISOString();
-    const existingLookup = selectedTracked?.payload?.savedVehicleLookup || null;
-    const incomingFingerprint = buildVehicleLookupFingerprint(currentLookup);
-    const existingFingerprint = buildVehicleLookupFingerprint(existingLookup);
-    if (selectedTracked?.payload?.savedVehicleSavedAt && existingFingerprint && incomingFingerprint === existingFingerprint) {
-      setDetailMessage('Vehicle details already saved. You can reopen this result anytime.');
-      return;
-    }
+    setCarcheckSaveLoading(true);
+    try {
+      const nowIso = new Date().toISOString();
+      const existingLookup = selectedTracked?.payload?.savedVehicleLookup || null;
+      const incomingFingerprint = buildVehicleLookupFingerprint(currentLookup);
+      const existingFingerprint = buildVehicleLookupFingerprint(existingLookup);
+      if (selectedTracked?.payload?.savedVehicleSavedAt && existingFingerprint && incomingFingerprint === existingFingerprint) {
+        setCarcheckSaveNotice('Already saved for this session.');
+        setDetailMessage('Vehicle details already saved. You can reopen this result anytime.');
+        return;
+      }
 
-    await updateQueueItem(selectedTrackedId, {
-      payload: {
-        ...selectedTracked?.payload,
-        vrm: trackedVrm,
-        savedVehicleLookup: currentLookup,
-        savedVehicleImageUrl: currentLookup?.imageUrl || currentLookup?.imageUrls?.[0] || selectedTrackedVehicleImageUrl || null,
-        savedVehicleSavedAt: nowIso,
-      },
-      updatedAt: nowIso,
-    });
-    await refreshQueue();
-    setDetailMessage('Vehicle details saved. Reopen anytime from this Draft Parking Charge.');
+      await updateQueueItem(selectedTrackedId, {
+        payload: {
+          ...selectedTracked?.payload,
+          vrm: trackedVrm,
+          savedVehicleLookup: currentLookup,
+          savedVehicleImageUrl: currentLookup?.imageUrl || currentLookup?.imageUrls?.[0] || selectedTrackedVehicleImageUrl || null,
+          savedVehicleSavedAt: nowIso,
+        },
+        updatedAt: nowIso,
+      });
+      await refreshQueue();
+      setCarcheckSaveNotice('Saved to this Draft Parking Charge.');
+      setDetailMessage('Vehicle details saved. Reopen anytime from this Draft Parking Charge.');
+      setCarcheckDialogOpen(false);
+      setCarcheckDialogMessage('');
+    } catch (error) {
+      console.error('[warden] failed to save carcheck details', error);
+      setCarcheckSaveNotice(error?.message || 'Save failed. Please retry.');
+      setDetailMessage(error?.message || 'Saving carcheck details failed.');
+    } finally {
+      setCarcheckSaveLoading(false);
+    }
   }
 
   async function queueOrSendCapture({ immediate = false, targetItemId = '', openPcnDialogAfterSync = false } = {}) {
@@ -2427,6 +2548,9 @@ export default function DashboardPage() {
       const draftPayload = {
         vrm,
         contraventionCode,
+        // Store under selectedContraventionCode as well so handleReviewTracked
+        // can restore the selection without a key mismatch.
+        selectedContraventionCode: contraventionCode,
         contraventionReason: contraventionLabel,
         observationStartTime: entryTime,
         observationEndTime: null,
@@ -2607,8 +2731,7 @@ export default function DashboardPage() {
 
       const vrm = normalizeVrm(closingEvidence.vrm || entryEvidence.vrm || queuedItem.payload.vrm);
       const authData = await checkAuthorization(vrm);
-      const entryTime = queuedItem.payload.entryCapturedAt || queuedItem.payload.observationStartTime || new Date().toISOString();
-      const closingTime = queuedItem.payload.closingCapturedAt || queuedItem.payload.observationEndTime || new Date().toISOString();
+      const { entryTime, closingTime } = resolveObservationWindow(queuedItem.payload || {});
       const entryFrame = buildEvidenceFrame(entryEvidence.images?.[0], entryTime);
       const closingFrame = buildEvidenceFrame(closingEvidence.images?.[0], closingTime);
       const allImages = [...(entryEvidence.images || []), ...(closingEvidence.images || [])];
@@ -2620,6 +2743,10 @@ export default function DashboardPage() {
       const cameraRawDataForSubmission = sanitizeCameraRawRecordsForSubmission(cameraRawDataForLos);
       const safeQueuedPayload = stripCarcheckFromPayload(queuedItem.payload);
       const submissionSafePayload = sanitizePayloadForSubmission(safeQueuedPayload);
+      const vehicleDetails = buildVehicleDetailsRecord(
+        submissionSafePayload?.savedVehicleLookup || queuedItem?.payload?.savedVehicleLookup || null,
+        vrm
+      );
       const sessionEvidence = {
         entry: buildPhaseSessionEvidence({
           phase: 'entry',
@@ -2645,6 +2772,10 @@ export default function DashboardPage() {
       const breachPayload = {
         ...submissionSafePayload,
         vrm,
+        vehicleDetails,
+        make: vehicleDetails?.make || submissionSafePayload?.make || null,
+        model: vehicleDetails?.model || submissionSafePayload?.model || null,
+        colour: vehicleDetails?.color || submissionSafePayload?.colour || submissionSafePayload?.color || null,
         images: allImages,
         imageUrls: allImages,
         evidence: {
@@ -2711,7 +2842,7 @@ export default function DashboardPage() {
         }
       }
 
-      setMessage(`Parking Charge submitted successfully: ${breachId || vrm}`);
+      setMessage(`Breach submitted successfully (${breachId || vrm}). Final PCN conversion is still required.`);
       setSelectedVrm('');
       setEntryFiles([]);
       setEntryPreviews([]);
@@ -2799,6 +2930,14 @@ export default function DashboardPage() {
       ]
         .filter((value) => typeof value === 'string' && value.length > 0)
         .filter((value, index, all) => all.indexOf(value) === index);
+      const vehicleDetails = buildVehicleDetailsRecord(
+        workingItem?.payload?.vehicleDetails ||
+        workingItem?.payload?.savedVehicleLookup ||
+        selectedTrackedVehicleDetails ||
+        null,
+        workingItem?.vrm || selectedTracked?.vrm || selectedVrm
+      );
+      const resolvedWindow = resolveObservationWindow(workingItem?.payload || {});
       const response = await fetchJson('/api/breaches/convert-to-pcn', {
         method: 'POST',
         token,
@@ -2807,11 +2946,19 @@ export default function DashboardPage() {
           reason: pcnReasonInput.trim() || 'No valid permit or payment found',
           notes: `Converted from breach ${breachId}`,
           vrm: workingItem?.vrm || selectedTracked?.vrm,
-          timestamp: workingItem?.observationEndTime || workingItem?.createdAt || new Date().toISOString(),
+          observationStartTime: resolvedWindow.entryTime || null,
+          observationEndTime: resolvedWindow.closingTime || null,
+          timestamp: (
+            resolvedWindow.closingTime ||
+            workingItem?.observationEndTime ||
+            workingItem?.createdAt ||
+            new Date().toISOString()
+          ),
           siteId: workingItem?.payload?.siteId || '',
           siteName: workingItem?.siteName || '',
           evidence: workingItem?.payload?.evidence || {},
           images,
+          vehicleDetails,
         },
       });
 
@@ -2824,8 +2971,8 @@ export default function DashboardPage() {
           breachLifecycle: 'CONVERTED_TO_PCN',
           convertedToPcn: true,
           convertedAt,
-          observationEndTime: workingItem?.payload?.observationEndTime || workingItem?.payload?.closingCapturedAt || convertedAt,
-          closingCapturedAt: workingItem?.payload?.closingCapturedAt || workingItem?.payload?.observationEndTime || convertedAt,
+          observationEndTime: resolvedWindow.closingTime || convertedAt,
+          closingCapturedAt: resolvedWindow.closingTime || convertedAt,
           pcnReason: pcnReasonInput.trim() || 'No valid permit or payment found',
           pcnId: response?.id || response?.pcnId || '',
           pcnNumber: response?.pcnNumber || '',
@@ -2895,8 +3042,11 @@ export default function DashboardPage() {
     if (item?.payload?.manualNote) {
       setManualNote(item.payload.manualNote);
     }
-    if (item?.payload?.selectedContraventionCode) {
-      setSelectedContraventionCode(item.payload.selectedContraventionCode);
+    if (item?.payload?.selectedContraventionCode || item?.payload?.contraventionCode) {
+      setSelectedContraventionCode(item.payload.selectedContraventionCode || item.payload.contraventionCode);
+    }
+    if (item?.payload?.contraventionReason) {
+      setSelectedReason(item.payload.contraventionReason);
     }
     const trackedVrm = normalizeVrm(item?.payload?.vrm || item?.vrm);
     const payloadAuthorization = item?.payload?.authorization || null;
@@ -2965,16 +3115,45 @@ export default function DashboardPage() {
   }
 
   async function handleFinalize({ openPcnDialogAfterSync = false } = {}) {
+    setPendingFinalize({
+      action: 'sync',
+      openPcnDialogAfterSync,
+    });
+    setPcnPreviewOpen(true);
+  }
+
+  function handleOpenPcnSubmitPreview() {
+    setPendingFinalize({
+      action: 'convert',
+      openPcnDialogAfterSync: false,
+    });
+    setPcnPreviewOpen(true);
+  }
+
+  async function confirmFinalize() {
+    if (!pendingFinalize) return;
+
+    setPcnPreviewOpen(false);
+    if (pendingFinalize.action === 'convert') {
+      try {
+        await handleConvertToPcn();
+      } finally {
+        setPendingFinalize(null);
+      }
+      return;
+    }
+
     setBusy(true);
     try {
       setLocation((await getCurrentLocation()) || location);
       await checkAuthorization(selectedVrm);
       await queueOrSendCapture({
         targetItemId: selectedTrackedId || '',
-        openPcnDialogAfterSync,
+        openPcnDialogAfterSync: pendingFinalize.openPcnDialogAfterSync,
       });
     } finally {
       setBusy(false);
+      setPendingFinalize(null);
     }
   }
 
@@ -3148,10 +3327,10 @@ export default function DashboardPage() {
           {/* Filter pills */}
           <div className="filter-pills">
             {[
-              { key: 'all',   label: 'All',    count: trackedBreaches.length },
-              { key: 'open',  label: 'Open',   count: trackedBreaches.filter(i => i.lifecycle.code === 'DRAFT_OPEN').length },
-              { key: 'ready', label: 'Ready',  count: trackedBreaches.filter(i => i.lifecycle.code === 'READY').length },
-              { key: 'failed',label: 'Failed', count: trackedBreaches.filter(i => i.lifecycle.code === 'FAILED').length },
+              { key: 'all', label: 'All', count: trackedBreaches.length },
+              { key: 'open', label: 'Open', count: trackedBreaches.filter(i => i.lifecycle.code === 'DRAFT_OPEN').length },
+              { key: 'ready', label: 'Ready', count: trackedBreaches.filter(i => i.lifecycle.code === 'READY').length },
+              { key: 'failed', label: 'Failed', count: trackedBreaches.filter(i => i.lifecycle.code === 'FAILED').length },
             ].map(f => (
               <button
                 key={f.key}
@@ -3200,10 +3379,10 @@ export default function DashboardPage() {
                     key={item.id}
                     className={[
                       'session-card',
-                      item.lifecycle.code === 'DRAFT_OPEN' && item.isOpen   ? 'session-card--active'   : '',
-                      item.lifecycle.code === 'DRAFT_OPEN' && timedOut      ? 'session-card--overtime' : '',
-                      item.lifecycle.code === 'READY'                       ? 'session-card--ready'    : '',
-                      item.lifecycle.code === 'FAILED'                      ? 'session-card--failed'   : '',
+                      item.lifecycle.code === 'DRAFT_OPEN' && item.isOpen ? 'session-card--active' : '',
+                      item.lifecycle.code === 'DRAFT_OPEN' && timedOut ? 'session-card--overtime' : '',
+                      item.lifecycle.code === 'READY' ? 'session-card--ready' : '',
+                      item.lifecycle.code === 'FAILED' ? 'session-card--failed' : '',
                     ].filter(Boolean).join(' ')}
                     onClick={() => handleReviewTracked(item)}
                     role="button"
@@ -3369,15 +3548,16 @@ export default function DashboardPage() {
               <button
                 type="button"
                 className="carcheck-open-btn"
-                  onClick={() => {
-                    const trackedVrm = selectedTracked?.payload?.vrm || selectedTracked?.vrm;
-                    if (!trackedVrm) return;
-                    setSelectedVrm(trackedVrm);
-                    setCarcheckDialogMessage(
-                      `Reopened saved carcheck${selectedTrackedVehicleDetails.make || selectedTrackedVehicleDetails.model ? `: ${[selectedTrackedVehicleDetails.make, selectedTrackedVehicleDetails.model].filter(Boolean).join(' ')}` : ''}.`
-                    );
-                    setCarcheckDialogOpen(true);
-                  }}
+                onClick={() => {
+                  const trackedVrm = selectedTracked?.payload?.vrm || selectedTracked?.vrm;
+                  if (!trackedVrm) return;
+                  setSelectedVrm(trackedVrm);
+                  setCarcheckDialogMessage(
+                    `Reopened saved carcheck${selectedTrackedVehicleDetails.make || selectedTrackedVehicleDetails.model ? `: ${[selectedTrackedVehicleDetails.make, selectedTrackedVehicleDetails.model].filter(Boolean).join(' ')}` : ''}.`
+                  );
+                  setCarcheckSaveNotice('');
+                  setCarcheckDialogOpen(true);
+                }}
               >
                 <span className="carcheck-open-btn-title">
                   {selectedTracked?.payload?.savedVehicleSavedAt ? 'Saved carcheck result' : 'Carcheck result ready'}
@@ -3537,7 +3717,7 @@ export default function DashboardPage() {
               <button
                 type="button"
                 className="action-btn action-btn--issue"
-                onClick={handleConvertToPcn}
+                onClick={handleOpenPcnSubmitPreview}
                 disabled={busy || convertLoading}
               >
                 {convertLoading
@@ -3624,9 +3804,9 @@ export default function DashboardPage() {
                             type="button"
                             className="action-btn action-btn--secondary"
                             style={{ fontSize: 12, padding: '4px 10px', marginTop: 4 }}
-                            onClick={() => handleRetryTracked(item.id)}
+                            onClick={() => openSubmitPreviewForTracked(item.id)}
                           >
-                            Retry
+                            Review & retry
                           </button>
                         ) : null}
                       </div>
@@ -3750,7 +3930,7 @@ export default function DashboardPage() {
                           {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
                         </span>
                         <span className="camera-raw-subline">
-                          {item?.capturedAt ? new Date(item.capturedAt).toLocaleString() : 'Capture time pending'}
+                          {item?.capturedAt ? formatCaptureTimestamp(item.capturedAt) : 'Capture time pending'}
                         </span>
                         <span className="camera-raw-subline">
                           {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
@@ -3795,7 +3975,7 @@ export default function DashboardPage() {
                           {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
                         </span>
                         <span className="camera-raw-subline">
-                          {item?.capturedAt ? new Date(item.capturedAt).toLocaleString() : 'Capture time pending'}
+                          {item?.capturedAt ? formatCaptureTimestamp(item.capturedAt) : 'Capture time pending'}
                         </span>
                         <span className="camera-raw-subline">
                           {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
@@ -3909,7 +4089,7 @@ export default function DashboardPage() {
               <div className="image-detail-meta-strip">
                 <span>
                   {imageDetailDialog.capturedAt
-                    ? `Captured ${new Date(imageDetailDialog.capturedAt).toLocaleString()}`
+                    ? `Captured ${formatCaptureTimestamp(imageDetailDialog.capturedAt)}`
                     : 'Capture time unavailable'}
                 </span>
                 <span>
@@ -4065,72 +4245,77 @@ export default function DashboardPage() {
         capturePhase={captureStepperPhase}
       />
 
-        {carcheckDialogOpen ? (
+      {carcheckDialogOpen ? (
         <div
           className="carcheck-overlay"
           role="dialog"
           aria-modal="true"
           aria-label="Carcheck result"
-            onClick={() => {
-              setCarcheckDialogOpen(false);
-              setCarcheckDialogMessage('');
-            }}
+          onClick={() => {
+            setCarcheckDialogOpen(false);
+            setCarcheckDialogMessage('');
+            setCarcheckSaveNotice('');
+            setCarcheckSaveLoading(false);
+          }}
         >
           <div className="carcheck-sheet" onClick={(event) => event.stopPropagation()}>
             <div className="carcheck-sheet-header">
               <div>
                 <div className="carcheck-sheet-kicker">Carcheck result</div>
                 <div className="carcheck-sheet-title">
-                    {selectedTrackedVehicleDetails?.make || vehicleLookup?.make || selectedTracked?.vrm || selectedVrm || 'Vehicle'} {selectedTrackedVehicleDetails?.model || vehicleLookup?.model || ''}
+                  {selectedTrackedVehicleDetails?.make || vehicleLookup?.make || selectedTracked?.vrm || selectedVrm || 'Vehicle'} {selectedTrackedVehicleDetails?.model || vehicleLookup?.model || ''}
                 </div>
               </div>
-                <button
-                  type="button"
-                  className="ghost-button stepper-close"
-                  onClick={() => {
-                    setCarcheckDialogOpen(false);
-                    setCarcheckDialogMessage('');
-                  }}
-                >
+              <button
+                type="button"
+                className="ghost-button stepper-close"
+                onClick={() => {
+                  setCarcheckDialogOpen(false);
+                  setCarcheckDialogMessage('');
+                  setCarcheckSaveNotice('');
+                  setCarcheckSaveLoading(false);
+                }}
+              >
                 ✕
               </button>
             </div>
 
             <div className="carcheck-sheet-body">
-                {carcheckDialogMessage ? <div className="notice notice-info">{carcheckDialogMessage}</div> : null}
+              {carcheckDialogMessage ? <div className="notice notice-info">{carcheckDialogMessage}</div> : null}
+              {carcheckSaveNotice ? <div className="notice notice-info">{carcheckSaveNotice}</div> : null}
 
-                {selectedTrackedVehicleDetails || vehicleLookup ? (
-                  <>
-                    {selectedTrackedVehicleImageUrl || vehicleLookup?.imageUrl || vehicleLookup?.imageUrls?.[0] ? (
-                      <img
-                        src={selectedTrackedVehicleImageUrl || vehicleLookup?.imageUrl || vehicleLookup?.imageUrls?.[0]}
-                        alt={`Vehicle ${selectedTrackedVehicleDetails?.vrm || vehicleLookup?.vrm || selectedTracked?.vrm || selectedVrm || 'lookup'}`}
-                        className="carcheck-sheet-image"
-                      />
-                    ) : null}
+              {selectedTrackedVehicleDetails || vehicleLookup ? (
+                <>
+                  {selectedTrackedVehicleImageUrl || vehicleLookup?.imageUrl || vehicleLookup?.imageUrls?.[0] ? (
+                    <img
+                      src={selectedTrackedVehicleImageUrl || vehicleLookup?.imageUrl || vehicleLookup?.imageUrls?.[0]}
+                      alt={`Vehicle ${selectedTrackedVehicleDetails?.vrm || vehicleLookup?.vrm || selectedTracked?.vrm || selectedVrm || 'lookup'}`}
+                      className="carcheck-sheet-image"
+                    />
+                  ) : null}
 
-                    <div className="carcheck-sheet-grid">
-                      <div className="carcheck-field">
-                        <span className="carcheck-field-label">VRM</span>
-                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.vrm || vehicleLookup?.vrm || selectedTracked?.vrm || selectedVrm || '—'}</span>
-                      </div>
-                      <div className="carcheck-field">
-                        <span className="carcheck-field-label">Colour</span>
-                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.color || vehicleLookup?.color || 'Unknown'}</span>
-                      </div>
-                      <div className="carcheck-field">
-                        <span className="carcheck-field-label">Year</span>
-                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.yearOfManufacture || vehicleLookup?.yearOfManufacture || 'Unknown'}</span>
-                      </div>
-                      <div className="carcheck-field">
-                        <span className="carcheck-field-label">Fuel</span>
-                        <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.fuelType || vehicleLookup?.fuelType || 'Unknown'}</span>
-                      </div>
+                  <div className="carcheck-sheet-grid">
+                    <div className="carcheck-field">
+                      <span className="carcheck-field-label">VRM</span>
+                      <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.vrm || vehicleLookup?.vrm || selectedTracked?.vrm || selectedVrm || '—'}</span>
                     </div>
-                  </>
-                ) : (
-                  <p className="card-copy">No vehicle data returned for this lookup.</p>
-                )}
+                    <div className="carcheck-field">
+                      <span className="carcheck-field-label">Colour</span>
+                      <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.color || vehicleLookup?.color || 'Unknown'}</span>
+                    </div>
+                    <div className="carcheck-field">
+                      <span className="carcheck-field-label">Year</span>
+                      <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.yearOfManufacture || vehicleLookup?.yearOfManufacture || 'Unknown'}</span>
+                    </div>
+                    <div className="carcheck-field">
+                      <span className="carcheck-field-label">Fuel</span>
+                      <span className="carcheck-field-value">{selectedTrackedVehicleDetails?.fuelType || vehicleLookup?.fuelType || 'Unknown'}</span>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <p className="card-copy">No vehicle data returned for this lookup.</p>
+              )}
 
               <div className="vehicle-result-actions">
                 <button
@@ -4138,8 +4323,9 @@ export default function DashboardPage() {
                   className="action-btn action-btn--secondary"
                   style={{ padding: '10px 14px', fontSize: 13 }}
                   onClick={handleSaveCarcheckDetails}
+                  disabled={carcheckSaveLoading}
                 >
-                  Save details
+                  {carcheckSaveLoading ? 'Saving details...' : 'Save details'}
                 </button>
               </div>
             </div>
@@ -4181,11 +4367,11 @@ export default function DashboardPage() {
                   </div>
                   <div className="pcn-summary-row">
                     <span className="pcn-summary-key">Observation Time</span>
-                    <span className="pcn-summary-value">{pcnPreview.entryTime ? new Date(pcnPreview.entryTime).toLocaleString() : '—'}</span>
+                    <span className="pcn-summary-value">{pcnPreview.entryTime ? formatCaptureTimestamp(pcnPreview.entryTime) : '—'}</span>
                   </div>
                   <div className="pcn-summary-row">
                     <span className="pcn-summary-key">Contravention Time</span>
-                    <span className="pcn-summary-value">{pcnPreview.closingTime ? new Date(pcnPreview.closingTime).toLocaleString() : '—'}</span>
+                    <span className="pcn-summary-value">{pcnPreview.closingTime ? formatCaptureTimestamp(pcnPreview.closingTime) : '—'}</span>
                   </div>
                   <div className="pcn-summary-row">
                     <span className="pcn-summary-key">Observed Duration</span>
@@ -4221,7 +4407,7 @@ export default function DashboardPage() {
                         )}
                         <div className="pcn-summary-image-time pcn-summary-image-time--overlay">
                           {pcnPreview.observationCapture?.capturedAt
-                            ? new Date(pcnPreview.observationCapture.capturedAt).toLocaleString()
+                            ? formatCaptureTimestamp(pcnPreview.observationCapture.capturedAt)
                             : 'Capture time unavailable'}
                         </div>
                       </div>
@@ -4240,7 +4426,7 @@ export default function DashboardPage() {
                         )}
                         <div className="pcn-summary-image-time pcn-summary-image-time--overlay">
                           {pcnPreview.contraventionCapture?.capturedAt
-                            ? new Date(pcnPreview.contraventionCapture.capturedAt).toLocaleString()
+                            ? formatCaptureTimestamp(pcnPreview.contraventionCapture.capturedAt)
                             : 'Capture time unavailable'}
                         </div>
                       </div>
@@ -4276,7 +4462,7 @@ export default function DashboardPage() {
                 <button
                   type="button"
                   className="action-btn action-btn--issue pcn-dialog-btn"
-                  onClick={handleConvertToPcn}
+                  onClick={handleOpenPcnSubmitPreview}
                   disabled={convertLoading}
                 >
                   {convertLoading
@@ -4288,6 +4474,35 @@ export default function DashboardPage() {
           </div>
         </div>
       ) : null}
+
+      {/* PCN Preview Dialog */}
+      <PcnPreviewDialog
+        open={pcnPreviewOpen}
+        loading={busy}
+        data={{
+          vrm: selectedVrm || selectedTracked?.vrm || selectedTracked?.payload?.vrm || '',
+          siteName: selectedSite?.name || selectedSite?.displayName || selectedTracked?.siteName || selectedSiteId,
+          contraventionReason: selectedReason || selectedTracked?.reason || selectedTracked?.payload?.contraventionReason || '',
+          observationStartTime: pcnPreview.entryTime || '',
+          observationEndTime: pcnPreview.closingTime || '',
+          observationStartLabel: pcnPreview.observationCapture?.capturedAtUk || '',
+          observationEndLabel: pcnPreview.contraventionCapture?.capturedAtUk || '',
+          actualMinutes: diffMinutes(
+            pcnPreview.entryTime || '',
+            pcnPreview.closingTime || ''
+          ),
+          mainEntryImagePreview: entryPreviews[mainEntryImageIndex] || '',
+          mainClosingImagePreview: closingPreviews[mainClosingImageIndex] || '',
+          location,
+          manualNote,
+          wardenId: profile?.uid || '',
+        }}
+        onConfirm={confirmFinalize}
+        onCancel={() => {
+          setPcnPreviewOpen(false);
+          setPendingFinalize(null);
+        }}
+      />
 
       {/* Hidden file inputs */}
       <input

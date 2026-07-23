@@ -1,8 +1,10 @@
 import { useRef, useState, useMemo, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { Capacitor } from '@capacitor/core';
+import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { isMlKitReady, scanPlateWithMlKit } from '../lib/mlkitLpr';
 import { canUseNativeCameraPreview, captureNativeCameraSample, setNativeCameraTorchEnabled, startNativeCameraPreview, stopNativeCameraPreview } from '../lib/nativeCameraPreview';
+import { getServerTimestamp } from '../lib/timeSync';
 
 function fileToDataUrl(file) {
     return new Promise((resolve, reject) => {
@@ -42,15 +44,7 @@ function getContraventionSelectionLabel(item) {
 }
 
 function formatEvidenceLocalTimestamp(capturedAt) {
-    const date = new Date(capturedAt || Date.now());
-    if (Number.isNaN(date.getTime())) return '';
-    const yyyy = String(date.getFullYear());
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const dd = String(date.getDate()).padStart(2, '0');
-    const hh = String(date.getHours()).padStart(2, '0');
-    const min = String(date.getMinutes()).padStart(2, '0');
-    const sec = String(date.getSeconds()).padStart(2, '0');
-    return `${yyyy}-${mm}-${dd} ${hh}:${min}:${sec}`;
+    return formatLocalTimestamp(capturedAt);
 }
 
 function formatEvidenceUtcTimestamp(capturedAt) {
@@ -78,6 +72,10 @@ function loadImageElement(file) {
 async function resolveCameraCaptureTimestamp(file, fallbackIso) {
     const fallback = normalizeCapturedAt(fallbackIso) || new Date().toISOString();
     if (!file || typeof window === 'undefined') return fallback;
+
+    // Use the actual capture moment as canonical. EXIF may be timezone-shifted
+    // and can introduce one-hour drift around DST.
+    if (fallback) return fallback;
 
     try {
         const exifr = await import('exifr');
@@ -111,32 +109,37 @@ async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
 
         const phaseLabel = String(phase || 'ENTRY').toUpperCase();
         const localLine = `LOCAL ${formatEvidenceLocalTimestamp(capturedAt)}`;
-        const utcLine = `UTC ${formatEvidenceUtcTimestamp(capturedAt).replace(' UTC', '')}`;
-        const lines = [`LDK WARDEN ${phaseLabel}`, localLine, utcLine];
+        const lines = [`LDK WARDEN ${phaseLabel}`, localLine];
 
-        const baseFont = Math.max(18, Math.floor(canvas.width / 56));
-        const lineGap = Math.max(4, Math.floor(baseFont * 0.25));
-        const paddingX = Math.max(12, Math.floor(baseFont * 0.55));
-        const paddingY = Math.max(10, Math.floor(baseFont * 0.45));
+        const baseFont = Math.max(48, Math.floor((canvas.width / 34) * 1.4));
+        const lineGap = Math.max(8, Math.floor(baseFont * 0.32));
+        const paddingX = Math.max(32, Math.floor(baseFont * 1.08));
+        const paddingY = Math.max(16, Math.floor(baseFont * 0.6));
 
         ctx.font = `700 ${baseFont}px Arial, sans-serif`;
         const contentWidth = Math.max(...lines.map((line) => ctx.measureText(line).width));
-        const boxWidth = Math.ceil(contentWidth + paddingX * 2);
+        const boxWidth = Math.ceil(Math.max(contentWidth + paddingX * 2, canvas.width * 0.62));
         const boxHeight = Math.ceil((baseFont * lines.length) + (lineGap * (lines.length - 1)) + (paddingY * 2));
-        const margin = Math.max(10, Math.floor(canvas.width * 0.02));
+        const margin = Math.max(18, Math.floor(canvas.width * 0.03));
         const boxX = margin;
-        const boxY = Math.max(margin, canvas.height - boxHeight - margin);
+        const boxY = margin;
 
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.66)';
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
         ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+        ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.08));
+        ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
 
         ctx.fillStyle = '#ffffff';
         ctx.textBaseline = 'top';
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.95)';
+        ctx.shadowBlur = Math.max(3, Math.floor(baseFont * 0.1));
         let textY = boxY + paddingY;
         for (const line of lines) {
             ctx.fillText(line, boxX + paddingX, textY);
             textY += baseFont + lineGap;
         }
+        ctx.shadowBlur = 0;
 
         const blob = await new Promise((resolve) => canvas.toBlob(resolve, file.type || 'image/jpeg', 0.92));
         if (!blob) return file;
@@ -315,7 +318,7 @@ export default function BreachStepper({
     const mlkitReadyRef = useRef(false);
 
     const normalizeVrm = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const stableCapturedVrm = normalizeVrm(capturedVrm || scanState.text || vrm);
+    const stableCapturedVrm = normalizeVrm(vrm || capturedVrm || scanState.text);
 
     const selectedContravention = useMemo(
         () => contraventions.find((c) => c.code === contraventionCode) || contraventions[0] || {},
@@ -327,29 +330,10 @@ export default function BreachStepper({
         [sites, defaultSiteId]
     );
 
-    const siteConsiderationMinutes = useMemo(
-        () => Number(selectedSite?.anprRules?.considerationMinutes ?? selectedSite?.considerationMinutes ?? 0),
-        [selectedSite]
-    );
-
     const defaultContraventionCode = useMemo(() => {
         if (!contraventions.length) return '';
-        if (siteConsiderationMinutes > 0) {
-            const timedRule = contraventions.find((item) => {
-                const mins = Number(item?.defaultObservationMinutes ?? 0);
-                if (mins !== siteConsiderationMinutes) return false;
-                const text = `${item?.code || ''} ${item?.label || ''}`.toLowerCase();
-                return /consideration|make_payment_within|register_vehicle_within|payment/i.test(text);
-            });
-            if (timedRule?.code) return timedRule.code;
-
-            const minuteMatch = contraventions.find(
-                (item) => Number(item?.defaultObservationMinutes ?? 0) === siteConsiderationMinutes
-            );
-            if (minuteMatch?.code) return minuteMatch.code;
-        }
         return contraventions[0]?.code || '';
-    }, [contraventions, siteConsiderationMinutes]);
+    }, [contraventions]);
 
     useEffect(() => {
         if (!contraventions.length) {
@@ -487,7 +471,7 @@ export default function BreachStepper({
         const allowWebFallback = Boolean(options.allowWebFallback);
         const skipOcr = Boolean(options.skipOcr);
 
-        const fallbackCapturedAt = new Date().toISOString();
+        const fallbackCapturedAt = await getServerTimestamp();
         const stampedCaptured = await Promise.all(
             captured.map(async (file) => {
                 const capturedAt = await resolveCameraCaptureTimestamp(file, fallbackCapturedAt);
@@ -527,7 +511,7 @@ export default function BreachStepper({
 
         if (result?.plateText) {
             const cleanedPlate = normalizeVrm(result.plateText);
-            setVrm(cleanedPlate);
+            setVrm((current) => current || cleanedPlate);
             setCapturedVrm(cleanedPlate);
             if (nextFiles[0]) {
                 nextFiles[0].detectedPlateText = cleanedPlate;
@@ -673,6 +657,7 @@ export default function BreachStepper({
                     liveNoPlateFramesRef.current = 0;
 
                     const effectiveConfidence = Math.min(100, confidence);
+                    setVrm((current) => current || plateText);
                     setCapturedVrm((current) => current || plateText);
                     if (!plateText) {
                         if (!warmupActive) {
@@ -1122,9 +1107,6 @@ export default function BreachStepper({
                         )}
 
                         {scanState.loading ? <div className="text-muted">Scanning image for VRM...</div> : null}
-                        {stableCapturedVrm ? (
-                            <div className="text-muted">Detected VRM: {stableCapturedVrm} (confidence {Math.round(scanState.confidence)}%)</div>
-                        ) : null}
 
                         <div className="stepper-nav">
                             <button type="button" className="ghost-button" onClick={handleClose}>Cancel</button>
@@ -1154,11 +1136,6 @@ export default function BreachStepper({
                 {!captureOnly && step === 1 ? (
                     <div className="stepper-step">
                         <p className="stepper-step-label">Step 2 — Vehicle details</p>
-                        <div className="stepper-vrm-banner">
-                            <span className="stepper-vrm-text">{stableCapturedVrm || normalizeVrm(vrm) || 'Pending VRM'}</span>
-                            <span className="text-muted">{selectedSite?.displayName || selectedSite?.name || defaultSiteId}</span>
-                        </div>
-
                         <label className="stepper-field">
                             <span className="stepper-field-label">VRM (registration)</span>
                             <input

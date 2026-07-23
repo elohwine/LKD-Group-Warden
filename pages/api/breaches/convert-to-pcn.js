@@ -1,11 +1,83 @@
 import { Timestamp } from 'firebase-admin/firestore';
 import { adminAuth, adminDb } from '../../../lib/firebase-admin.mjs';
 import normalizeVrm from '../../../lib/normalizeVrm.mjs';
+import { getUkDateTimeParts } from '../../../lib/ukTimestamp';
+import { buildVehicleDetailsRecord } from '../../../lib/vehicleDetails';
 
 function buildPcnNumber(vrm) {
   const safeVrm = normalizeVrm(vrm || '').slice(0, 6) || 'WARDEN';
   const stamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(-10);
   return `PCN-${safeVrm}-${stamp}`;
+}
+
+function parseInstant(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value?.toDate === 'function') {
+    const asDate = value.toDate();
+    return Number.isNaN(asDate?.getTime?.()) ? null : asDate;
+  }
+
+  if (typeof value === 'number') {
+    const asDate = new Date(value);
+    return Number.isNaN(asDate.getTime()) ? null : asDate;
+  }
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  // If timezone is missing, treat as UTC to keep behavior deterministic across hosts.
+  const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(raw)
+    ? raw
+    : `${raw}Z`;
+
+  const asDate = new Date(normalized);
+  return Number.isNaN(asDate.getTime()) ? null : asDate;
+}
+
+function resolveObservationInstants({ breachData = {}, requestStartRaw = null, requestEndRaw = null, requestTimestamp = null, fallbackNow = new Date() } = {}) {
+  const safeBreach = breachData && typeof breachData === 'object' ? breachData : {};
+  const cameraRawData = Array.isArray(safeBreach?.cameraRawData) ? safeBreach.cameraRawData : [];
+
+  const firstPhaseInstant = (phase) => {
+    const list = cameraRawData
+      .filter((record) => String(record?.phase || '').toLowerCase() === phase)
+      .map((record) => parseInstant(record?.capturedAt))
+      .filter(Boolean)
+      .sort((a, b) => a.getTime() - b.getTime());
+    return list[0] || null;
+  };
+
+  // Prefer persisted breach evidence timestamps (same capture chain as stamped images).
+  const breachStartCandidates = [
+    safeBreach?.evidence?.entry?.capturedAt,
+    safeBreach?.sessionEvidence?.entry?.capturedAt,
+    firstPhaseInstant('entry'),
+    safeBreach?.entryCapturedAt,
+    safeBreach?.observationStartTime,
+    safeBreach?.entryTime,
+    requestStartRaw,
+  ];
+
+  const breachEndCandidates = [
+    safeBreach?.evidence?.exit?.capturedAt,
+    safeBreach?.closingEvidence?.capturedAt,
+    safeBreach?.sessionEvidence?.closing?.capturedAt,
+    firstPhaseInstant('closing'),
+    safeBreach?.closingCapturedAt,
+    safeBreach?.observationEndTime,
+    safeBreach?.closedAt,
+    requestEndRaw,
+    requestTimestamp,
+  ];
+
+  const start = breachStartCandidates.map(parseInstant).find(Boolean) || parseInstant(requestTimestamp) || fallbackNow;
+  const end = breachEndCandidates.map(parseInstant).find(Boolean) || parseInstant(requestTimestamp) || fallbackNow;
+  return { start, end };
 }
 
 export default async function handler(req, res) {
@@ -32,11 +104,14 @@ export default async function handler(req, res) {
       notes,
       vrm,
       timestamp,
+      observationStartTime,
+      observationEndTime,
       siteId,
       siteName,
       evidence,
       images,
       imageUrls,
+      vehicleDetails,
     } = body;
 
     if (!breachId) {
@@ -68,12 +143,29 @@ export default async function handler(req, res) {
       : (Number.isFinite(breachAmount) && breachAmount > 0 ? breachAmount : 100);
 
     const now = new Date();
-    const eventTime = timestamp ? new Date(timestamp) : now;
-    const safeEventTime = Number.isNaN(eventTime.getTime()) ? now : eventTime;
+    const eventTime = parseInstant(timestamp);
+    const safeEventTime = eventTime || now;
+    const requestStartRaw = observationStartTime || null;
+    const requestEndRaw = observationEndTime || null;
+    const { start: safeObservedStart, end: safeObservedEnd } = resolveObservationInstants({
+      breachData,
+      requestStartRaw,
+      requestEndRaw,
+      requestTimestamp: timestamp || null,
+      fallbackNow: safeEventTime,
+    });
+    const safeObservedStartIso = safeObservedStart.toISOString();
+    const safeObservedEndIso = safeObservedEnd.toISOString();
+    const observedStartUk = getUkDateTimeParts(safeObservedStart);
+    const observedEndUk = getUkDateTimeParts(safeObservedEnd);
     const finalPcnNumber = buildPcnNumber(vrmValue);
     const mergedImages = [...(Array.isArray(images) ? images : []), ...(Array.isArray(imageUrls) ? imageUrls : [])]
       .filter((value) => typeof value === 'string' && value.length > 0)
       .filter((value, index, all) => all.indexOf(value) === index);
+    const resolvedVehicleDetails = buildVehicleDetailsRecord(
+      vehicleDetails || breachData?.vehicleDetails || breachData?.savedVehicleLookup || null,
+      vrmValue
+    );
 
     const pcnPayload = {
       breachId,
@@ -88,9 +180,25 @@ export default async function handler(req, res) {
       siteId: siteId || breachData?.siteId || '',
       siteName: siteName || breachData?.siteName || '',
       evidence: evidence || breachData?.evidence || null,
+      vehicleDetails: resolvedVehicleDetails,
+      make: resolvedVehicleDetails?.make || breachData?.make || null,
+      model: resolvedVehicleDetails?.model || breachData?.model || null,
+      colour: resolvedVehicleDetails?.color || breachData?.colour || breachData?.color || null,
       images: mergedImages,
       imageUrls: mergedImages,
+      observationStartTime: Timestamp.fromDate(safeObservedStart),
+      observationEndTime: Timestamp.fromDate(safeObservedEnd),
+      observedStartAt: Timestamp.fromDate(safeObservedStart),
+      observedEndAt: Timestamp.fromDate(safeObservedEnd),
       observedAt: Timestamp.fromDate(safeEventTime),
+      observationDateTime: Timestamp.fromDate(safeObservedStart),
+      contraventionDateTime: Timestamp.fromDate(safeObservedEnd),
+      observationDate: observedStartUk.date,
+      observationTime: observedStartUk.time,
+      contraventionDate: observedEndUk.date,
+      contraventionTime: observedEndUk.time,
+      entryTime: breachData?.entryTime || safeObservedStartIso,
+      closedAt: breachData?.closedAt || safeObservedEndIso,
       createdAt: Timestamp.fromDate(now),
       updatedAt: Timestamp.fromDate(now),
       createdBy: actorId,

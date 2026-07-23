@@ -1,6 +1,8 @@
 import { adminAuth, adminDb } from '../../../lib/firebase-admin.mjs';
 import { Timestamp } from 'firebase-admin/firestore';
 import normalizeVrm from '../../../lib/normalizeVrm.mjs';
+import { getBillableMinutes } from '../../../lib/duration';
+import { buildVehicleDetailsRecord } from '../../../lib/vehicleDetails';
 
 export const config = {
   api: {
@@ -89,6 +91,12 @@ export default async function handler(req, res) {
       selectedContraventionCode = null,
       manualNote = '',
       authorization = null,
+      vehicleDetails = null,
+      savedVehicleLookup = null,
+      make = null,
+      model = null,
+      colour = null,
+      color = null,
       location,
       notes,
     } = body;
@@ -149,6 +157,10 @@ export default async function handler(req, res) {
     const validImages = [...images, ...imageUrls]
       .filter((url) => typeof url === 'string' && url.startsWith('http'))
       .filter((url, index, all) => all.indexOf(url) === index);
+    const normalizedVehicleDetails = buildVehicleDetailsRecord(
+      vehicleDetails || savedVehicleLookup,
+      vrmNormalized
+    );
 
     const hasEntryEvidence = Boolean(
       evidence?.entry?.imageUrl || evidence?.entry?.vehicleImage || evidence?.entry?.plateImage
@@ -183,11 +195,18 @@ export default async function handler(req, res) {
       entryTime: entryTime || observationStartTime || startTime.toISOString(),
       closedAt: closedAt || observationEndTime || endTime.toISOString(),
       lastSeen: lastSeen || closedAt || observationEndTime || endTime.toISOString(),
-      actualMinutes: Number.isFinite(Number(actualMinutes)) ? Number(actualMinutes) : Math.round((endTime.getTime() - startTime.getTime()) / 60000),
+      // Chargeable duration counts partial minutes as full minutes.
+      actualMinutes: Number.isFinite(Number(actualMinutes))
+        ? Number(actualMinutes)
+        : getBillableMinutes(startTime.toISOString(), endTime.toISOString()),
       location: location || null,
       notes: notes || manualNote || '',
       manualNote: manualNote || notes || '',
       authorization: authorization || null,
+      vehicleDetails: normalizedVehicleDetails,
+      make: normalizedVehicleDetails?.make || make || null,
+      model: normalizedVehicleDetails?.model || model || null,
+      colour: normalizedVehicleDetails?.color || colour || color || null,
 
       // Server-stamped audit fields (GDPR compliance - not from client)
       source: 'WARDEN',

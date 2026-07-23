@@ -1,6 +1,7 @@
 import Head from 'next/head';
 import { useEffect } from 'react';
 import { Capacitor } from '@capacitor/core';
+import { syncWithServerTime } from '../lib/timeSync.js';
 import ErrorBoundary from '../components/ErrorBoundary.js';
 import '../styles/globals.css';
 
@@ -9,7 +10,12 @@ const LIGHT_THEME_COLOR = '#f6f9fd';
 
 export default function WardenApp({ Component, pageProps }) {
   useEffect(() => {
-    async function configureNativeStatusBar() {
+    async function initializeApp() {
+      // Sync with server time on app startup to correct device clock drift
+      syncWithServerTime().catch((error) => {
+        console.warn('[app] Server time sync failed:', error);
+      });
+
       if (!Capacitor.isNativePlatform() || typeof document === 'undefined') return undefined;
 
       try {
@@ -45,7 +51,7 @@ export default function WardenApp({ Component, pageProps }) {
     }
 
     let cleanup = null;
-    configureNativeStatusBar().then((dispose) => {
+    initializeApp().then((dispose) => {
       cleanup = typeof dispose === 'function' ? dispose : null;
     });
 

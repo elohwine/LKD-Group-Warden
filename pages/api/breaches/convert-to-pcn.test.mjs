@@ -86,6 +86,8 @@ describe('POST /api/breaches/convert-to-pcn', () => {
         vrm: 'AB12CDE',
         siteId: 'site-1',
         siteName: 'Main Site',
+        observationStartTime: '2026-07-08T10:00:00.000Z',
+        observationEndTime: '2026-07-08T10:12:00.000Z',
       }),
     });
     mockBreachRef.set.mockResolvedValue(undefined);
@@ -162,6 +164,46 @@ describe('POST /api/breaches/convert-to-pcn', () => {
     expect(payload.pcnNumber).toMatch(/^PCN-/);
     expect(payload.amount).toBe(100);
     expect(payload.sameDayWarnings).toBeNull();
+
+    const pcnWritePayload = mockPcnsCollection.add.mock.calls[0][0];
+    expect(pcnWritePayload.observationStartTime?._seconds).toBe(Math.floor(new Date('2026-07-08T10:00:00.000Z').getTime() / 1000));
+    expect(pcnWritePayload.observationEndTime?._seconds).toBe(Math.floor(new Date('2026-07-08T10:12:00.000Z').getTime() / 1000));
+    expect(pcnWritePayload.observedStartAt?._seconds).toBe(Math.floor(new Date('2026-07-08T10:00:00.000Z').getTime() / 1000));
+    expect(pcnWritePayload.observedEndAt?._seconds).toBe(Math.floor(new Date('2026-07-08T10:12:00.000Z').getTime() / 1000));
+    expect(pcnWritePayload.observationDateTime?._seconds).toBe(Math.floor(new Date('2026-07-08T10:00:00.000Z').getTime() / 1000));
+    expect(pcnWritePayload.contraventionDateTime?._seconds).toBe(Math.floor(new Date('2026-07-08T10:12:00.000Z').getTime() / 1000));
+    expect(pcnWritePayload.observationDate).toBe('2026-07-08');
+    expect(pcnWritePayload.observationTime).toBe('11:00');
+    expect(pcnWritePayload.contraventionDate).toBe('2026-07-08');
+    expect(pcnWritePayload.contraventionTime).toBe('11:12');
+    expect(pcnWritePayload.entryTime).toBe('2026-07-08T10:00:00.000Z');
+    expect(pcnWritePayload.closedAt).toBe('2026-07-08T10:12:00.000Z');
+  });
+
+  it('uses conversion timestamp as fallback when breach has no explicit timing', async () => {
+    mockBreachRef.get.mockResolvedValueOnce({
+      exists: true,
+      data: () => ({
+        vrm: 'AB12CDE',
+        siteId: 'site-1',
+        siteName: 'Main Site',
+      }),
+    });
+
+    const req = mockRequest({
+      body: {
+        timestamp: '2026-07-09T11:45:00.000Z',
+      },
+    });
+    const res = mockResponse();
+
+    await handler(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    const pcnWritePayload = mockPcnsCollection.add.mock.calls[0][0];
+    const expectedSeconds = Math.floor(new Date('2026-07-09T11:45:00.000Z').getTime() / 1000);
+    expect(pcnWritePayload.observedStartAt?._seconds).toBe(expectedSeconds);
+    expect(pcnWritePayload.observedEndAt?._seconds).toBe(expectedSeconds);
   });
 
   it('returns 500 when conversion write fails', async () => {
