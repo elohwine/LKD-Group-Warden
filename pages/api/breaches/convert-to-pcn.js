@@ -2,6 +2,7 @@ import { Timestamp } from 'firebase-admin/firestore';
 import { adminAuth, adminDb } from '../../../lib/firebase-admin.mjs';
 import normalizeVrm from '../../../lib/normalizeVrm.mjs';
 import { getUkDateTimeParts } from '../../../lib/ukTimestamp';
+import { getBillableMinutesFromMilliseconds } from '../../../lib/duration';
 import { buildVehicleDetailsRecord } from '../../../lib/vehicleDetails';
 
 function buildPcnNumber(vrm) {
@@ -37,6 +38,26 @@ function parseInstant(value) {
 
   const asDate = new Date(normalized);
   return Number.isNaN(asDate.getTime()) ? null : asDate;
+}
+
+const DEFAULT_PCN_REASON = 'No valid permit or payment found';
+
+function resolvePreferredReason({ requestReason = '', breachData = {} } = {}) {
+  const incoming = String(requestReason || '').trim();
+  const breachCandidates = [
+    breachData?.contraventionReason,
+    breachData?.reason,
+    breachData?.contravention,
+    breachData?.manualNote,
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  const breachPreferred = breachCandidates[0] || '';
+  if (incoming && incoming !== DEFAULT_PCN_REASON) return incoming;
+  if (breachPreferred) return breachPreferred;
+  if (incoming) return incoming;
+  return DEFAULT_PCN_REASON;
 }
 
 function resolveObservationInstants({ breachData = {}, requestStartRaw = null, requestEndRaw = null, requestTimestamp = null, fallbackNow = new Date() } = {}) {
@@ -156,6 +177,9 @@ export default async function handler(req, res) {
     });
     const safeObservedStartIso = safeObservedStart.toISOString();
     const safeObservedEndIso = safeObservedEnd.toISOString();
+    const rawDurationMs = safeObservedEnd.getTime() - safeObservedStart.getTime();
+    const actualDurationMs = Number.isFinite(rawDurationMs) && rawDurationMs > 0 ? rawDurationMs : 0;
+    const actualMinutes = getBillableMinutesFromMilliseconds(actualDurationMs);
     const observedStartUk = getUkDateTimeParts(safeObservedStart);
     const observedEndUk = getUkDateTimeParts(safeObservedEnd);
     const finalPcnNumber = buildPcnNumber(vrmValue);
@@ -167,12 +191,14 @@ export default async function handler(req, res) {
       vrmValue
     );
 
+    const finalReason = resolvePreferredReason({ requestReason: reason, breachData });
+
     const pcnPayload = {
       breachId,
       pcnNumber: finalPcnNumber,
       vrm: vrmValue,
       amount: amountValue,
-      reason: reason || breachData?.contraventionReason || 'No valid permit or payment found',
+      reason: finalReason,
       notes: notes || '',
       source: 'WARDEN',
       status: 'PENDING',
@@ -197,6 +223,8 @@ export default async function handler(req, res) {
       observationTime: observedStartUk.time,
       contraventionDate: observedEndUk.date,
       contraventionTime: observedEndUk.time,
+      actualDurationMs,
+      actualMinutes,
       entryTime: breachData?.entryTime || safeObservedStartIso,
       closedAt: breachData?.closedAt || safeObservedEndIso,
       createdAt: Timestamp.fromDate(now),

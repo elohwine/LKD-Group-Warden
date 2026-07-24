@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/router';
 import { fetchJson } from '../lib/api';
-import { clearSession, getStoredSiteId, loadSession, restoreSession, saveStoredSiteId } from '../lib/session';
+import {
+  clearSession,
+  getStoredMobileCameraId,
+  getStoredSiteId,
+  loadSession,
+  restoreSession,
+  saveStoredMobileCameraId,
+  saveStoredSiteId,
+} from '../lib/session';
 import { signOutFromWardenApp, getStoredToken, getValidToken } from '../lib/auth';
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
@@ -837,7 +845,6 @@ function stripCarcheckFromPayload(payload) {
   if (!payload || typeof payload !== 'object') return {};
   const {
     vehicleLookup,
-    vehicleDetails,
     carcheck,
     carCheck,
     carcheckResult,
@@ -851,7 +858,9 @@ export default function DashboardPage() {
   const router = useRouter();
   const [profile, setProfile] = useState(null);
   const [sites, setSites] = useState([]);
+  const [mobileCameras, setMobileCameras] = useState([]);
   const [selectedSiteId, setSelectedSiteId] = useState('');
+  const [selectedMobileCameraId, setSelectedMobileCameraId] = useState('');
   const [selectedVrm, setSelectedVrm] = useState('');
   const [selectedReason, setSelectedReason] = useState('');
   const [manualNote, setManualNote] = useState('');
@@ -874,10 +883,12 @@ export default function DashboardPage() {
   const [carcheckDialogMessage, setCarcheckDialogMessage] = useState('');
   const [carcheckSaveLoading, setCarcheckSaveLoading] = useState(false);
   const [carcheckSaveNotice, setCarcheckSaveNotice] = useState('');
+  const [carcheckSaveStatus, setCarcheckSaveStatus] = useState('idle');
   const [queueItems, setQueueItems] = useState([]);
   const [syncing, setSyncing] = useState(false);
   const [online, setOnline] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [mobileCameraAssigning, setMobileCameraAssigning] = useState(false);
   const [message, setMessage] = useState('');
   const [detailMessage, setDetailMessage] = useState('');
   const [ticks, setTicks] = useState(0);
@@ -934,6 +945,27 @@ export default function DashboardPage() {
   }
 
   const selectedSite = useMemo(() => sites.find((site) => String(site.id) === String(selectedSiteId)) || null, [sites, selectedSiteId]);
+  const DEFAULT_PCN_REASON = 'No valid permit or payment found';
+  const getPreferredReason = (payload = null, fallback = DEFAULT_PCN_REASON) => {
+    const candidates = [
+      payload?.pcnReason,
+      payload?.contraventionReason,
+      payload?.reason,
+      selectedReason,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    }
+    return fallback;
+  };
+  const selectedMobileCamera = useMemo(
+    () => mobileCameras.find((camera) => String(camera.id) === String(selectedMobileCameraId)) || null,
+    [mobileCameras, selectedMobileCameraId]
+  );
+  const selectedMobileCameraSite = useMemo(
+    () => sites.find((site) => String(site.id) === String(selectedMobileCamera?.siteId || '')) || null,
+    [sites, selectedMobileCamera]
+  );
   const contraventions = useMemo(() => getContraventionOptions(selectedSite), [selectedSite]);
   const activeTimers = useMemo(() => {
     return queueItems
@@ -1070,6 +1102,15 @@ export default function DashboardPage() {
     ]);
     return payloadImageUrls[0] || null;
   }, [selectedTracked, selectedTrackedVehicleDetails]);
+  const activeCarcheckLookup = selectedTrackedVehicleDetails || vehicleLookup || null;
+  const canSaveCarcheckDetails = Boolean(selectedTrackedId && activeCarcheckLookup);
+  const isCurrentCarcheckAlreadySaved = useMemo(() => {
+    if (!selectedTracked?.payload?.savedVehicleLookup || !activeCarcheckLookup) return false;
+
+    const incomingFingerprint = buildVehicleLookupFingerprint(activeCarcheckLookup);
+    const existingFingerprint = buildVehicleLookupFingerprint(selectedTracked.payload.savedVehicleLookup);
+    return Boolean(existingFingerprint && incomingFingerprint && incomingFingerprint === existingFingerprint);
+  }, [selectedTracked, activeCarcheckLookup]);
   const pcnPreview = useMemo(() => {
     if (!selectedTracked) {
       return {
@@ -1263,6 +1304,23 @@ export default function DashboardPage() {
     return 'Review';
   }
 
+  function resolveVehicleDetailsForSubmission(inputVrm, sourcePayload = null) {
+    const normalizedVrm = normalizeVrm(inputVrm || sourcePayload?.vrm || selectedVrm || '');
+    if (!normalizedVrm) return null;
+
+    const payloadLookup = sourcePayload?.savedVehicleLookup || sourcePayload?.vehicleDetails || null;
+    const trackedLookup = normalizeVrm(selectedTrackedVehicleDetails?.vrm || selectedTracked?.payload?.vrm || '') === normalizedVrm
+      ? selectedTrackedVehicleDetails
+      : null;
+    const cachedLookup = vehicleLookupByVrm[normalizedVrm] || null;
+    const activeLookup = normalizeVrm(vehicleLookup?.vrm || '') === normalizedVrm ? vehicleLookup : null;
+
+    return buildVehicleDetailsRecord(
+      payloadLookup || trackedLookup || cachedLookup || activeLookup || null,
+      normalizedVrm
+    );
+  }
+
   async function openSubmitPreviewForTracked(itemId) {
     if (!itemId) return;
     const items = await listQueueItems();
@@ -1307,6 +1365,11 @@ export default function DashboardPage() {
       const saved = loadSession();
       if (saved?.selectedSiteId) setSelectedSiteId(saved.selectedSiteId);
     }
+
+    const storedMobileCameraId = getStoredMobileCameraId();
+    if (storedMobileCameraId) {
+      setSelectedMobileCameraId(storedMobileCameraId);
+    }
   }, []);
 
   useEffect(() => {
@@ -1323,7 +1386,7 @@ export default function DashboardPage() {
         setAuthToken(token);
         setProfile(session);
         setOnline(navigator.onLine);
-        await Promise.all([loadSites(token), refreshQueue()]);
+        await Promise.all([loadSites(token), loadMobileCameras(token), refreshQueue()]);
         authReadyRef.current = true;
       } catch (error) {
         console.error('[warden] profile bootstrap failed', error);
@@ -1383,15 +1446,32 @@ export default function DashboardPage() {
   }, [contraventions, selectedContraventionCode, selectedReason]);
 
   useEffect(() => {
+    const nextReason = String(selectedReason || '').trim();
+    if (!nextReason) return;
+    setPcnReasonInput((current) => {
+      const cur = String(current || '').trim();
+      if (!cur || cur === DEFAULT_PCN_REASON) return nextReason;
+      return current;
+    });
+  }, [selectedReason]);
+
+  useEffect(() => {
     if (selectedSiteId) {
       saveStoredSiteId(selectedSiteId);
     }
   }, [selectedSiteId]);
 
   useEffect(() => {
+    if (selectedMobileCameraId) {
+      saveStoredMobileCameraId(selectedMobileCameraId);
+    }
+  }, [selectedMobileCameraId]);
+
+  useEffect(() => {
     setCarcheckDialogOpen(false);
     setCarcheckSaveLoading(false);
     setCarcheckSaveNotice('');
+    setCarcheckSaveStatus('idle');
     setPcnDialogOpen(false);
   }, [selectedTrackedId]);
 
@@ -1407,6 +1487,19 @@ export default function DashboardPage() {
     const stored = window.localStorage.getItem('warden-auto-submit-on-closing-capture');
     setAutoSubmitOnClosingCapture(stored === 'true');
   }, []);
+
+  useEffect(() => {
+    if (!carcheckDialogOpen) return;
+    if (carcheckSaveStatus !== 'success') return;
+    if (!carcheckSaveNotice) return;
+
+    const timeoutId = window.setTimeout(() => {
+      setCarcheckSaveNotice('');
+      setCarcheckSaveStatus('idle');
+    }, 4000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [carcheckDialogOpen, carcheckSaveStatus, carcheckSaveNotice]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1439,6 +1532,67 @@ export default function DashboardPage() {
     if (!selectedSiteId && activeSites.length > 0) {
       setSelectedSiteId(activeSites[0].id);
       saveStoredSiteId(activeSites[0].id);
+    }
+  }
+
+  async function loadMobileCameras(token) {
+    const data = await fetchJson('/api/cameras', { token });
+    const allCameras = Array.isArray(data?.cameras) ? data.cameras : [];
+    const nextMobileCameras = allCameras.filter((camera) => (
+      camera?.isMobile === true || camera?.lastSiteAssignmentReason === 'mobile_camera_daily_assignment'
+    ));
+
+    setMobileCameras(nextMobileCameras);
+
+    const storedMobileCameraId = getStoredMobileCameraId();
+    const hasStoredSelection = nextMobileCameras.some((camera) => String(camera.id) === String(storedMobileCameraId || ''));
+    if (hasStoredSelection) {
+      setSelectedMobileCameraId(storedMobileCameraId);
+      return;
+    }
+
+    if (!selectedMobileCameraId && nextMobileCameras.length === 1) {
+      setSelectedMobileCameraId(nextMobileCameras[0].id);
+      saveStoredMobileCameraId(nextMobileCameras[0].id);
+    }
+  }
+
+  async function assignMobileCameraToSite(cameraId, siteId) {
+    const nextCameraId = String(cameraId || '').trim();
+    const nextSiteId = String(siteId || '').trim();
+
+    if (!nextSiteId) {
+      setDetailMessage('Select the patrol site before linking a vehicle camera.');
+      return;
+    }
+
+    if (!nextCameraId) {
+      setDetailMessage('Warden-only mode active. No vehicle camera linked for this patrol.');
+      return;
+    }
+
+    setMobileCameraAssigning(true);
+    try {
+      const token = await resolveAuthToken();
+      await fetchJson(`/api/cameras/${encodeURIComponent(nextCameraId)}/site-assignment`, {
+        method: 'POST',
+        token,
+        body: {
+          siteId: nextSiteId,
+          assignedBy: profile?.email || profile?.uid || 'warden',
+          reason: 'warden_patrol_site_assignment'
+        }
+      });
+
+      await loadMobileCameras(token);
+      const resolvedSite = sites.find((site) => String(site.id) === String(nextSiteId)) || null;
+      const resolvedCamera = mobileCameras.find((camera) => String(camera.id) === String(nextCameraId)) || selectedMobileCamera;
+      setDetailMessage(`${resolvedCamera?.name || 'Vehicle camera'} assigned to ${resolvedSite?.name || resolvedSite?.displayName || nextSiteId}.`);
+    } catch (error) {
+      console.error('[warden] mobile camera assignment failed', error);
+      setDetailMessage(error?.message || 'Vehicle camera assignment failed.');
+    } finally {
+      setMobileCameraAssigning(false);
     }
   }
 
@@ -2196,6 +2350,7 @@ export default function DashboardPage() {
     const cachedLookup = vehicleLookupByVrm[vrm];
     if (cachedLookup && !forceRefresh) {
       setCarcheckSaveNotice('');
+      setCarcheckSaveStatus('idle');
       setVehicleLookup(cachedLookup);
       setCarcheckDialogMessage(`Loaded from app memory${cachedLookup?.make || cachedLookup?.model ? `: ${[cachedLookup.make, cachedLookup.model].filter(Boolean).join(' ')}` : ''}.`);
       setCarcheckDialogOpen(true);
@@ -2215,6 +2370,7 @@ export default function DashboardPage() {
 
       const normalized = normalizeVehicleLookup(result, vrm);
       setCarcheckSaveNotice('');
+      setCarcheckSaveStatus('idle');
       setVehicleLookup(normalized);
       setVehicleLookupByVrm((current) => ({ ...current, [vrm]: normalized }));
       setCarcheckDialogMessage(`Carcheck complete${normalized?.make || normalized?.model ? `: ${[normalized.make, normalized.model].filter(Boolean).join(' ')}` : ''}.`);
@@ -2236,18 +2392,25 @@ export default function DashboardPage() {
   async function handleSaveCarcheckDetails() {
     const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm);
     setCarcheckSaveNotice('');
+    setCarcheckSaveStatus('idle');
     if (!trackedVrm) {
+      setCarcheckSaveStatus('error');
+      setCarcheckSaveNotice('Run carcheck before saving details.');
       setDetailMessage('Run carcheck before saving details.');
       return;
     }
 
-    const currentLookup = selectedTrackedVehicleDetails || vehicleLookup;
+    const currentLookup = activeCarcheckLookup;
     if (!currentLookup) {
+      setCarcheckSaveStatus('error');
+      setCarcheckSaveNotice('No carcheck result to save yet.');
       setDetailMessage('No carcheck result to save yet.');
       return;
     }
 
     if (!selectedTrackedId) {
+      setCarcheckSaveStatus('error');
+      setCarcheckSaveNotice('Open a Draft Parking Charge before saving carcheck details.');
       setDetailMessage('Open a Draft Parking Charge before saving carcheck details.');
       return;
     }
@@ -2255,10 +2418,12 @@ export default function DashboardPage() {
     setCarcheckSaveLoading(true);
     try {
       const nowIso = new Date().toISOString();
+      const normalizedLookup = buildVehicleDetailsRecord(currentLookup, trackedVrm);
       const existingLookup = selectedTracked?.payload?.savedVehicleLookup || null;
-      const incomingFingerprint = buildVehicleLookupFingerprint(currentLookup);
+      const incomingFingerprint = buildVehicleLookupFingerprint(normalizedLookup || currentLookup);
       const existingFingerprint = buildVehicleLookupFingerprint(existingLookup);
       if (selectedTracked?.payload?.savedVehicleSavedAt && existingFingerprint && incomingFingerprint === existingFingerprint) {
+        setCarcheckSaveStatus('success');
         setCarcheckSaveNotice('Already saved for this session.');
         setDetailMessage('Vehicle details already saved. You can reopen this result anytime.');
         return;
@@ -2268,19 +2433,31 @@ export default function DashboardPage() {
         payload: {
           ...selectedTracked?.payload,
           vrm: trackedVrm,
-          savedVehicleLookup: currentLookup,
-          savedVehicleImageUrl: currentLookup?.imageUrl || currentLookup?.imageUrls?.[0] || selectedTrackedVehicleImageUrl || null,
+          savedVehicleLookup: normalizedLookup || currentLookup,
+          vehicleDetails: normalizedLookup || currentLookup,
+          savedVehicleImageUrl:
+            normalizedLookup?.imageUrl ||
+            normalizedLookup?.imageUrls?.[0] ||
+            currentLookup?.imageUrl ||
+            currentLookup?.imageUrls?.[0] ||
+            selectedTrackedVehicleImageUrl ||
+            null,
           savedVehicleSavedAt: nowIso,
         },
         updatedAt: nowIso,
       });
+      if (normalizedLookup) {
+        setVehicleLookup(normalizedLookup);
+        setVehicleLookupByVrm((current) => ({ ...current, [trackedVrm]: normalizedLookup }));
+      }
       await refreshQueue();
-      setCarcheckSaveNotice('Saved to this Draft Parking Charge.');
+      setCarcheckSaveStatus('success');
+      setCarcheckSaveNotice(`Saved to this Draft Parking Charge at ${formatCaptureTimestamp(nowIso)}.`);
       setDetailMessage('Vehicle details saved. Reopen anytime from this Draft Parking Charge.');
-      setCarcheckDialogOpen(false);
-      setCarcheckDialogMessage('');
+      setCarcheckDialogMessage('Carcheck details saved and attached to this Draft Parking Charge.');
     } catch (error) {
       console.error('[warden] failed to save carcheck details', error);
+      setCarcheckSaveStatus('error');
       setCarcheckSaveNotice(error?.message || 'Save failed. Please retry.');
       setDetailMessage(error?.message || 'Saving carcheck details failed.');
     } finally {
@@ -2334,8 +2511,11 @@ export default function DashboardPage() {
       return;
     }
 
+    const normalizedVrm = normalizeVrm(selectedVrm);
+    const savedVehicleLookup = resolveVehicleDetailsForSubmission(normalizedVrm, selectedTracked?.payload || null);
+
     const payload = stripCarcheckFromPayload({
-      vrm: normalizeVrm(selectedVrm),
+      vrm: normalizedVrm,
       siteId: selectedSiteId,
       siteName: selectedSite?.name || selectedSite?.displayName || selectedSiteId,
       source: 'WARDEN',
@@ -2354,6 +2534,8 @@ export default function DashboardPage() {
       actualMinutes: elapsedMinutes,
       manualNote,
       authorization,
+      savedVehicleLookup,
+      vehicleDetails: savedVehicleLookup,
       selectedContraventionCode,
       mainEntryImageIndex,
       mainClosingImageIndex,
@@ -2445,8 +2627,11 @@ export default function DashboardPage() {
       detection: entryDetection,
       capturedAt: entryTime,
     });
+    const normalizedVrm = normalizeVrm(selectedVrm);
+    const savedVehicleLookup = resolveVehicleDetailsForSubmission(normalizedVrm, selectedTracked?.payload || null);
+
     const draftPayload = stripCarcheckFromPayload({
-      vrm: normalizeVrm(selectedVrm),
+      vrm: normalizedVrm,
       siteId: selectedSiteId,
       siteName: selectedSite?.name || selectedSite?.displayName || selectedSiteId,
       source: 'WARDEN',
@@ -2462,6 +2647,8 @@ export default function DashboardPage() {
       closingCapturedAt: null,
       manualNote,
       authorization,
+      savedVehicleLookup,
+      vehicleDetails: savedVehicleLookup,
       selectedContraventionCode,
       mainEntryImageIndex,
       mainClosingImageIndex,
@@ -2741,10 +2928,25 @@ export default function DashboardPage() {
         closingEvidence.images || []
       );
       const cameraRawDataForSubmission = sanitizeCameraRawRecordsForSubmission(cameraRawDataForLos);
-      const safeQueuedPayload = stripCarcheckFromPayload(queuedItem.payload);
+      const resolvedQueuedVehicleDetails = resolveVehicleDetailsForSubmission(queuedItem?.payload?.vrm, queuedItem?.payload || null);
+      const safeQueuedPayload = stripCarcheckFromPayload({
+        ...(queuedItem.payload || {}),
+        savedVehicleLookup:
+          queuedItem?.payload?.savedVehicleLookup ||
+          queuedItem?.payload?.vehicleDetails ||
+          resolvedQueuedVehicleDetails,
+        vehicleDetails:
+          queuedItem?.payload?.vehicleDetails ||
+          queuedItem?.payload?.savedVehicleLookup ||
+          resolvedQueuedVehicleDetails,
+      });
       const submissionSafePayload = sanitizePayloadForSubmission(safeQueuedPayload);
       const vehicleDetails = buildVehicleDetailsRecord(
-        submissionSafePayload?.savedVehicleLookup || queuedItem?.payload?.savedVehicleLookup || null,
+        submissionSafePayload?.savedVehicleLookup ||
+          submissionSafePayload?.vehicleDetails ||
+          queuedItem?.payload?.savedVehicleLookup ||
+          queuedItem?.payload?.vehicleDetails ||
+          null,
         vrm
       );
       const sessionEvidence = {
@@ -2802,6 +3004,7 @@ export default function DashboardPage() {
         actorId: profile?.uid,
         realExitObserved: true,
         breachEvidenceMode: 'paired_exit',
+        savedVehicleLookup: vehicleDetails,
         entryTime,
         closedAt: closingTime,
         lastSeen: closingTime,
@@ -2836,7 +3039,7 @@ export default function DashboardPage() {
         if (submittedItem) {
           setSelectedTrackedId(submittedItem.id);
           setActiveTab('tracked');
-          setPcnReasonInput(submittedItem?.payload?.pcnReason || 'No valid permit or payment found');
+          setPcnReasonInput(getPreferredReason(submittedItem?.payload));
           setConvertError('');
           setMessage('Parking Charge submitted. Use the primary action to complete final PCN submission.');
         }
@@ -2938,12 +3141,20 @@ export default function DashboardPage() {
         workingItem?.vrm || selectedTracked?.vrm || selectedVrm
       );
       const resolvedWindow = resolveObservationWindow(workingItem?.payload || {});
+      const manualReason = String(pcnReasonInput || '').trim();
+      const payloadReason = getPreferredReason(workingItem?.payload || {}, '');
+      const finalReason =
+        (manualReason && manualReason !== DEFAULT_PCN_REASON && manualReason)
+        || String(selectedReason || '').trim()
+        || payloadReason
+        || manualReason
+        || DEFAULT_PCN_REASON;
       const response = await fetchJson('/api/breaches/convert-to-pcn', {
         method: 'POST',
         token,
         body: {
           breachId,
-          reason: pcnReasonInput.trim() || 'No valid permit or payment found',
+          reason: finalReason,
           notes: `Converted from breach ${breachId}`,
           vrm: workingItem?.vrm || selectedTracked?.vrm,
           observationStartTime: resolvedWindow.entryTime || null,
@@ -2973,7 +3184,7 @@ export default function DashboardPage() {
           convertedAt,
           observationEndTime: resolvedWindow.closingTime || convertedAt,
           closingCapturedAt: resolvedWindow.closingTime || convertedAt,
-          pcnReason: pcnReasonInput.trim() || 'No valid permit or payment found',
+          pcnReason: finalReason,
           pcnId: response?.id || response?.pcnId || '',
           pcnNumber: response?.pcnNumber || '',
           pcnAmount: Number(response?.amount || 0) > 0 ? Number(response.amount) : Number(workingItem?.payload?.pcnAmount || 0),
@@ -3082,7 +3293,7 @@ export default function DashboardPage() {
     setMonitoringSessionStartedAt(sessionStart);
     setMonitoringSessionActive(Boolean(sessionStart) && !item?.payload?.closingCapturedAt && !item?.payload?.observationEndTime && closingEvidence.length === 0);
 
-    setPcnReasonInput(item?.payload?.pcnReason || 'No valid permit or payment found');
+    setPcnReasonInput(getPreferredReason(item?.payload));
     setConvertError('');
 
     const lifecycleLabel = (item?.lifecycle?.label || getBreachLifecycle(item).label || 'session').toLowerCase();
@@ -3556,6 +3767,7 @@ export default function DashboardPage() {
                     `Reopened saved carcheck${selectedTrackedVehicleDetails.make || selectedTrackedVehicleDetails.model ? `: ${[selectedTrackedVehicleDetails.make, selectedTrackedVehicleDetails.model].filter(Boolean).join(' ')}` : ''}.`
                   );
                   setCarcheckSaveNotice('');
+                  setCarcheckSaveStatus('idle');
                   setCarcheckDialogOpen(true);
                 }}
               >
@@ -4175,6 +4387,55 @@ export default function DashboardPage() {
                 </select>
               </div>
 
+              <div className="detail-section-label" style={{ marginTop: 8 }}>Vehicle Camera</div>
+              <div className="settings-row settings-row--stacked">
+                <span className="settings-row-label">Linked mobile ANPR camera</span>
+                <select
+                  className="site-filter-select"
+                  value={selectedMobileCameraId}
+                  onChange={async (event) => {
+                    const nextCameraId = event.target.value;
+                    setSelectedMobileCameraId(nextCameraId);
+                    saveStoredMobileCameraId(nextCameraId);
+
+                    if (!nextCameraId) {
+                      setDetailMessage('Warden-only mode active. No vehicle camera linked for this patrol.');
+                      return;
+                    }
+
+                    await assignMobileCameraToSite(nextCameraId, selectedSiteId);
+                  }}
+                >
+                  <option value="">No vehicle camera linked</option>
+                  {mobileCameras.map((camera) => (
+                    <option key={camera.id} value={camera.id}>
+                      {camera.name || camera.id}
+                    </option>
+                  ))}
+                </select>
+                {selectedMobileCamera ? (
+                  <small className="muted-text" style={{ marginTop: 6 }}>
+                    Current backend site: {selectedMobileCameraSite?.displayName || selectedMobileCameraSite?.name || 'Unassigned'}.
+                    Selecting this dropdown links the camera to the patrol site for today.
+                  </small>
+                ) : null}
+                {!selectedMobileCamera ? (
+                  <small className="muted-text" style={{ marginTop: 6 }}>
+                    Leave this blank to work in warden-only mode with no vehicle camera attached.
+                  </small>
+                ) : null}
+                {mobileCameras.length === 0 ? (
+                  <small className="muted-text" style={{ marginTop: 6 }}>
+                    No mobile cameras are flagged yet in the backend camera registry.
+                  </small>
+                ) : null}
+                {mobileCameraAssigning ? (
+                  <small className="muted-text" style={{ marginTop: 6 }}>
+                    Assigning selected vehicle camera to the active patrol site...
+                  </small>
+                ) : null}
+              </div>
+
               <button
                 type="button"
                 className="action-btn action-btn--secondary"
@@ -4255,6 +4516,7 @@ export default function DashboardPage() {
             setCarcheckDialogOpen(false);
             setCarcheckDialogMessage('');
             setCarcheckSaveNotice('');
+            setCarcheckSaveStatus('idle');
             setCarcheckSaveLoading(false);
           }}
         >
@@ -4273,6 +4535,7 @@ export default function DashboardPage() {
                   setCarcheckDialogOpen(false);
                   setCarcheckDialogMessage('');
                   setCarcheckSaveNotice('');
+                  setCarcheckSaveStatus('idle');
                   setCarcheckSaveLoading(false);
                 }}
               >
@@ -4282,7 +4545,15 @@ export default function DashboardPage() {
 
             <div className="carcheck-sheet-body">
               {carcheckDialogMessage ? <div className="notice notice-info">{carcheckDialogMessage}</div> : null}
-              {carcheckSaveNotice ? <div className="notice notice-info">{carcheckSaveNotice}</div> : null}
+              {carcheckSaveNotice ? (
+                <div
+                  className={`notice ${carcheckSaveStatus === 'success' ? 'notice-success' : carcheckSaveStatus === 'error' ? 'notice-error' : 'notice-info'}`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {carcheckSaveNotice}
+                </div>
+              ) : null}
 
               {selectedTrackedVehicleDetails || vehicleLookup ? (
                 <>
@@ -4323,9 +4594,13 @@ export default function DashboardPage() {
                   className="action-btn action-btn--secondary"
                   style={{ padding: '10px 14px', fontSize: 13 }}
                   onClick={handleSaveCarcheckDetails}
-                  disabled={carcheckSaveLoading}
+                  disabled={carcheckSaveLoading || !canSaveCarcheckDetails}
                 >
-                  {carcheckSaveLoading ? 'Saving details...' : 'Save details'}
+                  {carcheckSaveLoading
+                    ? 'Saving details...'
+                    : isCurrentCarcheckAlreadySaved
+                      ? 'Details saved'
+                      : 'Save details'}
                 </button>
               </div>
             </div>

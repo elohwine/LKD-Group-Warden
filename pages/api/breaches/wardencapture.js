@@ -1,7 +1,7 @@
 import { adminAuth, adminDb } from '../../../lib/firebase-admin.mjs';
 import { Timestamp } from 'firebase-admin/firestore';
 import normalizeVrm from '../../../lib/normalizeVrm.mjs';
-import { getBillableMinutes } from '../../../lib/duration';
+import { getBillableMinutes, getElapsedMilliseconds } from '../../../lib/duration';
 import { buildVehicleDetailsRecord } from '../../../lib/vehicleDetails';
 
 export const config = {
@@ -76,6 +76,8 @@ export default async function handler(req, res) {
       siteId,
       siteName,
       contraventionReason,
+      reason,
+      contravention,
       observationStartTime,
       observationEndTime,
       images = [],
@@ -101,11 +103,18 @@ export default async function handler(req, res) {
       notes,
     } = body;
 
+    const resolvedContraventionReason = String(
+      contraventionReason
+      || reason
+      || contravention
+      || ''
+    ).trim();
+
     // ───── VALIDATE REQUIRED FIELDS ─────
     const errors = [];
     if (!vrm) errors.push('vrm is required');
     if (!siteId) errors.push('siteId is required');
-    if (!contraventionReason) errors.push('contraventionReason is required');
+    if (!resolvedContraventionReason) errors.push('contraventionReason is required');
 
     if (errors.length > 0) {
       console.warn(`[wardencapture] Validation failed: ${errors.join(', ')}`);
@@ -153,6 +162,8 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Closing evidence must be captured after opening evidence' });
     }
 
+    const actualDurationMs = getElapsedMilliseconds(startTime.toISOString(), endTime.toISOString());
+
     // ───── VALIDATE IMAGES ARRAY ─────
     const validImages = [...images, ...imageUrls]
       .filter((url) => typeof url === 'string' && url.startsWith('http'))
@@ -182,8 +193,10 @@ export default async function handler(req, res) {
       vrm: vrmNormalized,
       siteId,
       siteName: siteName || 'Unknown Site',
-      contraventionReason,
+      contraventionReason: resolvedContraventionReason,
       selectedContraventionCode,
+      contravention: resolvedContraventionReason,
+      reason: resolvedContraventionReason,
       observationStartTime: Timestamp.fromDate(startTime),
       observationEndTime: Timestamp.fromDate(endTime),
       images: validImages,
@@ -196,6 +209,7 @@ export default async function handler(req, res) {
       closedAt: closedAt || observationEndTime || endTime.toISOString(),
       lastSeen: lastSeen || closedAt || observationEndTime || endTime.toISOString(),
       // Chargeable duration counts partial minutes as full minutes.
+      actualDurationMs,
       actualMinutes: Number.isFinite(Number(actualMinutes))
         ? Number(actualMinutes)
         : getBillableMinutes(startTime.toISOString(), endTime.toISOString()),
