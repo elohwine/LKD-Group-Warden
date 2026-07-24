@@ -59,6 +59,33 @@ validate_public_api_base() {
     export NEXT_PUBLIC_WARDEN_API_BASE_URL="$base"
 }
 
+validate_camera_service_base() {
+    load_env_file_if_present ".env.local"
+    load_env_file_if_present ".env.production"
+
+    local base="${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL:-${CAMERA_SERVICE_BASE_URL:-}}"
+
+    if [ -z "$base" ]; then
+        echo -e "${RED}NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL is required for APK builds.${NC}"
+        echo -e "${YELLOW}Expected value example: http://camera.ldkgroup.co.uk${NC}"
+        exit 1
+    fi
+
+    if [[ ! "$base" =~ ^https?:// ]]; then
+        echo -e "${RED}NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL must include http:// or https:// (got: $base)${NC}"
+        exit 1
+    fi
+
+    base="${base%/}"
+
+    if [[ ! "$base" =~ ^https?://([a-zA-Z0-9-]+\.)*ldkgroup\.co\.uk$ ]]; then
+        echo -e "${RED}NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL must point to *.ldkgroup.co.uk (got: $base)${NC}"
+        exit 1
+    fi
+
+    export NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL="$base"
+}
+
 require_env() {
     local name="$1"
     local value="${!name:-}"
@@ -130,6 +157,10 @@ cd - >/dev/null 2>&1 || true
 print_step "Validating mobile API base URL..."
 validate_public_api_base
 echo -e "${GREEN}Using NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}${NC}"
+
+print_step "Validating camera service API base URL..."
+validate_camera_service_base
+echo -e "${GREEN}Using NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL=${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL}${NC}"
 
 print_step "Ensuring public Firebase client config..."
 ensure_public_firebase_config

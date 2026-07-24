@@ -33,8 +33,9 @@ Because APK uses static export (`next export`), local Next.js API routes are not
 
 Set backend URL for the mobile app environment:
 - `NEXT_PUBLIC_API_BASE_URL=https://<your-backend-host>`
+- `NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL=http://camera.ldkgroup.co.uk` (or HTTPS if available)
 
-Without this, API calls such as role lookup, site loading, upload, and capture will fail in APK runtime.
+Without this, API calls such as role lookup, site loading, upload, capture, and mobile camera management (list/assign/edit) can fail in APK runtime.
 
 ## Signed APK Runbook
 
