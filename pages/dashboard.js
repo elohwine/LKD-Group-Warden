@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/router';
-import { fetchJson } from '../lib/api';
+import { fetchCameraServiceJson, fetchJson } from '../lib/api';
 import {
   clearSession,
   getStoredMobileCameraId,
@@ -889,6 +889,9 @@ export default function DashboardPage() {
   const [online, setOnline] = useState(true);
   const [busy, setBusy] = useState(false);
   const [mobileCameraAssigning, setMobileCameraAssigning] = useState(false);
+  const [mobileCameraSavingId, setMobileCameraSavingId] = useState('');
+  const [mobileCameraDrafts, setMobileCameraDrafts] = useState({});
+  const [mobileCameraAssignmentSites, setMobileCameraAssignmentSites] = useState({});
   const [message, setMessage] = useState('');
   const [detailMessage, setDetailMessage] = useState('');
   const [ticks, setTicks] = useState(0);
@@ -966,6 +969,23 @@ export default function DashboardPage() {
     () => sites.find((site) => String(site.id) === String(selectedMobileCamera?.siteId || '')) || null,
     [sites, selectedMobileCamera]
   );
+  const mobileCamerasByAvailability = useMemo(() => {
+    const nowMs = Date.now();
+    const fifteenMinutesMs = 15 * 60 * 1000;
+
+    const withFlags = mobileCameras.map((camera) => {
+      const lastSeenMs = new Date(camera?.lastSeen || '').getTime();
+      const recentlySeen = Number.isFinite(lastSeenMs) && (nowMs - lastSeenMs) <= fifteenMinutesMs;
+      const status = String(camera?.status || '').toLowerCase();
+      const available = status === 'active' || recentlySeen;
+      return { ...camera, available };
+    });
+
+    return withFlags.sort((left, right) => {
+      if (left.available !== right.available) return left.available ? -1 : 1;
+      return String(left.name || '').localeCompare(String(right.name || ''));
+    });
+  }, [mobileCameras]);
   const contraventions = useMemo(() => getContraventionOptions(selectedSite), [selectedSite]);
   const activeTimers = useMemo(() => {
     return queueItems
@@ -1386,7 +1406,19 @@ export default function DashboardPage() {
         setAuthToken(token);
         setProfile(session);
         setOnline(navigator.onLine);
-        await Promise.all([loadSites(token), loadMobileCameras(token), refreshQueue()]);
+        const bootstrapResults = await Promise.allSettled([
+          loadSites(token),
+          loadMobileCameras(token),
+          refreshQueue(),
+        ]);
+
+        const hardFailure = bootstrapResults.find((result, index) => (
+          result.status === 'rejected' && (index === 0 || index === 2)
+        ));
+
+        if (hardFailure) {
+          throw hardFailure.reason;
+        }
         authReadyRef.current = true;
       } catch (error) {
         console.error('[warden] profile bootstrap failed', error);
@@ -1468,6 +1500,53 @@ export default function DashboardPage() {
   }, [selectedMobileCameraId]);
 
   useEffect(() => {
+    if (!Array.isArray(mobileCameras) || mobileCameras.length === 0) {
+      setMobileCameraDrafts({});
+      setMobileCameraAssignmentSites({});
+      return;
+    }
+
+    setMobileCameraDrafts((current) => {
+      const next = {};
+      for (const camera of mobileCameras) {
+        next[camera.id] = {
+          name: current?.[camera.id]?.name ?? (camera?.name || ''),
+          ipAddress: current?.[camera.id]?.ipAddress ?? (camera?.ipAddress || ''),
+          macAddress: current?.[camera.id]?.macAddress ?? (camera?.macAddress || '')
+        };
+      }
+      return next;
+    });
+
+    setMobileCameraAssignmentSites((current) => {
+      const next = {};
+      for (const camera of mobileCameras) {
+        next[camera.id] = current?.[camera.id] || camera?.siteId || selectedSiteId || '';
+      }
+      return next;
+    });
+  }, [mobileCameras, selectedSiteId]);
+
+  useEffect(() => {
+    if (activeTab !== 'mobile') return;
+
+    let canceled = false;
+    (async () => {
+      try {
+        const token = await resolveAuthToken();
+        if (canceled) return;
+        await loadMobileCameras(token);
+      } catch (error) {
+        console.error('[warden] failed to refresh mobile cameras tab', error);
+      }
+    })();
+
+    return () => {
+      canceled = true;
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
     setCarcheckDialogOpen(false);
     setCarcheckSaveLoading(false);
     setCarcheckSaveNotice('');
@@ -1525,7 +1604,7 @@ export default function DashboardPage() {
   }, [selectedVrm, vehicleLookupByVrm]);
 
   async function loadSites(token) {
-    const data = await fetchJson('/api/sites?forceAdmin=true', { token });
+    const data = await fetchCameraServiceJson('/api/sites?forceAdmin=true', { token });
     const nextSites = Array.isArray(data?.sites) ? data.sites : [];
     const activeSites = nextSites.filter((site) => site.active !== false && site.isActive !== false);
     setSites(activeSites);
@@ -1536,25 +1615,51 @@ export default function DashboardPage() {
   }
 
   async function loadMobileCameras(token) {
-    const data = await fetchJson('/api/cameras', { token });
-    const allCameras = Array.isArray(data?.cameras) ? data.cameras : [];
-    const nextMobileCameras = allCameras.filter((camera) => (
-      camera?.isMobile === true || camera?.lastSiteAssignmentReason === 'mobile_camera_daily_assignment'
-    ));
+    try {
+      const data = await fetchCameraServiceJson('/api/cameras', { token });
+      const allCameras = Array.isArray(data?.cameras) ? data.cameras : [];
+      const nextMobileCameras = allCameras.filter((camera) => (
+        camera?.isMobile === true || camera?.lastSiteAssignmentReason === 'mobile_camera_daily_assignment'
+      ));
 
-    setMobileCameras(nextMobileCameras);
+      setMobileCameras(nextMobileCameras);
 
-    const storedMobileCameraId = getStoredMobileCameraId();
-    const hasStoredSelection = nextMobileCameras.some((camera) => String(camera.id) === String(storedMobileCameraId || ''));
-    if (hasStoredSelection) {
-      setSelectedMobileCameraId(storedMobileCameraId);
-      return;
+      const storedMobileCameraId = getStoredMobileCameraId();
+      const hasStoredSelection = nextMobileCameras.some((camera) => String(camera.id) === String(storedMobileCameraId || ''));
+      if (hasStoredSelection) {
+        setSelectedMobileCameraId(storedMobileCameraId);
+        return nextMobileCameras;
+      }
+
+      if (!selectedMobileCameraId && nextMobileCameras.length === 1) {
+        setSelectedMobileCameraId(nextMobileCameras[0].id);
+        saveStoredMobileCameraId(nextMobileCameras[0].id);
+      }
+
+      return nextMobileCameras;
+    } catch (error) {
+      // Mobile camera management is optional; do not fail dashboard bootstrap.
+      console.warn('[warden] mobile camera list unavailable', error?.message || error);
+      setMobileCameras([]);
+      return [];
     }
+  }
 
-    if (!selectedMobileCameraId && nextMobileCameras.length === 1) {
-      setSelectedMobileCameraId(nextMobileCameras[0].id);
-      saveStoredMobileCameraId(nextMobileCameras[0].id);
-    }
+  function updateMobileCameraDraft(cameraId, field, value) {
+    setMobileCameraDrafts((current) => ({
+      ...current,
+      [cameraId]: {
+        ...(current[cameraId] || {}),
+        [field]: value
+      }
+    }));
+  }
+
+  function updateMobileCameraAssignmentSite(cameraId, siteId) {
+    setMobileCameraAssignmentSites((current) => ({
+      ...current,
+      [cameraId]: siteId
+    }));
   }
 
   async function assignMobileCameraToSite(cameraId, siteId) {
@@ -1574,7 +1679,7 @@ export default function DashboardPage() {
     setMobileCameraAssigning(true);
     try {
       const token = await resolveAuthToken();
-      await fetchJson(`/api/cameras/${encodeURIComponent(nextCameraId)}/site-assignment`, {
+      await fetchCameraServiceJson(`/api/cameras/${encodeURIComponent(nextCameraId)}/site-assignment`, {
         method: 'POST',
         token,
         body: {
@@ -1594,6 +1699,53 @@ export default function DashboardPage() {
     } finally {
       setMobileCameraAssigning(false);
     }
+  }
+
+  async function saveMobileCameraDetails(cameraId) {
+    const id = String(cameraId || '').trim();
+    if (!id) return;
+
+    const draft = mobileCameraDrafts[id] || {};
+    const payload = {
+      isMobile: true,
+      name: String(draft.name || '').trim(),
+      ipAddress: String(draft.ipAddress || '').trim() || null,
+      macAddress: String(draft.macAddress || '').trim() || null
+    };
+
+    if (!payload.name) {
+      setDetailMessage('Camera name cannot be empty.');
+      return;
+    }
+
+    setMobileCameraSavingId(id);
+    try {
+      const token = await resolveAuthToken();
+      await fetchCameraServiceJson(`/api/cameras/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        token,
+        body: payload
+      });
+      await loadMobileCameras(token);
+      setDetailMessage(`${payload.name} details updated.`);
+    } catch (error) {
+      console.error('[warden] failed to save mobile camera details', error);
+      setDetailMessage(error?.message || 'Failed to save mobile camera details.');
+    } finally {
+      setMobileCameraSavingId('');
+    }
+  }
+
+  async function handleLinkSelectedMobileCamera(nextCameraId) {
+    setSelectedMobileCameraId(nextCameraId);
+    saveStoredMobileCameraId(nextCameraId);
+
+    if (!nextCameraId) {
+      setDetailMessage('Warden-only mode active. No vehicle camera linked for this patrol.');
+      return;
+    }
+
+    await assignMobileCameraToSite(nextCameraId, selectedSiteId);
   }
 
   async function refreshQueue() {
@@ -3486,6 +3638,8 @@ export default function DashboardPage() {
             <span className="app-header-vrm">{selectedTracked.vrm}</span>
           ) : currentScreen === 'queue' ? (
             <span>Sync Queue</span>
+          ) : currentScreen === 'mobile' ? (
+            <span>Mobile Cameras</span>
           ) : currentScreen === 'camera' ? (
             <span>Camera Raw Data</span>
           ) : (
@@ -3568,6 +3722,24 @@ export default function DashboardPage() {
               {sites.map(site => (
                 <option key={site.id} value={site.id}>
                   {site.displayName || site.name || site.id}
+                </option>
+              ))}
+            </select>
+          ) : null}
+
+          {mobileCameras.length > 0 ? (
+            <select
+              className="site-filter-select site-filter-select--home"
+              value={selectedMobileCameraId}
+              onChange={async (event) => {
+                await handleLinkSelectedMobileCamera(event.target.value);
+              }}
+              style={{ marginTop: 8 }}
+            >
+              <option value="">No vehicle camera linked (warden-only)</option>
+              {mobileCamerasByAvailability.map((camera) => (
+                <option key={camera.id} value={camera.id}>
+                  {(camera.available ? 'Available' : 'Offline')} - {camera.name || camera.id}
                 </option>
               ))}
             </select>
@@ -4055,6 +4227,148 @@ export default function DashboardPage() {
         </main>
       ) : null}
 
+      {/* ─── MOBILE CAMERAS SCREEN ─────────────────────────────────── */}
+      {currentScreen === 'mobile' ? (
+        <main className="screen-body">
+          <div className="detail-section">
+            <div className="detail-section-label">Mobile cameras</div>
+
+            <div className="settings-row settings-row--stacked" style={{ marginBottom: 10 }}>
+              <span className="settings-row-label">Active patrol site</span>
+              <select
+                className="site-filter-select"
+                value={selectedSiteId}
+                onChange={(event) => {
+                  setSelectedSiteId(event.target.value);
+                  saveStoredSiteId(event.target.value);
+                }}
+              >
+                <option value="">Select site</option>
+                {sites.map((site) => (
+                  <option key={site.id} value={site.id}>
+                    {site.displayName || site.name || site.id}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="settings-row settings-row--stacked" style={{ marginBottom: 14 }}>
+              <span className="settings-row-label">Linked vehicle camera for this shift</span>
+              <select
+                className="site-filter-select"
+                value={selectedMobileCameraId}
+                onChange={async (event) => {
+                  await handleLinkSelectedMobileCamera(event.target.value);
+                }}
+              >
+                <option value="">No vehicle camera linked</option>
+                {mobileCamerasByAvailability.map((camera) => (
+                  <option key={camera.id} value={camera.id}>
+                    {(camera.available ? 'Available' : 'Offline')} - {camera.name || camera.id}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {mobileCamerasByAvailability.length === 0 ? (
+              <div className="empty-state" style={{ padding: '20px 12px' }}>
+                <div className="empty-icon">🚐</div>
+                <p className="empty-title">No mobile cameras found</p>
+                <p className="empty-hint">Flag a camera as mobile in camera management first.</p>
+              </div>
+            ) : (
+              <div className="sessions-list">
+                {mobileCamerasByAvailability.map((camera) => {
+                  const draft = mobileCameraDrafts[camera.id] || {
+                    name: camera?.name || '',
+                    ipAddress: camera?.ipAddress || '',
+                    macAddress: camera?.macAddress || ''
+                  };
+                  const assignmentSiteId = mobileCameraAssignmentSites[camera.id] || camera?.siteId || selectedSiteId || '';
+                  const assignmentSite = sites.find((site) => String(site.id) === String(assignmentSiteId || '')) || null;
+
+                  return (
+                    <article key={camera.id} className="session-card">
+                      <div style={{ width: '100%' }}>
+                        <div className="sc-left" style={{ display: 'block' }}>
+                          <div className="sc-plate">{camera.name || camera.id}</div>
+                          <div className="sc-site">
+                            {camera.available ? 'Available now' : 'Not recently active'}
+                            {camera.lastSeen ? ` • Last seen ${new Date(camera.lastSeen).toLocaleString()}` : ''}
+                          </div>
+                          <div className="sc-reason">Assigned site: {sites.find((site) => String(site.id) === String(camera.siteId || ''))?.name || 'Unassigned'}</div>
+                        </div>
+
+                        <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+                          <input
+                            type="text"
+                            value={draft.name}
+                            onChange={(event) => updateMobileCameraDraft(camera.id, 'name', event.target.value)}
+                            placeholder="Camera name"
+                          />
+                          <input
+                            type="text"
+                            value={draft.ipAddress}
+                            onChange={(event) => updateMobileCameraDraft(camera.id, 'ipAddress', event.target.value)}
+                            placeholder="Camera IP"
+                          />
+                          <input
+                            type="text"
+                            value={draft.macAddress}
+                            onChange={(event) => updateMobileCameraDraft(camera.id, 'macAddress', event.target.value)}
+                            placeholder="Camera MAC"
+                          />
+                          <select
+                            value={assignmentSiteId}
+                            onChange={(event) => updateMobileCameraAssignmentSite(camera.id, event.target.value)}
+                          >
+                            <option value="">Select site for activation</option>
+                            {sites.map((site) => (
+                              <option key={site.id} value={site.id}>
+                                {site.displayName || site.name || site.id}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                          <button
+                            type="button"
+                            className="action-btn action-btn--secondary"
+                            onClick={() => saveMobileCameraDetails(camera.id)}
+                            disabled={mobileCameraSavingId === camera.id}
+                            style={{ fontSize: 12, padding: '6px 10px' }}
+                          >
+                            {mobileCameraSavingId === camera.id ? 'Saving details...' : 'Save name/IP/MAC'}
+                          </button>
+                          <button
+                            type="button"
+                            className="action-btn action-btn--secondary"
+                            onClick={async () => {
+                              await assignMobileCameraToSite(camera.id, assignmentSiteId || selectedSiteId);
+                            }}
+                            disabled={mobileCameraAssigning || !(assignmentSiteId || selectedSiteId)}
+                            style={{ fontSize: 12, padding: '6px 10px' }}
+                          >
+                            {mobileCameraAssigning && selectedMobileCameraId === camera.id
+                              ? 'Assigning...'
+                              : `Activate at ${assignmentSite?.name || 'selected site'}`}
+                          </button>
+                        </div>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+
+            {detailMessage ? (
+              <div className="notice notice-info" style={{ marginTop: 12 }}>{detailMessage}</div>
+            ) : null}
+          </div>
+        </main>
+      ) : null}
+
       {/* ─── CAMERA RAW SCREEN ─────────────────────────────────────── */}
       {currentScreen === 'camera' ? (
         <main className="screen-body">
@@ -4251,6 +4565,14 @@ export default function DashboardPage() {
           <span className="bottom-nav-icon" aria-hidden="true">📷</span>
           <span className="bottom-nav-label">Camera</span>
         </button>
+        <button
+          type="button"
+          className={`bottom-nav-btn ${activeTab === 'mobile' ? 'bottom-nav-btn--active' : ''}`}
+          onClick={() => setActiveTab('mobile')}
+        >
+          <span className="bottom-nav-icon" aria-hidden="true">🚐</span>
+          <span className="bottom-nav-label">Mobile</span>
+        </button>
       </nav>
 
       {imageDetailDialog.open ? (
@@ -4394,22 +4716,13 @@ export default function DashboardPage() {
                   className="site-filter-select"
                   value={selectedMobileCameraId}
                   onChange={async (event) => {
-                    const nextCameraId = event.target.value;
-                    setSelectedMobileCameraId(nextCameraId);
-                    saveStoredMobileCameraId(nextCameraId);
-
-                    if (!nextCameraId) {
-                      setDetailMessage('Warden-only mode active. No vehicle camera linked for this patrol.');
-                      return;
-                    }
-
-                    await assignMobileCameraToSite(nextCameraId, selectedSiteId);
+                    await handleLinkSelectedMobileCamera(event.target.value);
                   }}
                 >
                   <option value="">No vehicle camera linked</option>
-                  {mobileCameras.map((camera) => (
+                  {mobileCamerasByAvailability.map((camera) => (
                     <option key={camera.id} value={camera.id}>
-                      {camera.name || camera.id}
+                      {(camera.available ? 'Available' : 'Offline')} - {camera.name || camera.id}
                     </option>
                   ))}
                 </select>
@@ -4471,7 +4784,7 @@ export default function DashboardPage() {
       ) : null}
 
       {/* ─── FAB ────────────────────────────────────────────────────── */}
-      {currentScreen !== 'detail' ? (
+      {currentScreen !== 'detail' && currentScreen !== 'mobile' ? (
         <button
           type="button"
           className="fab-new-breach"
