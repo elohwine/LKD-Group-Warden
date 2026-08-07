@@ -19,6 +19,8 @@ import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { getServerTimestamp, syncWithServerTime } from '../lib/timeSync';
 import { getBillableMinutes } from '../lib/duration';
 import { buildVehicleDetailsRecord } from '../lib/vehicleDetails';
+import { isVehicleCameraCandidate } from '../lib/vehicleCameras';
+import { buildMobileCameraAssignmentPayload } from '../lib/mobileCameraAssignment';
 import AppShell from '../components/AppShell';
 import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
@@ -106,28 +108,45 @@ async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
 
     ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
 
-    const label = phase === 'closing' ? 'CLOSING' : 'ENTRY';
+    const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
+    const label = phase === 'closing' ? 'CLOSING' : (isPlateCutout ? 'PLATE' : 'ENTRY');
     const stampText = `${label} ${formatCaptureTimestamp(capturedAt)}`;
-    const baseFont = Math.max(50, Math.floor((canvas.width / 30) * 1.4));
+    const baseFont = isPlateCutout
+      ? Math.max(12, Math.floor(canvas.width / 44))
+      : Math.max(50, Math.floor((canvas.width / 30) * 1.4));
     ctx.font = `700 ${baseFont}px Arial, sans-serif`;
-    const paddingX = Math.max(32, Math.floor(baseFont * 1.08));
-    const paddingY = Math.max(16, Math.floor(baseFont * 0.58));
+    const paddingX = isPlateCutout
+      ? Math.max(6, Math.floor(baseFont * 0.52))
+      : Math.max(32, Math.floor(baseFont * 1.08));
+    const paddingY = isPlateCutout
+      ? Math.max(4, Math.floor(baseFont * 0.38))
+      : Math.max(16, Math.floor(baseFont * 0.58));
     const textMetrics = ctx.measureText(stampText);
-    const boxWidth = Math.ceil(Math.max(textMetrics.width + paddingX * 2, canvas.width * 0.62));
+    const boxWidth = Math.ceil(isPlateCutout
+      ? (textMetrics.width + paddingX * 2)
+      : Math.max(textMetrics.width + paddingX * 2, canvas.width * 0.62));
     const boxHeight = Math.ceil(baseFont + paddingY * 2);
-    const boxX = Math.max(14, Math.floor(canvas.width * 0.03));
-    const boxY = Math.max(18, Math.floor(canvas.height * 0.035));
+    const marginX = isPlateCutout ? Math.max(4, Math.floor(canvas.width * 0.015)) : Math.max(14, Math.floor(canvas.width * 0.03));
+    const marginY = isPlateCutout ? Math.max(4, Math.floor(canvas.height * 0.02)) : Math.max(18, Math.floor(canvas.height * 0.035));
+    const boxX = isPlateCutout
+      ? Math.max(0, canvas.width - boxWidth - marginX)
+      : marginX;
+    const boxY = isPlateCutout
+      ? Math.max(0, canvas.height - boxHeight - marginY)
+      : marginY;
 
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+    ctx.fillStyle = isPlateCutout ? 'rgba(0, 0, 0, 0.56)' : 'rgba(0, 0, 0, 0.8)';
     ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-    ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.08));
-    ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+    if (!isPlateCutout) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+      ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.08));
+      ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+    }
 
     ctx.fillStyle = '#ffffff';
     ctx.textBaseline = 'top';
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.95)';
-    ctx.shadowBlur = Math.max(3, Math.floor(baseFont * 0.1));
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+    ctx.shadowBlur = isPlateCutout ? 1 : Math.max(3, Math.floor(baseFont * 0.1));
     ctx.fillText(stampText, boxX + paddingX, boxY + paddingY);
     ctx.shadowBlur = 0;
 
@@ -245,6 +264,56 @@ function isLikelyUkVrm(value) {
   return /^[A-Z]{2}[0-9]{2}[A-Z]{3}$/.test(value);
 }
 
+function normalizeBboxForImage(rawBbox, imageWidth, imageHeight) {
+  if (!rawBbox || !imageWidth || !imageHeight) return null;
+
+  const x0Candidate = Number(rawBbox?.x0 ?? rawBbox?.left ?? rawBbox?.x ?? NaN);
+  const y0Candidate = Number(rawBbox?.y0 ?? rawBbox?.top ?? rawBbox?.y ?? NaN);
+  const x1FromEdges = Number(rawBbox?.x1 ?? rawBbox?.right ?? NaN);
+  const y1FromEdges = Number(rawBbox?.y1 ?? rawBbox?.bottom ?? NaN);
+  const widthCandidate = Number(rawBbox?.width ?? NaN);
+  const heightCandidate = Number(rawBbox?.height ?? NaN);
+
+  let x0 = x0Candidate;
+  let y0 = y0Candidate;
+  let x1 = Number.isFinite(x1FromEdges)
+    ? x1FromEdges
+    : (Number.isFinite(x0) && Number.isFinite(widthCandidate) ? x0 + widthCandidate : NaN);
+  let y1 = Number.isFinite(y1FromEdges)
+    ? y1FromEdges
+    : (Number.isFinite(y0) && Number.isFinite(heightCandidate) ? y0 + heightCandidate : NaN);
+
+  if (![x0, y0, x1, y1].every(Number.isFinite)) return null;
+
+  // Some engines emit normalized [0..1] coordinates.
+  const looksNormalized = [x0, y0, x1, y1].every((value) => value >= 0 && value <= 1);
+  if (looksNormalized) {
+    x0 *= imageWidth;
+    x1 *= imageWidth;
+    y0 *= imageHeight;
+    y1 *= imageHeight;
+  }
+
+  const left = Math.min(x0, x1);
+  const right = Math.max(x0, x1);
+  const top = Math.min(y0, y1);
+  const bottom = Math.max(y0, y1);
+
+  const safeX0 = Math.max(0, Math.min(imageWidth - 1, left));
+  const safeY0 = Math.max(0, Math.min(imageHeight - 1, top));
+  const safeX1 = Math.max(1, Math.min(imageWidth, right));
+  const safeY1 = Math.max(1, Math.min(imageHeight, bottom));
+
+  if (safeX1 <= safeX0 || safeY1 <= safeY0) return null;
+
+  return {
+    x0: safeX0,
+    y0: safeY0,
+    x1: safeX1,
+    y1: safeY1,
+  };
+}
+
 function buildPlateCandidatesFromWords(words) {
   const safeWords = Array.isArray(words) ? words : [];
   const candidates = [];
@@ -314,15 +383,18 @@ async function createPlateCutoutDataUrl(file, bbox) {
     const imageHeight = image.naturalHeight || image.height;
     if (!imageWidth || !imageHeight) return '';
 
-    const rawWidth = Math.max(1, bbox.x1 - bbox.x0);
-    const rawHeight = Math.max(1, bbox.y1 - bbox.y0);
+    const normalizedBbox = normalizeBboxForImage(bbox, imageWidth, imageHeight);
+    if (!normalizedBbox) return '';
+
+    const rawWidth = Math.max(1, normalizedBbox.x1 - normalizedBbox.x0);
+    const rawHeight = Math.max(1, normalizedBbox.y1 - normalizedBbox.y0);
     const padX = Math.max(4, Math.round(rawWidth * 0.2));
     const padY = Math.max(4, Math.round(rawHeight * 0.35));
 
-    const sx = Math.max(0, Math.floor(bbox.x0 - padX));
-    const sy = Math.max(0, Math.floor(bbox.y0 - padY));
-    const ex = Math.min(imageWidth, Math.ceil(bbox.x1 + padX));
-    const ey = Math.min(imageHeight, Math.ceil(bbox.y1 + padY));
+    const sx = Math.max(0, Math.floor(normalizedBbox.x0 - padX));
+    const sy = Math.max(0, Math.floor(normalizedBbox.y0 - padY));
+    const ex = Math.min(imageWidth, Math.ceil(normalizedBbox.x1 + padX));
+    const ey = Math.min(imageHeight, Math.ceil(normalizedBbox.y1 + padY));
     const sw = Math.max(1, ex - sx);
     const sh = Math.max(1, ey - sy);
 
@@ -371,7 +443,29 @@ async function scanPlateFromImage(file) {
     const best = candidates[0];
     if (!best?.text) return null;
 
-    const cutoffImage = await createPlateCutoutDataUrl(file, best.bbox);
+    let cutoffImage = await createPlateCutoutDataUrl(file, best.bbox);
+    if (!cutoffImage) {
+      const alternateCandidates = candidates
+        .filter((candidate) => candidate?.bbox)
+        .slice(1, 6);
+
+      for (const candidate of alternateCandidates) {
+        cutoffImage = await createPlateCutoutDataUrl(file, candidate.bbox);
+        if (cutoffImage) {
+          break;
+        }
+      }
+    }
+
+    if (cutoffImage) {
+      const cutoffFile = dataUrlToFile(cutoffImage, `plate_cutoff_${Date.now()}.jpg`);
+      if (cutoffFile) {
+        const capturedAt = normalizeCapturedAt(file?.capturedAt) || new Date().toISOString();
+        const stampedCutoff = await stampEvidenceImage(cutoffFile, { capturedAt, phase: 'plate' });
+        const stampedPreview = await fileToDataUrl(stampedCutoff);
+        cutoffImage = stampedPreview || cutoffImage;
+      }
+    }
     return {
       plateText: normalizeVrm(best.text),
       confidence: Number(best.confidence || 0),
@@ -383,17 +477,34 @@ async function scanPlateFromImage(file) {
   }
 }
 
-function buildEvidenceFrame(imageUrl, timestamp) {
+function buildEvidenceFrame(imageUrl, timestamp, plateImageUrl = '') {
   if (!imageUrl) return null;
   const capturedAt = normalizeCapturedAt(timestamp) || null;
   return {
     imageUrl,
     vehicleImage: imageUrl,
-    plateImage: imageUrl,
+    plateImage: plateImageUrl || imageUrl,
     timestamp: capturedAt,
     capturedAt,
     capturedAtUk: capturedAt ? formatCaptureTimestamp(capturedAt) : '',
   };
+}
+
+function isPlateCutoffFileArtifact(fileLike) {
+  const name = String(fileLike?.name || fileLike?.fileName || '').toLowerCase();
+  return name.includes('plate_cutoff_');
+}
+
+function hasCapturePairArtifacts(files) {
+  const safeFiles = Array.isArray(files) ? files : [];
+  if (safeFiles.length === 0) return false;
+
+  const hasVehicleImage = safeFiles.some((file) => !isPlateCutoffFileArtifact(file));
+  const hasPlateCutoff = safeFiles.some((file) => (
+    isPlateCutoffFileArtifact(file) || Boolean(String(file?.detectedPlateCutoffImage || '').trim())
+  ));
+
+  return hasVehicleImage && hasPlateCutoff;
 }
 
 function buildCameraRawRecords(files, previews, { phase, capturedAt, source = 'WARDEN_CAPTURE' } = {}) {
@@ -406,6 +517,7 @@ function buildCameraRawRecords(files, previews, { phase, capturedAt, source = 'W
     return {
       id: `${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`,
       phase: phase === 'closing' ? 'closing' : 'entry',
+      imageRole: isPlateCutoffFileArtifact(file) ? 'plate_cutoff' : 'vehicle_full',
       source,
       capturedAt: normalizedCapturedAt,
       capturedAtUk: formatCaptureTimestamp(normalizedCapturedAt),
@@ -663,6 +775,22 @@ function collectImageUrlsFromValue(root) {
   return found
     .filter((url) => !/\/missing/i.test(url))
     .filter((url, index, all) => all.indexOf(url) === index);
+}
+
+function pickUploadedPlateImageUrl(uploadedUrls, evidenceFiles, fallbackUrl = '') {
+  const safeUrls = Array.isArray(uploadedUrls) ? uploadedUrls : [];
+  const safeFiles = Array.isArray(evidenceFiles) ? evidenceFiles : [];
+
+  for (let i = 0; i < Math.min(safeUrls.length, safeFiles.length); i += 1) {
+    const fileName = String(safeFiles[i]?.name || '').toLowerCase();
+    if (!fileName.includes('plate_cutoff_')) continue;
+
+    const candidate = String(safeUrls[i] || '').trim();
+    if (/^https?:\/\//i.test(candidate)) return candidate;
+  }
+
+  const fallback = String(fallbackUrl || '').trim();
+  return /^https?:\/\//i.test(fallback) ? fallback : '';
 }
 
 function diffMinutes(startIso, endIso) {
@@ -938,6 +1066,7 @@ export default function DashboardPage() {
   const qrFileInputRef = useRef(null);
   const authReadyRef = useRef(false);
   const capturePhaseRef = useRef('entry');
+  const pcnAutoCheckSignatureRef = useRef('');
 
   async function resolveAuthToken({ forceRefresh = false } = {}) {
     const token = await getValidToken({ forceRefresh });
@@ -945,6 +1074,23 @@ export default function DashboardPage() {
     if (!nextToken) throw new Error('auth_missing');
     if (nextToken !== authToken) setAuthToken(nextToken);
     return nextToken;
+  }
+
+  function isAuthBootstrapError(error) {
+    const status = Number(error?.status);
+    if (status === 401 || status === 403) return true;
+
+    const message = String(error?.message || '').toLowerCase();
+    if (!message) return false;
+
+    return (
+      message.includes('auth_missing') ||
+      message.includes('id-token') ||
+      message.includes('not authorized') ||
+      message.includes('unauthorized') ||
+      message.includes('permission denied') ||
+      message.includes('forbidden')
+    );
   }
 
   const selectedSite = useMemo(() => sites.find((site) => String(site.id) === String(selectedSiteId)) || null, [sites, selectedSiteId]);
@@ -1131,6 +1277,38 @@ export default function DashboardPage() {
     const existingFingerprint = buildVehicleLookupFingerprint(selectedTracked.payload.savedVehicleLookup);
     return Boolean(existingFingerprint && incomingFingerprint && incomingFingerprint === existingFingerprint);
   }, [selectedTracked, activeCarcheckLookup]);
+  const pcnSubmissionGate = useMemo(() => {
+    const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm);
+    const siteId = String(selectedTracked?.payload?.siteId || selectedSiteId || '').trim();
+    const carcheckReady = Boolean(
+      trackedVrm && activeCarcheckLookup && normalizeVrm(activeCarcheckLookup?.vrm || '') === trackedVrm
+    );
+    const permitChecked = Boolean(trackedVrm && selectedTrackedAuthorization && typeof selectedTrackedAuthorization === 'object');
+
+    let message = 'Carcheck and ePermit must both be validated before submission.';
+    if (!trackedVrm) {
+      message = 'Recheck the VRM on the image before submitting.';
+    } else if (!siteId) {
+      message = 'Assign a patrol site before submitting.';
+    } else if (!carcheckReady) {
+      message = 'Carcheck returned no result. Cross-check the plate image VRM, edit VRM, then retry checks.';
+    } else if (!permitChecked) {
+      message = 'E-permit check has not been run yet. Run mandatory checks before submission.';
+    } else {
+      message = selectedTrackedAuthorization?.hasAuthorization
+        ? 'Carcheck and ePermit checks completed (authorised vehicle detected).'
+        : 'Carcheck and ePermit checks completed (no active permit/payment found).';
+    }
+
+    return {
+      trackedVrm,
+      siteId,
+      carcheckReady,
+      permitChecked,
+      ready: Boolean(trackedVrm && siteId && carcheckReady && permitChecked),
+      message,
+    };
+  }, [activeCarcheckLookup, selectedSiteId, selectedTracked, selectedTrackedAuthorization, selectedVrm]);
   const pcnPreview = useMemo(() => {
     if (!selectedTracked) {
       return {
@@ -1292,7 +1470,11 @@ export default function DashboardPage() {
   const filteredBreaches = useMemo(() => {
     let list = trackedBreaches;
     if (selectedSiteId) {
-      list = list.filter((item) => String(item?.payload?.siteId) === String(selectedSiteId));
+      list = list.filter((item) => {
+        const itemSiteId = String(item?.payload?.siteId || '').trim();
+        if (!itemSiteId) return true;
+        return itemSiteId === String(selectedSiteId);
+      });
     }
     if (breachStatusFilter === 'all') return list;
     return list.filter((item) => {
@@ -1351,6 +1533,14 @@ export default function DashboardPage() {
     }
 
     await handleReviewTracked(item);
+    const checks = await ensurePcnSubmissionChecks({
+      vrm: item?.payload?.vrm || item?.vrm || selectedVrm,
+      siteId: item?.payload?.siteId || selectedSiteId,
+      forceCarcheck: true,
+      openDialog: false,
+    });
+    if (!checks.ok) return;
+
     setPendingFinalize({
       action: 'convert',
       openPcnDialogAfterSync: false,
@@ -1396,7 +1586,7 @@ export default function DashboardPage() {
     async function bootstrapSession() {
       try {
         const session = loadSession() || await restoreSession();
-        const token = session?.token;
+        let token = session?.token;
 
         if (!token || !session?.role) {
           await router.replace('/login');
@@ -1406,15 +1596,31 @@ export default function DashboardPage() {
         setAuthToken(token);
         setProfile(session);
         setOnline(navigator.onLine);
-        const bootstrapResults = await Promise.allSettled([
+        let bootstrapResults = await Promise.allSettled([
           loadSites(token),
           loadMobileCameras(token),
           refreshQueue(),
         ]);
 
+        const siteFailure = bootstrapResults[0];
+        if (siteFailure?.status === 'rejected' && isAuthBootstrapError(siteFailure.reason)) {
+          token = await resolveAuthToken({ forceRefresh: true });
+          setAuthToken(token);
+          bootstrapResults = await Promise.allSettled([
+            loadSites(token),
+            loadMobileCameras(token),
+            refreshQueue(),
+          ]);
+        }
+
         const hardFailure = bootstrapResults.find((result, index) => (
-          result.status === 'rejected' && (index === 0 || index === 2)
+          result.status === 'rejected' && index === 2
         ));
+
+        const siteLoadFailed = bootstrapResults[0]?.status === 'rejected';
+        if (siteLoadFailed) {
+          setDetailMessage('Patrol sites are still loading. You can capture evidence now and assign site before submission.');
+        }
 
         if (hardFailure) {
           throw hardFailure.reason;
@@ -1422,9 +1628,17 @@ export default function DashboardPage() {
         authReadyRef.current = true;
       } catch (error) {
         console.error('[warden] profile bootstrap failed', error);
-        clearSession();
-        await signOutFromWardenApp();
-        await router.replace('/login');
+
+        if (isAuthBootstrapError(error)) {
+          clearSession();
+          await signOutFromWardenApp();
+          await router.replace('/login');
+          return;
+        }
+
+        setMessage('Unable to load patrol sites right now. Check network/API and retry.');
+        setOnline(navigator.onLine);
+        authReadyRef.current = true;
       }
     }
 
@@ -1604,23 +1818,17 @@ export default function DashboardPage() {
   }, [selectedVrm, vehicleLookupByVrm]);
 
   async function loadSites(token) {
-    const data = await fetchCameraServiceJson('/api/sites?forceAdmin=true', { token });
+    const data = await fetchJson('/api/sites?forceAdmin=true', { token });
     const nextSites = Array.isArray(data?.sites) ? data.sites : [];
     const activeSites = nextSites.filter((site) => site.active !== false && site.isActive !== false);
     setSites(activeSites);
-    if (!selectedSiteId && activeSites.length > 0) {
-      setSelectedSiteId(activeSites[0].id);
-      saveStoredSiteId(activeSites[0].id);
-    }
   }
 
   async function loadMobileCameras(token) {
     try {
       const data = await fetchCameraServiceJson('/api/cameras', { token });
       const allCameras = Array.isArray(data?.cameras) ? data.cameras : [];
-      const nextMobileCameras = allCameras.filter((camera) => (
-        camera?.isMobile === true || camera?.lastSiteAssignmentReason === 'mobile_camera_daily_assignment'
-      ));
+      const nextMobileCameras = allCameras.filter((camera) => isVehicleCameraCandidate(camera));
 
       setMobileCameras(nextMobileCameras);
 
@@ -1679,20 +1887,23 @@ export default function DashboardPage() {
     setMobileCameraAssigning(true);
     try {
       const token = await resolveAuthToken();
+      const resolvedSite = sites.find((site) => String(site.id) === String(nextSiteId)) || null;
+      const assignmentPayload = buildMobileCameraAssignmentPayload({
+        siteId: nextSiteId,
+        siteName: resolvedSite?.name || resolvedSite?.displayName || '',
+        assignedBy: profile?.email || profile?.uid || 'warden',
+        reason: 'warden_patrol_site_assignment',
+      });
+
       await fetchCameraServiceJson(`/api/cameras/${encodeURIComponent(nextCameraId)}/site-assignment`, {
         method: 'POST',
         token,
-        body: {
-          siteId: nextSiteId,
-          assignedBy: profile?.email || profile?.uid || 'warden',
-          reason: 'warden_patrol_site_assignment'
-        }
+        body: assignmentPayload
       });
 
       await loadMobileCameras(token);
-      const resolvedSite = sites.find((site) => String(site.id) === String(nextSiteId)) || null;
-      const resolvedCamera = mobileCameras.find((camera) => String(camera.id) === String(nextCameraId)) || selectedMobileCamera;
-      setDetailMessage(`${resolvedCamera?.name || 'Vehicle camera'} assigned to ${resolvedSite?.name || resolvedSite?.displayName || nextSiteId}.`);
+      const refreshedCamera = mobileCameras.find((camera) => String(camera.id) === String(nextCameraId)) || selectedMobileCamera;
+      setDetailMessage(`${refreshedCamera?.name || 'Vehicle camera'} linked to ${resolvedSite?.name || resolvedSite?.displayName || nextSiteId}. The backend assignment and alarm metadata will now use this site.`);
     } catch (error) {
       console.error('[warden] mobile camera assignment failed', error);
       setDetailMessage(error?.message || 'Vehicle camera assignment failed.');
@@ -1708,6 +1919,8 @@ export default function DashboardPage() {
     const draft = mobileCameraDrafts[id] || {};
     const payload = {
       isMobile: true,
+      cameraType: 'Vehicle Camera',
+      manufacturer: 'Vehicle Camera',
       name: String(draft.name || '').trim(),
       ipAddress: String(draft.ipAddress || '').trim() || null,
       macAddress: String(draft.macAddress || '').trim() || null
@@ -1879,6 +2092,27 @@ export default function DashboardPage() {
 
     if (nextFiles.length > 0) {
       plateScanResult = await scanPlateFromImage(nextFiles[0]);
+      if (plateScanResult?.plateText && !plateScanResult?.cutoffImage) {
+        try {
+          const fallbackScan = await scanPlateFromImage(nextFiles[0]);
+          if (fallbackScan?.cutoffImage) {
+            plateScanResult = {
+              ...plateScanResult,
+              cutoffImage: fallbackScan.cutoffImage,
+              bbox: plateScanResult?.bbox || fallbackScan?.bbox || null,
+            };
+          }
+        } catch (_) {
+          // Validation below determines whether capture can be committed.
+        }
+      }
+
+      if (plateScanResult?.plateText && !plateScanResult?.cutoffImage) {
+        setMessage('Plate text detected but plate image could not be extracted. Reframe plate and capture again.');
+        event.target.value = '';
+        return;
+      }
+
       if (plateScanResult?.cutoffImage) {
         const cutoffFile = dataUrlToFile(
           plateScanResult.cutoffImage,
@@ -1888,6 +2122,12 @@ export default function DashboardPage() {
           cutoffFile.capturedAt = capturedAt;
           nextFiles.push(cutoffFile);
         }
+      }
+
+      if (!hasCapturePairArtifacts(nextFiles)) {
+        setMessage('Capture requires 2 images: full vehicle and plate cutout. Reframe plate and capture again.');
+        event.target.value = '';
+        return;
       }
 
       const refreshedPreviews = await toPreviewSrcList(nextFiles);
@@ -1921,11 +2161,15 @@ export default function DashboardPage() {
       const mergedEntryPreviews = [...entryPreviews, ...nextPreviews];
       setEntryFiles(mergedEntryFiles);
       setEntryPreviews(mergedEntryPreviews);
-      setMainEntryImageIndex((current) => (
-        mergedEntryFiles.length > 0
-          ? Math.min(current, mergedEntryFiles.length - 1)
-          : 0
-      ));
+      if (entryFiles.length === 0) {
+        setMainEntryImageIndex(0);
+      } else {
+        setMainEntryImageIndex((current) => (
+          mergedEntryFiles.length > 0
+            ? Math.min(current, mergedEntryFiles.length - 1)
+            : 0
+        ));
+      }
       setEntryCapturedAt((current) => current || capturedAt);
       setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'entry'));
       if (plateScanResult?.plateText) {
@@ -1994,11 +2238,15 @@ export default function DashboardPage() {
       const closingTime = capturedAt;
       setClosingFiles(mergedClosingFiles);
       setClosingPreviews(mergedClosingPreviews);
-      setMainClosingImageIndex((current) => (
-        mergedClosingFiles.length > 0
-          ? Math.min(current, mergedClosingFiles.length - 1)
-          : 0
-      ));
+      if (closingFiles.length === 0) {
+        setMainClosingImageIndex(0);
+      } else {
+        setMainClosingImageIndex((current) => (
+          mergedClosingFiles.length > 0
+            ? Math.min(current, mergedClosingFiles.length - 1)
+            : 0
+        ));
+      }
       setClosingCapturedAt(capturedAt);
       setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'closing'));
       setMonitoringSessionActive(false);
@@ -2112,7 +2360,8 @@ export default function DashboardPage() {
       plateScanResult = {
         plateText: scanPlateText,
         confidence: Number(scan?.confidence || 0),
-        cutoffImage: '',
+        cutoffImage: String(scan?.cutoffImage || ''),
+        bbox: scan?.bbox || null,
       };
     }
     if (!plateScanResult && (nextFiles[0]?.detectedPlateText || nextFiles[0]?.detectedPlateCutoffImage)) {
@@ -2123,6 +2372,38 @@ export default function DashboardPage() {
       };
     } else if (!plateScanResult && nextFiles.length > 0) {
       plateScanResult = await scanPlateFromImage(nextFiles[0]);
+    }
+
+    if (plateScanResult?.plateText && plateScanResult?.bbox && !plateScanResult?.cutoffImage && nextFiles.length > 0) {
+      const bboxCutoff = await createPlateCutoutDataUrl(nextFiles[0], plateScanResult.bbox);
+      if (bboxCutoff) {
+        plateScanResult = {
+          ...plateScanResult,
+          cutoffImage: bboxCutoff,
+        };
+      }
+    }
+
+    // Regression guard: some native scan paths return plate text without a
+    // cutoff image. Force a secondary OCR crop pass before finalizing files.
+    if (plateScanResult?.plateText && !plateScanResult?.cutoffImage && nextFiles.length > 0) {
+      try {
+        const fallbackScan = await scanPlateFromImage(nextFiles[0]);
+        if (fallbackScan?.cutoffImage) {
+          plateScanResult = {
+            ...plateScanResult,
+            cutoffImage: fallbackScan.cutoffImage,
+            bbox: plateScanResult?.bbox || fallbackScan?.bbox || null,
+          };
+        }
+      } catch (_) {
+        // Keep capture flow running even if fallback crop extraction fails.
+      }
+    }
+
+    if (plateScanResult?.plateText && !plateScanResult?.cutoffImage) {
+      setMessage('Plate text detected but plate image could not be extracted. Reframe plate and capture again.');
+      return;
     }
 
     const hasCutoffFile = nextFiles.some((file) => String(file?.name || '').toLowerCase().includes('plate_cutoff_'));
@@ -2136,6 +2417,11 @@ export default function DashboardPage() {
         nextFiles.push(cutoffFile);
         nextPreviews.push(plateScanResult.cutoffImage);
       }
+    }
+
+    if (!hasCapturePairArtifacts(nextFiles)) {
+      setMessage('Capture requires 2 images: full vehicle and plate cutout. Reframe plate and capture again.');
+      return;
     }
 
     if (nextFiles[0]) {
@@ -2167,11 +2453,15 @@ export default function DashboardPage() {
       const mergedEntryPreviews = [...entryPreviews, ...nextPreviews];
       setEntryFiles(mergedEntryFiles);
       setEntryPreviews(mergedEntryPreviews);
-      setMainEntryImageIndex((current) => (
-        mergedEntryFiles.length > 0
-          ? Math.min(current, mergedEntryFiles.length - 1)
-          : 0
-      ));
+      if (entryFiles.length === 0) {
+        setMainEntryImageIndex(0);
+      } else {
+        setMainEntryImageIndex((current) => (
+          mergedEntryFiles.length > 0
+            ? Math.min(current, mergedEntryFiles.length - 1)
+            : 0
+        ));
+      }
       setEntryCapturedAt((current) => current || capturedAt);
       setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'entry'));
       if (plateScanResult?.plateText || nextFiles[0]?.detectedPlateText) {
@@ -2233,11 +2523,15 @@ export default function DashboardPage() {
       const closingTime = capturedAt;
       setClosingFiles(mergedClosingFiles);
       setClosingPreviews(mergedClosingPreviews);
-      setMainClosingImageIndex((current) => (
-        mergedClosingFiles.length > 0
-          ? Math.min(current, mergedClosingFiles.length - 1)
-          : 0
-      ));
+      if (closingFiles.length === 0) {
+        setMainClosingImageIndex(0);
+      } else {
+        setMainClosingImageIndex((current) => (
+          mergedClosingFiles.length > 0
+            ? Math.min(current, mergedClosingFiles.length - 1)
+            : 0
+        ));
+      }
       setClosingCapturedAt(capturedAt);
       setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'closing'));
       setMonitoringSessionActive(false);
@@ -2322,10 +2616,10 @@ export default function DashboardPage() {
     setCaptureStepperOpen(false);
   }
 
-  async function uploadEvidenceFiles(evidenceFiles, manualVrm) {
+  async function uploadEvidenceFiles(evidenceFiles, manualVrm, siteIdOverride = '') {
     const formData = new FormData();
     evidenceFiles.forEach((file) => formData.append('file', file.blob || file, file.name));
-    formData.append('siteId', selectedSiteId);
+    formData.append('siteId', String(siteIdOverride || selectedSiteId || '').trim());
     formData.append('manualVrm', manualVrm || selectedVrm);
 
     let token = await resolveAuthToken();
@@ -2375,11 +2669,12 @@ export default function DashboardPage() {
     }
   }
 
-  async function checkAuthorization(nextVrm) {
+  async function checkAuthorization(nextVrm, siteIdOverride = '') {
     const vrm = normalizeVrm(nextVrm || selectedVrm);
-    if (!vrm || !selectedSiteId) return null;
+    const effectiveSiteId = String(siteIdOverride || selectedSiteId || '').trim();
+    if (!vrm || !effectiveSiteId) return null;
     const token = await resolveAuthToken();
-    const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, {
+    const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(effectiveSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, {
       token
     });
     setAuthorization(result);
@@ -2412,6 +2707,49 @@ export default function DashboardPage() {
     setDetailMessage(`VRM updated to ${normalized}.`);
   }
 
+  async function persistTrackedPcnDetails({ silent = false } = {}) {
+    if (!selectedTrackedId) return false;
+
+    const nextSiteId = String(selectedSiteId || selectedTracked?.payload?.siteId || '').trim();
+    if (!nextSiteId) {
+      if (!silent) setDetailMessage('Select a patrol site before saving PCN details.');
+      return false;
+    }
+
+    const nextSite = sites.find((site) => String(site.id) === nextSiteId) || null;
+    const nextSiteName = String(nextSite?.name || nextSite?.displayName || selectedTracked?.payload?.siteName || '').trim() || 'Site not set';
+
+    const nextContravention = contraventions.find((item) => item.code === selectedContraventionCode) || null;
+    const nextContraventionCode = String(selectedContraventionCode || selectedTracked?.payload?.selectedContraventionCode || selectedTracked?.payload?.contraventionCode || '').trim();
+    const nextReason = String(nextContravention?.label || selectedReason || selectedTracked?.payload?.contraventionReason || '').trim();
+
+    if (!nextContraventionCode || !nextReason) {
+      if (!silent) setDetailMessage('Select a contravention before saving PCN details.');
+      return false;
+    }
+
+    await updateQueueItem(selectedTrackedId, {
+      payload: {
+        ...(selectedTracked?.payload || {}),
+        siteId: nextSiteId,
+        siteName: nextSiteName,
+        selectedContraventionCode: nextContraventionCode,
+        contraventionCode: nextContraventionCode,
+        contraventionReason: nextReason,
+        contravention: nextReason,
+        reason: nextReason,
+      },
+      updatedAt: new Date().toISOString(),
+    });
+
+    setSelectedReason(nextReason);
+    await refreshQueue();
+    if (!silent) {
+      setDetailMessage('PCN details saved. Site and contravention updated for this draft.');
+    }
+    return true;
+  }
+
   async function handlePermitLookup() {
     setBusy(true);
     try {
@@ -2431,8 +2769,8 @@ export default function DashboardPage() {
 
   function startMonitoringSession() {
     const startedAt = entryCapturedAt || new Date().toISOString();
-    if (!selectedSiteId || !selectedVrm || !hasEntryEvidence) {
-      setMessage('Capture entry evidence with site and VRM before starting a Draft Parking Charge.');
+    if (!selectedVrm || !hasEntryEvidence) {
+      setMessage('Capture entry evidence and set VRM before starting a Draft Parking Charge.');
       return;
     }
     if (!entryCapturedAt) {
@@ -2494,9 +2832,10 @@ export default function DashboardPage() {
   async function runVehicleLookupForVrm(inputVrm, options = {}) {
     const vrm = normalizeVrm(inputVrm);
     const forceRefresh = Boolean(options.forceRefresh);
+    const openDialog = options.openDialog !== false;
     if (!vrm) {
       setMessage('Enter or read a VRM before running car check.');
-      return;
+      return null;
     }
 
     const cachedLookup = vehicleLookupByVrm[vrm];
@@ -2504,9 +2843,11 @@ export default function DashboardPage() {
       setCarcheckSaveNotice('');
       setCarcheckSaveStatus('idle');
       setVehicleLookup(cachedLookup);
-      setCarcheckDialogMessage(`Loaded from app memory${cachedLookup?.make || cachedLookup?.model ? `: ${[cachedLookup.make, cachedLookup.model].filter(Boolean).join(' ')}` : ''}.`);
-      setCarcheckDialogOpen(true);
-      return;
+      if (openDialog) {
+        setCarcheckDialogMessage(`Loaded from app memory${cachedLookup?.make || cachedLookup?.model ? `: ${[cachedLookup.make, cachedLookup.model].filter(Boolean).join(' ')}` : ''}.`);
+        setCarcheckDialogOpen(true);
+      }
+      return cachedLookup;
     }
 
     setVehicleLookupLoading(true);
@@ -2525,21 +2866,127 @@ export default function DashboardPage() {
       setCarcheckSaveStatus('idle');
       setVehicleLookup(normalized);
       setVehicleLookupByVrm((current) => ({ ...current, [vrm]: normalized }));
-      setCarcheckDialogMessage(`Carcheck complete${normalized?.make || normalized?.model ? `: ${[normalized.make, normalized.model].filter(Boolean).join(' ')}` : ''}.`);
-      setCarcheckDialogOpen(true);
+      if (openDialog) {
+        setCarcheckDialogMessage(`Carcheck complete${normalized?.make || normalized?.model ? `: ${[normalized.make, normalized.model].filter(Boolean).join(' ')}` : ''}.`);
+        setCarcheckDialogOpen(true);
+      }
+      return normalized;
     } catch (error) {
       console.error('[warden] vehicle lookup failed', error);
       setVehicleLookup(null);
-      setCarcheckDialogMessage(error?.message || 'Carcheck unavailable');
-      setCarcheckDialogOpen(true);
+      if (openDialog) {
+        setCarcheckDialogMessage(error?.message || 'Carcheck unavailable');
+        setCarcheckDialogOpen(true);
+      }
+      return null;
     } finally {
       setVehicleLookupLoading(false);
     }
   }
 
+  async function ensurePcnSubmissionChecks({
+    vrm: inputVrm = selectedVrm,
+    siteId: inputSiteId = selectedSiteId,
+    forceCarcheck = false,
+    openDialog = false,
+  } = {}) {
+    const vrm = normalizeVrm(inputVrm);
+    const siteId = String(inputSiteId || '').trim();
+
+    if (!vrm || !siteId) {
+      return {
+        ok: false,
+        error: 'Enter a VRM and assign a patrol site before submitting.',
+      };
+    }
+
+    let vehicleDetails = vehicleLookupByVrm[vrm] || null;
+    if (!vehicleDetails && normalizeVrm(vehicleLookup?.vrm || '') === vrm) {
+      vehicleDetails = vehicleLookup;
+    }
+    if (!vehicleDetails && normalizeVrm(selectedTrackedVehicleDetails?.vrm || '') === vrm) {
+      vehicleDetails = selectedTrackedVehicleDetails;
+    }
+
+    if (!vehicleDetails || forceCarcheck) {
+      vehicleDetails = await runVehicleLookupForVrm(vrm, {
+        forceRefresh: true,
+        openDialog,
+      });
+    }
+
+    if (!vehicleDetails) {
+      const error = 'Carcheck returned no result. Cross-check the plate image VRM, edit VRM, then retry checks.';
+      setMessage(error);
+      setDetailMessage(error);
+      return { ok: false, error };
+    }
+
+    let permitResult = authorizationByVrm[vrm] || null;
+    if (!permitResult && normalizeVrm(selectedTracked?.payload?.vrm || '') === vrm) {
+      permitResult = selectedTrackedAuthorization;
+    }
+
+    if (!permitResult || forceCarcheck) {
+      try {
+        permitResult = await checkAuthorization(vrm, siteId);
+      } catch (error) {
+        const message = error?.message || 'E-permit check failed. Retry after confirming the VRM and site.';
+        setMessage(message);
+        setDetailMessage(message);
+        return { ok: false, error: message };
+      }
+    }
+
+    if (!permitResult) {
+      const error = 'E-permit check returned no result. Retry the lookup before submitting.';
+      setMessage(error);
+      setDetailMessage(error);
+      return { ok: false, error };
+    }
+
+    return {
+      ok: true,
+      vrm,
+      siteId,
+      vehicleDetails,
+      permitResult,
+    };
+  }
+
   async function handleVehicleLookup() {
     await runVehicleLookupForVrm(selectedVrm, { forceRefresh: true });
   }
+
+  useEffect(() => {
+    const vrm = normalizeVrm(selectedVrm);
+    const siteId = String(selectedSiteId || selectedTracked?.payload?.siteId || '').trim();
+    const hasEvidence = entryFiles.length > 0 || closingFiles.length > 0;
+
+    if (!vrm || !siteId || !hasEvidence || vrm.length < 5) return;
+
+    const signature = `${vrm}|${siteId}|${entryFiles.length}|${closingFiles.length}`;
+    if (pcnAutoCheckSignatureRef.current === signature) return;
+
+    let cancelled = false;
+    (async () => {
+      const result = await ensurePcnSubmissionChecks({
+        vrm,
+        siteId,
+        forceCarcheck: true,
+        openDialog: false,
+      });
+
+      if (cancelled) return;
+      if (result.ok) {
+        pcnAutoCheckSignatureRef.current = signature;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedVrm, selectedSiteId, selectedTracked?.payload?.siteId, entryFiles.length, closingFiles.length]);
 
   async function handleSaveCarcheckDetails() {
     const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm);
@@ -2626,8 +3073,14 @@ export default function DashboardPage() {
       }
     }
 
-    if (!selectedSiteId) {
-      setMessage('Choose a patrol site before submitting.');
+    const trackedSiteId = String(selectedTracked?.payload?.siteId || '').trim();
+    const effectiveSiteId = String(selectedSiteId || trackedSiteId || '').trim();
+    const effectiveSite = sites.find((site) => String(site.id) === effectiveSiteId) || null;
+    const effectiveSiteName =
+      String(effectiveSite?.name || effectiveSite?.displayName || selectedTracked?.payload?.siteName || effectiveSiteId || '').trim();
+
+    if (!effectiveSiteId) {
+      setMessage('Assign a patrol site before submitting.');
       return;
     }
     if (!selectedVrm) {
@@ -2639,9 +3092,17 @@ export default function DashboardPage() {
       setMessage('Capture opening evidence before creating a breach.');
       return;
     }
+    if (!hasCapturePairArtifacts(entryFiles)) {
+      setMessage('Opening evidence must include both full vehicle and plate cutout images. Recapture entry evidence.');
+      return;
+    }
 
     if (closingFiles.length === 0) {
       setMessage('Capture closing evidence before creating a breach.');
+      return;
+    }
+    if (!hasCapturePairArtifacts(closingFiles)) {
+      setMessage('Closing evidence must include both full vehicle and plate cutout images. Recapture closing evidence.');
       return;
     }
 
@@ -2668,8 +3129,8 @@ export default function DashboardPage() {
 
     const payload = stripCarcheckFromPayload({
       vrm: normalizedVrm,
-      siteId: selectedSiteId,
-      siteName: selectedSite?.name || selectedSite?.displayName || selectedSiteId,
+      siteId: effectiveSiteId,
+      siteName: effectiveSiteName || 'Site not set',
       source: 'WARDEN',
       wardenId: profile?.uid,
       actorId: profile?.uid,
@@ -2758,16 +3219,16 @@ export default function DashboardPage() {
   }
 
   async function handleSaveDraft() {
-    if (!selectedSiteId) {
-      setMessage('Choose a patrol site before saving a draft.');
-      return;
-    }
     if (!selectedVrm) {
       setMessage('Enter or capture a VRM before saving a draft.');
       return;
     }
     if (entryFiles.length === 0) {
       setMessage('Capture opening evidence before saving a draft.');
+      return;
+    }
+    if (!hasCapturePairArtifacts(entryFiles)) {
+      setMessage('Opening evidence must include both full vehicle and plate cutout images before saving draft.');
       return;
     }
 
@@ -2782,10 +3243,14 @@ export default function DashboardPage() {
     const normalizedVrm = normalizeVrm(selectedVrm);
     const savedVehicleLookup = resolveVehicleDetailsForSubmission(normalizedVrm, selectedTracked?.payload || null);
 
+    const draftSiteId = String(selectedSiteId || selectedTracked?.payload?.siteId || '').trim();
+    const draftSite = sites.find((site) => String(site.id) === draftSiteId) || null;
+    const draftSiteName = String(draftSite?.name || draftSite?.displayName || selectedTracked?.payload?.siteName || '').trim();
+
     const draftPayload = stripCarcheckFromPayload({
       vrm: normalizedVrm,
-      siteId: selectedSiteId,
-      siteName: selectedSite?.name || selectedSite?.displayName || selectedSiteId,
+      siteId: draftSiteId,
+      siteName: draftSiteName || 'Site not set',
       source: 'WARDEN',
       wardenId: profile?.uid,
       actorId: profile?.uid,
@@ -2869,6 +3334,10 @@ export default function DashboardPage() {
   }) {
     try {
       setBusy(true);
+      if (!hasCapturePairArtifacts(files)) {
+        setMessage('Capture requires 2 images: full vehicle and plate cutout. Reframe plate and scan again.');
+        return;
+      }
       setMessage(`Saving Draft Parking Charge for VRM ${vrm}…`);
 
       const entryTime = normalizeCapturedAt(files?.[0]?.capturedAt) || new Date().toISOString();
@@ -2884,6 +3353,9 @@ export default function DashboardPage() {
         vehicleImage: stepperEntryVehicleImage,
       };
 
+      const resolvedSiteId = String(siteId || '').trim();
+      const resolvedSite = sites.find((site) => String(site.id) === resolvedSiteId) || null;
+
       const draftPayload = {
         vrm,
         contraventionCode,
@@ -2894,8 +3366,8 @@ export default function DashboardPage() {
         observationStartTime: entryTime,
         observationEndTime: null,
         expectedObservationMinutes: requiredObservationMinutes,
-        siteId,
-        siteName,
+        siteId: resolvedSiteId,
+        siteName: siteName || resolvedSite?.name || resolvedSite?.displayName || 'Site not set',
         note,
         detectedEntryPlateText: stepperEntryDetection.plateText,
         detectedEntryPlateCutoffImage: stepperEntryDetection.plateCutoffImage,
@@ -2960,6 +3432,14 @@ export default function DashboardPage() {
       await refreshQueue();
 
       const token = await resolveAuthToken();
+      const queuedSiteId = String(queuedItem?.payload?.siteId || selectedSiteId || '').trim();
+      if (!queuedSiteId) {
+        throw new Error('Assign a patrol site before syncing this Parking Charge.');
+      }
+      const queuedSite = sites.find((site) => String(site.id) === queuedSiteId) || null;
+      const queuedSiteName = String(
+        queuedItem?.payload?.siteName || queuedSite?.name || queuedSite?.displayName || queuedSiteId || ''
+      ).trim();
 
       const storedFiles = Array.isArray(queuedItem.files) ? queuedItem.files : [];
       let entryEvidenceFiles = storedFiles.filter((file) => file.phase === 'entry');
@@ -3062,17 +3542,25 @@ export default function DashboardPage() {
       }
 
       const entryEvidence = hasLocalPairedEvidence
-        ? await uploadEvidenceFiles(entryEvidenceFiles, queuedItem.payload.vrm)
+        ? await uploadEvidenceFiles(entryEvidenceFiles, queuedItem.payload.vrm, queuedSiteId)
         : { vrm: queuedItem.payload.vrm, images: [payloadEntryImage] };
       const closingEvidence = hasLocalPairedEvidence
-        ? await uploadEvidenceFiles(closingEvidenceFiles, queuedItem.payload.vrm)
+        ? await uploadEvidenceFiles(closingEvidenceFiles, queuedItem.payload.vrm, queuedSiteId)
         : { vrm: queuedItem.payload.vrm, images: [payloadClosingImage] };
 
       const vrm = normalizeVrm(closingEvidence.vrm || entryEvidence.vrm || queuedItem.payload.vrm);
-      const authData = await checkAuthorization(vrm);
+      const submissionChecks = await ensurePcnSubmissionChecks({
+        vrm,
+        siteId: queuedSiteId,
+        forceCarcheck: true,
+        openDialog: false,
+      });
+      if (!submissionChecks.ok) {
+        throw new Error(submissionChecks.error || 'Carcheck or e-permit validation failed');
+      }
+
+      const authData = submissionChecks.permitResult || await checkAuthorization(vrm, queuedSiteId);
       const { entryTime, closingTime } = resolveObservationWindow(queuedItem.payload || {});
-      const entryFrame = buildEvidenceFrame(entryEvidence.images?.[0], entryTime);
-      const closingFrame = buildEvidenceFrame(closingEvidence.images?.[0], closingTime);
       const allImages = [...(entryEvidence.images || []), ...(closingEvidence.images || [])];
       const cameraRawDataForLos = enrichCameraRawRecordsWithUploadedUrls(
         queuedItem?.payload?.cameraRawData || [],
@@ -3093,8 +3581,21 @@ export default function DashboardPage() {
           resolvedQueuedVehicleDetails,
       });
       const submissionSafePayload = sanitizePayloadForSubmission(safeQueuedPayload);
+      const entryPlateImageUrl = pickUploadedPlateImageUrl(
+        entryEvidence.images || [],
+        entryEvidenceFiles,
+        submissionSafePayload?.detectedEntryPlateCutoffImage || submissionSafePayload?.sessionEvidence?.entry?.plateCutoffImage || ''
+      );
+      const closingPlateImageUrl = pickUploadedPlateImageUrl(
+        closingEvidence.images || [],
+        closingEvidenceFiles,
+        submissionSafePayload?.detectedClosingPlateCutoffImage || submissionSafePayload?.sessionEvidence?.closing?.plateCutoffImage || ''
+      );
+      const entryFrame = buildEvidenceFrame(entryEvidence.images?.[0], entryTime, entryPlateImageUrl);
+      const closingFrame = buildEvidenceFrame(closingEvidence.images?.[0], closingTime, closingPlateImageUrl);
       const vehicleDetails = buildVehicleDetailsRecord(
-        submissionSafePayload?.savedVehicleLookup ||
+        submissionChecks.vehicleDetails ||
+          submissionSafePayload?.savedVehicleLookup ||
           submissionSafePayload?.vehicleDetails ||
           queuedItem?.payload?.savedVehicleLookup ||
           queuedItem?.payload?.vehicleDetails ||
@@ -3107,7 +3608,7 @@ export default function DashboardPage() {
           capturedAt: entryTime,
           detection: {
             plateText: submissionSafePayload?.detectedEntryPlateText,
-            plateCutoffImage: submissionSafePayload?.detectedEntryPlateCutoffImage,
+            plateCutoffImage: entryPlateImageUrl || submissionSafePayload?.detectedEntryPlateCutoffImage,
             plateConfidence: submissionSafePayload?.detectedEntryPlateConfidence,
             vehicleImage: entryFrame?.imageUrl || submissionSafePayload?.detectedEntryVehicleImage || submissionSafePayload?.startVehicleImage || payloadEntryImage,
           },
@@ -3117,7 +3618,7 @@ export default function DashboardPage() {
           capturedAt: closingTime,
           detection: {
             plateText: submissionSafePayload?.detectedClosingPlateText,
-            plateCutoffImage: submissionSafePayload?.detectedClosingPlateCutoffImage,
+            plateCutoffImage: closingPlateImageUrl || submissionSafePayload?.detectedClosingPlateCutoffImage,
             plateConfidence: submissionSafePayload?.detectedClosingPlateConfidence,
             vehicleImage: closingFrame?.imageUrl || submissionSafePayload?.detectedClosingVehicleImage || payloadClosingImage,
           },
@@ -3126,10 +3627,14 @@ export default function DashboardPage() {
       const breachPayload = {
         ...submissionSafePayload,
         vrm,
+        siteId: queuedSiteId,
+        siteName: queuedSiteName || 'Site not set',
         vehicleDetails,
         make: vehicleDetails?.make || submissionSafePayload?.make || null,
         model: vehicleDetails?.model || submissionSafePayload?.model || null,
         colour: vehicleDetails?.color || submissionSafePayload?.colour || submissionSafePayload?.color || null,
+        detectedEntryPlateCutoffImage: entryPlateImageUrl || submissionSafePayload?.detectedEntryPlateCutoffImage || '',
+        detectedClosingPlateCutoffImage: closingPlateImageUrl || submissionSafePayload?.detectedClosingPlateCutoffImage || '',
         images: allImages,
         imageUrls: allImages,
         evidence: {
@@ -3244,6 +3749,16 @@ export default function DashboardPage() {
       let workingItem = selectedTracked;
       let breachId = workingItem?.payload?.breachId || '';
 
+      const submissionChecks = await ensurePcnSubmissionChecks({
+        vrm: workingItem?.vrm || workingItem?.payload?.vrm || selectedVrm,
+        siteId: workingItem?.payload?.siteId || selectedSiteId,
+        forceCarcheck: true,
+        openDialog: false,
+      });
+      if (!submissionChecks.ok) {
+        throw new Error(submissionChecks.error || 'Carcheck or e-permit validation failed before PCN submission');
+      }
+
       if (!breachId) {
         setMessage('Submitting evidence package before final PCN submission...');
         const syncResult = await syncQueueItem(trackedItemId, {
@@ -3286,6 +3801,7 @@ export default function DashboardPage() {
         .filter((value) => typeof value === 'string' && value.length > 0)
         .filter((value, index, all) => all.indexOf(value) === index);
       const vehicleDetails = buildVehicleDetailsRecord(
+        submissionChecks.vehicleDetails ||
         workingItem?.payload?.vehicleDetails ||
         workingItem?.payload?.savedVehicleLookup ||
         selectedTrackedVehicleDetails ||
@@ -3478,6 +3994,10 @@ export default function DashboardPage() {
   }
 
   async function handleFinalize({ openPcnDialogAfterSync = false } = {}) {
+    await persistTrackedPcnDetails({ silent: true });
+    const checks = await ensurePcnSubmissionChecks({ forceCarcheck: true, openDialog: false });
+    if (!checks.ok) return;
+
     setPendingFinalize({
       action: 'sync',
       openPcnDialogAfterSync,
@@ -3485,7 +4005,11 @@ export default function DashboardPage() {
     setPcnPreviewOpen(true);
   }
 
-  function handleOpenPcnSubmitPreview() {
+  async function handleOpenPcnSubmitPreview() {
+    await persistTrackedPcnDetails({ silent: true });
+    const checks = await ensurePcnSubmissionChecks({ forceCarcheck: true, openDialog: false });
+    if (!checks.ok) return;
+
     setPendingFinalize({
       action: 'convert',
       openPcnDialogAfterSync: false,
@@ -3495,6 +4019,11 @@ export default function DashboardPage() {
 
   async function confirmFinalize() {
     if (!pendingFinalize) return;
+
+    await persistTrackedPcnDetails({ silent: true });
+
+    const checks = await ensurePcnSubmissionChecks({ forceCarcheck: true, openDialog: false });
+    if (!checks.ok) return;
 
     setPcnPreviewOpen(false);
     if (pendingFinalize.action === 'convert') {
@@ -3596,6 +4125,7 @@ export default function DashboardPage() {
     if (next) {
       setSelectedReason(next.label);
       setManualObservationMinutes(Number(next.defaultObservationMinutes ?? 0));
+      setPcnReasonInput(next.label || '');
     }
   }
 
@@ -3718,7 +4248,7 @@ export default function DashboardPage() {
               value={selectedSiteId}
               onChange={e => { setSelectedSiteId(e.target.value); saveStoredSiteId(e.target.value); }}
             >
-              <option value="">All sites</option>
+              <option value="">No site</option>
               {sites.map(site => (
                 <option key={site.id} value={site.id}>
                   {site.displayName || site.name || site.id}
@@ -3860,6 +4390,50 @@ export default function DashboardPage() {
             </div>
           ) : null}
 
+          {/* Draft PCN details */}
+          <div className="detail-section">
+            <div className="detail-section-label">Draft PCN details</div>
+            <label className="stepper-field" style={{ marginBottom: 8 }}>
+              <span className="stepper-field-label">Patrol site</span>
+              <select
+                className="stepper-select"
+                value={selectedSiteId}
+                onChange={(event) => setSelectedSiteId(event.target.value)}
+              >
+                <option value="">Select site</option>
+                {sites.map((site) => (
+                  <option key={site.id} value={site.id}>
+                    {site.displayName || site.name || site.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="stepper-field" style={{ marginBottom: 8 }}>
+              <span className="stepper-field-label">Contravention reason</span>
+              <select
+                className="stepper-select"
+                value={selectedContraventionCode}
+                onChange={(event) => selectContravention(event.target.value)}
+              >
+                {contraventions.map((c, index) => (
+                  <option key={c.code || `detail-contravention-${index + 1}`} value={c.code || ''}>
+                    {getContraventionSelectionLabel(c)}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <button
+              type="button"
+              className="action-btn action-btn--secondary"
+              onClick={() => persistTrackedPcnDetails({ silent: false })}
+              disabled={busy}
+            >
+              Save PCN details
+            </button>
+          </div>
+
           {/* E-permit lookup */}
           <div className="detail-section">
             <div className="detail-section-label">E-permit lookup</div>
@@ -3883,14 +4457,6 @@ export default function DashboardPage() {
               onClick={persistSelectedTrackedVrm}
             >
               Save VRM
-            </button>
-            <button
-              type="button"
-              className="action-btn action-btn--secondary"
-              disabled={!selectedVrm || busy}
-              onClick={handlePermitLookup}
-            >
-              {busy ? 'Checking ePermit...' : 'Check ePermit'}
             </button>
 
             {selectedTrackedAuthorization ? (
@@ -3918,15 +4484,6 @@ export default function DashboardPage() {
           {/* Carcheck */}
           <div className="detail-section">
             <div className="detail-section-label">Carcheck</div>
-            <button
-              type="button"
-              className="action-btn action-btn--secondary"
-              disabled={!selectedVrm || vehicleLookupLoading || busy}
-              onClick={handleVehicleLookup}
-            >
-              {vehicleLookupLoading ? 'Checking carcheck...' : 'Run carcheck'}
-            </button>
-
             {selectedTrackedVehicleDetails ? (
               <button
                 type="button"
@@ -4098,17 +4655,48 @@ export default function DashboardPage() {
 
             {/* Single submit flow: sync evidence (if needed) and submit PCN once */}
             {canIssuePcnFromCurrentState ? (
-              <button
-                type="button"
-                className="action-btn action-btn--issue"
-                onClick={handleOpenPcnSubmitPreview}
-                disabled={busy || convertLoading}
-              >
-                {convertLoading
-                  ? 'Submitting...'
-                  : (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')}
-              </button>
-            ) : null}
+                <div className="pcn-gate-card">
+                  <div className="pcn-gate-row">
+                    <span className={`pcn-status-pill ${pcnSubmissionGate.ready ? 'pcn-status-pill--ok' : 'pcn-status-pill--warn'}`}>
+                      {pcnSubmissionGate.ready ? 'Checks passed' : 'Checks required'}
+                    </span>
+                    <span className="pcn-gate-message">{pcnSubmissionGate.message}</span>
+                  </div>
+                  <div className="pcn-gate-actions">
+                    <button
+                      type="button"
+                      className="action-btn action-btn--secondary"
+                      onClick={async () => {
+                        await persistSelectedTrackedVrm();
+                        const checks = await ensurePcnSubmissionChecks({
+                          vrm: pcnSubmissionGate.trackedVrm || selectedVrm,
+                          siteId: pcnSubmissionGate.siteId || selectedSiteId,
+                          forceCarcheck: true,
+                          openDialog: true,
+                        });
+                        if (checks.ok) {
+                          setDetailMessage('Mandatory checks completed. You can submit now.');
+                        }
+                      }}
+                      disabled={busy || convertLoading || !pcnSubmissionGate.trackedVrm}
+                    >
+                      Run mandatory checks
+                    </button>
+                    <button
+                      type="button"
+                      className="action-btn action-btn--issue"
+                      onClick={handleOpenPcnSubmitPreview}
+                      disabled={busy || convertLoading}
+                    >
+                      {convertLoading
+                        ? 'Submitting...'
+                        : (pcnSubmissionGate.ready
+                          ? (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')
+                          : 'Retry checks to submit')}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
 
             {convertError ? <div className="notice notice-error">{convertError}</div> : null}
 
@@ -4243,7 +4831,7 @@ export default function DashboardPage() {
                   saveStoredSiteId(event.target.value);
                 }}
               >
-                <option value="">Select site</option>
+                <option value="">No site</option>
                 {sites.map((site) => (
                   <option key={site.id} value={site.id}>
                     {site.displayName || site.name || site.id}
@@ -4451,7 +5039,10 @@ export default function DashboardPage() {
                         <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
                           {item?.phase === 'closing' ? 'Closing' : 'Entry'}
                         </span>
-                        <span className="camera-raw-filename">{item?.fileName || `Capture ${index + 1}`}</span>
+                        <span className="camera-raw-filename">
+                          {item?.fileName || `Capture ${index + 1}`}
+                          {item?.imageRole === 'plate_cutoff' ? ' · Plate cutout' : ' · Full vehicle'}
+                        </span>
                         <span className="camera-raw-subline">
                           {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
                         </span>
@@ -4496,7 +5087,10 @@ export default function DashboardPage() {
                         <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
                           {item?.phase === 'closing' ? 'Closing' : 'Entry'}
                         </span>
-                        <span className="camera-raw-filename">{item?.fileName || `Capture ${index + 1}`}</span>
+                        <span className="camera-raw-filename">
+                          {item?.fileName || `Capture ${index + 1}`}
+                          {item?.imageRole === 'plate_cutoff' ? ' · Plate cutout' : ' · Full vehicle'}
+                        </span>
                         <span className="camera-raw-subline">
                           {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
                         </span>
@@ -4700,7 +5294,7 @@ export default function DashboardPage() {
                     saveStoredSiteId(event.target.value);
                   }}
                 >
-                  <option value="">Select site</option>
+                  <option value="">No site</option>
                   {sites.map((site) => (
                     <option key={site.id} value={site.id}>
                       {site.displayName || site.name || site.id}
