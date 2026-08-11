@@ -17,6 +17,8 @@ export default function PcnPreviewDialog({ open = false, data = {}, onConfirm, o
     location = null,
     manualNote = '',
     wardenId = '',
+    permitStatus = '',
+    permitWarning = '',
   } = data;
 
   const splitLabel = (label, fallbackValue) => {
@@ -93,9 +95,19 @@ export default function PcnPreviewDialog({ open = false, data = {}, onConfirm, o
                 <span className="pcn-summary-value">{wardenId || '-'}</span>
               </div>
               <div className="pcn-summary-row pcn-preview-span-2">
+                <span className="pcn-summary-key">E-permit</span>
+                <span className="pcn-summary-value">{permitStatus || '-'}</span>
+              </div>
+              <div className="pcn-summary-row pcn-preview-span-2">
                 <span className="pcn-summary-key">Location</span>
                 <span className="pcn-summary-value">{locationText}</span>
               </div>
+              {permitWarning ? (
+                <div className="pcn-summary-row pcn-preview-span-2">
+                  <span className="pcn-summary-key">Submission note</span>
+                  <span className="pcn-summary-value pcn-preview-notes">{permitWarning}</span>
+                </div>
+              ) : null}
               {manualNote ? (
                 <div className="pcn-summary-row pcn-preview-span-2">
                   <span className="pcn-summary-key">Notes</span>
@@ -132,7 +144,7 @@ export default function PcnPreviewDialog({ open = false, data = {}, onConfirm, o
             <button type="button" className="action-btn action-btn--secondary pcn-dialog-btn" onClick={onCancel} disabled={loading}>
               Back
             </button>
-            <button type="button" className="action-btn action-btn--issue pcn-dialog-btn" onClick={onConfirm} disabled={loading}>
+            <button type="button" className="action-btn action-btn--primary pcn-dialog-btn" onClick={onConfirm} disabled={loading}>
               {loading ? 'Finalizing...' : 'Confirm and send'}
             </button>
           </div>

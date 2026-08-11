@@ -18,8 +18,11 @@ load_env_file_if_present() {
 }
 
 ensure_public_firebase_config() {
-    load_env_file_if_present ".env.local"
-    load_env_file_if_present ".env.production"
+    # Only pull from env files when public Firebase vars are not already provided.
+    if [ -z "${NEXT_PUBLIC_FIREBASE_API_KEY:-}" ] || [ -z "${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN:-}" ] || [ -z "${NEXT_PUBLIC_FIREBASE_PROJECT_ID:-}" ] || [ -z "${NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET:-}" ] || [ -z "${NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID:-}" ] || [ -z "${NEXT_PUBLIC_FIREBASE_APP_ID:-}" ]; then
+        load_env_file_if_present ".env.local"
+        load_env_file_if_present ".env.production"
+    fi
 
     export NEXT_PUBLIC_FIREBASE_API_KEY="${NEXT_PUBLIC_FIREBASE_API_KEY:-AIzaSyDlnhEMK0DkgyPYTsgnO0HFgldywKK1fFc}"
     export NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN="${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN:-ldk-group-e-permits-system.firebaseapp.com}"
@@ -38,7 +41,7 @@ ensure_public_firebase_config() {
 }
 
 validate_public_api_base() {
-    local base="${NEXT_PUBLIC_API_BASE_URL:-${NEXT_PUBLIC_WARDEN_API_BASE_URL:-www.ldkgroup.co.uk}}"
+    local base="${NEXT_PUBLIC_API_BASE_URL:-www.ldkgroup.co.uk}"
 
     if [[ ! "$base" =~ ^https?:// ]]; then
         base="https://$base"
@@ -56,18 +59,21 @@ validate_public_api_base() {
     fi
 
     export NEXT_PUBLIC_API_BASE_URL="$base"
-    export NEXT_PUBLIC_WARDEN_API_BASE_URL="$base"
 }
 
 validate_camera_service_base() {
-    load_env_file_if_present ".env.local"
-    load_env_file_if_present ".env.production"
-
     local base="${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL:-${CAMERA_SERVICE_BASE_URL:-}}"
+
+    # Respect inline/exported values first. Only fall back to env files when unset.
+    if [ -z "$base" ]; then
+        load_env_file_if_present ".env.local"
+        load_env_file_if_present ".env.production"
+        base="${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL:-${CAMERA_SERVICE_BASE_URL:-}}"
+    fi
 
     if [ -z "$base" ]; then
         echo -e "${RED}NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL is required for APK builds.${NC}"
-        echo -e "${YELLOW}Expected value example: http://camera.ldkgroup.co.uk${NC}"
+        echo -e "${YELLOW}Expected value example: https://camera.ldkgroup.co.uk${NC}"
         exit 1
     fi
 
@@ -84,6 +90,15 @@ validate_camera_service_base() {
     fi
 
     export NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL="$base"
+}
+
+print_preflight_api_targets() {
+    require_env NEXT_PUBLIC_API_BASE_URL
+    require_env NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL
+
+    echo -e "${GREEN}APK preflight API targets:${NC}"
+    echo -e "  NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}"
+    echo -e "  NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL=${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL}"
 }
 
 require_env() {
@@ -161,6 +176,9 @@ echo -e "${GREEN}Using NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}${NC}
 print_step "Validating camera service API base URL..."
 validate_camera_service_base
 echo -e "${GREEN}Using NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL=${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL}${NC}"
+
+print_step "APK API preflight summary..."
+print_preflight_api_targets
 
 print_step "Ensuring public Firebase client config..."
 ensure_public_firebase_config

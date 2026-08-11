@@ -49,6 +49,19 @@ const mockRequest = (overrides = {}) => {
     siteId: 'site-001',
     siteName: 'Test Site',
     contraventionReason: 'Parked in bay',
+      vehicleDetails: {
+        vrm: 'AB12CDE',
+        make: 'Ford',
+        model: 'Focus',
+        color: 'Blue',
+        imageUrl: 'https://example.com/vehicle.jpg',
+      },
+      authorization: {
+        hasAuthorization: true,
+        authorization: {
+          type: 'permit',
+        },
+      },
     observationStartTime: '2026-07-08T10:00:00.000Z',
     observationEndTime: '2026-07-08T10:12:00.000Z',
     images: [
@@ -211,6 +224,36 @@ describe('POST /api/breaches/wardencapture', () => {
       expect(res.json).toHaveBeenCalledWith({
         error: 'Paired opening and closing evidence is required before a breach can be created',
       });
+    });
+
+    it('returns 400 when carcheck details are missing', async () => {
+      const req = mockRequest({
+        body: {
+          vehicleDetails: null,
+        },
+      });
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const callArgs = res.json.mock.calls[0][0];
+      expect(callArgs.details).toContain('vehicleDetails is required');
+    });
+
+    it('returns 400 when permit lookup is missing', async () => {
+      const req = mockRequest({
+        body: {
+          authorization: null,
+        },
+      });
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const callArgs = res.json.mock.calls[0][0];
+      expect(callArgs.details).toContain('authorization is required');
     });
   });
 

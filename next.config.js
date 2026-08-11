@@ -1,5 +1,10 @@
 let withPWA = (config) => config;
 
+const rewriteApiBase = (
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  'https://www.ldkgroup.co.uk'
+).replace(/\/$/, '');
+
 try {
   withPWA = require('next-pwa')({
     dest: 'public',
@@ -23,7 +28,7 @@ const nextConfig = {
     return [
       {
         source: '/api/:path*',
-        destination: 'https://www.ldkgroup.co.uk/api/:path*'
+        destination: `${rewriteApiBase}/api/:path*`
       }
     ];
   }

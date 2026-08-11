@@ -26,6 +26,10 @@ function normalizeCapturedAt(value) {
     return asDate.toISOString();
 }
 
+function normalizeVrm(value) {
+    return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
 function stripSitePrefix(value) {
     return String(value || '')
         .replace(/^\s*site(?:\s*[A-Z0-9]+)?[\s:_-]*/i, '')
@@ -69,6 +73,92 @@ function loadImageElement(file) {
     });
 }
 
+function normalizeBboxForImage(rawBbox, imageWidth, imageHeight) {
+    if (!rawBbox || !imageWidth || !imageHeight) return null;
+
+    const x0Candidate = Number(rawBbox?.x0 ?? rawBbox?.left ?? rawBbox?.x ?? NaN);
+    const y0Candidate = Number(rawBbox?.y0 ?? rawBbox?.top ?? rawBbox?.y ?? NaN);
+    const x1FromEdges = Number(rawBbox?.x1 ?? rawBbox?.right ?? NaN);
+    const y1FromEdges = Number(rawBbox?.y1 ?? rawBbox?.bottom ?? NaN);
+    const widthCandidate = Number(rawBbox?.width ?? NaN);
+    const heightCandidate = Number(rawBbox?.height ?? NaN);
+
+    let x0 = x0Candidate;
+    let y0 = y0Candidate;
+    let x1 = Number.isFinite(x1FromEdges)
+        ? x1FromEdges
+        : (Number.isFinite(x0) && Number.isFinite(widthCandidate) ? x0 + widthCandidate : NaN);
+    let y1 = Number.isFinite(y1FromEdges)
+        ? y1FromEdges
+        : (Number.isFinite(y0) && Number.isFinite(heightCandidate) ? y0 + heightCandidate : NaN);
+
+    if (![x0, y0, x1, y1].every(Number.isFinite)) return null;
+
+    const looksNormalized = [x0, y0, x1, y1].every((value) => value >= 0 && value <= 1);
+    if (looksNormalized) {
+        x0 *= imageWidth;
+        x1 *= imageWidth;
+        y0 *= imageHeight;
+        y1 *= imageHeight;
+    }
+
+    const left = Math.min(x0, x1);
+    const right = Math.max(x0, x1);
+    const top = Math.min(y0, y1);
+    const bottom = Math.max(y0, y1);
+
+    const safeX0 = Math.max(0, Math.min(imageWidth - 1, left));
+    const safeY0 = Math.max(0, Math.min(imageHeight - 1, top));
+    const safeX1 = Math.max(1, Math.min(imageWidth, right));
+    const safeY1 = Math.max(1, Math.min(imageHeight, bottom));
+
+    if (safeX1 <= safeX0 || safeY1 <= safeY0) return null;
+
+    return {
+        x0: safeX0,
+        y0: safeY0,
+        x1: safeX1,
+        y1: safeY1,
+    };
+}
+
+async function createPlateCutoutDataUrl(file, bbox) {
+    if (!file || !bbox) return '';
+
+    try {
+        const image = await loadImageElement(file);
+        const imageWidth = image.naturalWidth || image.width;
+        const imageHeight = image.naturalHeight || image.height;
+        if (!imageWidth || !imageHeight) return '';
+
+        const normalizedBbox = normalizeBboxForImage(bbox, imageWidth, imageHeight);
+        if (!normalizedBbox) return '';
+
+        const rawWidth = Math.max(1, normalizedBbox.x1 - normalizedBbox.x0);
+        const rawHeight = Math.max(1, normalizedBbox.y1 - normalizedBbox.y0);
+        const padX = Math.max(4, Math.round(rawWidth * 0.2));
+        const padY = Math.max(4, Math.round(rawHeight * 0.35));
+
+        const sx = Math.max(0, Math.floor(normalizedBbox.x0 - padX));
+        const sy = Math.max(0, Math.floor(normalizedBbox.y0 - padY));
+        const ex = Math.min(imageWidth, Math.ceil(normalizedBbox.x1 + padX));
+        const ey = Math.min(imageHeight, Math.ceil(normalizedBbox.y1 + padY));
+        const sw = Math.max(1, ex - sx);
+        const sh = Math.max(1, ey - sy);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = sw;
+        canvas.height = sh;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return '';
+
+        ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
+        return canvas.toDataURL('image/jpeg', 0.92);
+    } catch (_) {
+        return '';
+    }
+}
+
 async function resolveCameraCaptureTimestamp(file, fallbackIso) {
     const fallback = normalizeCapturedAt(fallbackIso) || new Date().toISOString();
     if (!file || typeof window === 'undefined') return fallback;
@@ -107,39 +197,53 @@ async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
 
         ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
 
-        const phaseLabel = String(phase || 'ENTRY').toUpperCase();
-        const localLine = `LOCAL ${formatEvidenceLocalTimestamp(capturedAt)}`;
-        const lines = [`LDK WARDEN ${phaseLabel}`, localLine];
+        const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
+        const stampText = formatEvidenceLocalTimestamp(capturedAt);
+        let baseFont = 3 * (isPlateCutout
+            ? Math.max(10, Math.min(14, Math.floor(canvas.width / 90)))
+            : Math.max(11, Math.min(16, Math.floor(canvas.width / 88))));
+        const marginX = Math.max(6, Math.floor(canvas.width * 0.012));
+        const marginY = Math.max(6, Math.floor(canvas.height * 0.014));
+        const maxBoxWidth = Math.max(40, canvas.width - (marginX * 2));
+        const maxBoxHeight = Math.max(20, canvas.height - (marginY * 2));
 
-        const baseFont = Math.max(48, Math.floor((canvas.width / 34) * 1.4));
-        const lineGap = Math.max(8, Math.floor(baseFont * 0.32));
-        const paddingX = Math.max(32, Math.floor(baseFont * 1.08));
-        const paddingY = Math.max(16, Math.floor(baseFont * 0.6));
-
-        ctx.font = `700 ${baseFont}px Arial, sans-serif`;
-        const contentWidth = Math.max(...lines.map((line) => ctx.measureText(line).width));
-        const boxWidth = Math.ceil(Math.max(contentWidth + paddingX * 2, canvas.width * 0.62));
-        const boxHeight = Math.ceil((baseFont * lines.length) + (lineGap * (lines.length - 1)) + (paddingY * 2));
-        const margin = Math.max(18, Math.floor(canvas.width * 0.03));
-        const boxX = margin;
-        const boxY = margin;
-
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-        ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-        ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.08));
-        ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
-
-        ctx.fillStyle = '#ffffff';
-        ctx.textBaseline = 'top';
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.95)';
-        ctx.shadowBlur = Math.max(3, Math.floor(baseFont * 0.1));
-        let textY = boxY + paddingY;
-        for (const line of lines) {
-            ctx.fillText(line, boxX + paddingX, textY);
-            textY += baseFont + lineGap;
+        let paddingX = 0;
+        let paddingY = 0;
+        let boxWidth = 0;
+        let boxHeight = 0;
+        while (baseFont >= 10) {
+            paddingX = Math.max(8, Math.floor(baseFont * 0.45));
+            paddingY = Math.max(5, Math.floor(baseFont * 0.3));
+            ctx.font = `600 ${baseFont}px "Roboto Mono", "Courier New", monospace`;
+            const textWidth = Math.ceil(ctx.measureText(stampText).width);
+            boxWidth = textWidth + (paddingX * 2);
+            boxHeight = Math.ceil(baseFont + (paddingY * 2));
+            if (boxWidth <= maxBoxWidth && boxHeight <= maxBoxHeight) break;
+            baseFont -= 2;
         }
-        ctx.shadowBlur = 0;
+
+        const clampedBoxWidth = Math.min(maxBoxWidth, boxWidth);
+        const clampedBoxHeight = Math.min(maxBoxHeight, boxHeight);
+
+        // ANPR-style timestamp container: compact dark chip for readability.
+        ctx.fillStyle = 'rgba(5, 10, 18, 0.64)';
+        ctx.fillRect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
+        ctx.strokeStyle = 'rgba(220, 235, 255, 0.26)';
+        ctx.lineWidth = Math.max(1, Math.floor(baseFont * 0.08));
+        ctx.strokeRect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
+
+        ctx.textBaseline = 'top';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.82)';
+        ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.22));
+        ctx.fillStyle = '#f7fbff';
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
+        ctx.clip();
+        ctx.strokeText(stampText, marginX + paddingX, marginY + paddingY);
+        ctx.fillText(stampText, marginX + paddingX, marginY + paddingY);
+        ctx.restore();
 
         const blob = await new Promise((resolve) => canvas.toBlob(resolve, file.type || 'image/jpeg', 0.92));
         if (!blob) return file;
@@ -172,6 +276,31 @@ function dataUrlToFile(dataUrl, filename) {
     } catch (_) {
         return null;
     }
+}
+
+function isPlateCutoffFileArtifact(fileLike) {
+    const name = String(fileLike?.name || fileLike?.fileName || '').toLowerCase();
+    return name.includes('plate_cutoff_');
+}
+
+function hasCapturePairArtifacts(files, options = {}) {
+    const requireExtractedVrm = options?.requireExtractedVrm !== false;
+    const requirePlateCutoff = options?.requirePlateCutoff !== false;
+    const minimumImages = Math.max(1, Number(options?.minimumImages || 1));
+    const safeFiles = Array.isArray(files) ? files : [];
+    if (safeFiles.length === 0) return false;
+
+    const hasVehicleImage = safeFiles.some((file) => !isPlateCutoffFileArtifact(file));
+    const hasPlateCutoff = safeFiles.some((file) => (
+        isPlateCutoffFileArtifact(file) || Boolean(String(file?.detectedPlateCutoffImage || '').trim())
+    ));
+    const hasExtractedVrm = safeFiles.some((file) => Boolean(normalizeVrm(file?.detectedPlateText || '')));
+    const hasMinimumImages = safeFiles.length >= minimumImages;
+
+    return hasVehicleImage
+        && hasMinimumImages
+        && (requirePlateCutoff ? hasPlateCutoff : true)
+        && (requireExtractedVrm ? hasExtractedVrm : true);
 }
 
 function base64JpegToFile(base64, filename) {
@@ -469,7 +598,7 @@ export default function BreachStepper({
     async function appendCapturedFiles(captured, initialScanResult = null, options = {}) {
         if (!captured.length) return;
         const allowWebFallback = Boolean(options.allowWebFallback);
-        const skipOcr = Boolean(options.skipOcr);
+        const skipOcr = Boolean(options.skipOcr) || evidencePhase === 'closing';
 
         const fallbackCapturedAt = await getServerTimestamp();
         const stampedCaptured = await Promise.all(
@@ -509,6 +638,31 @@ export default function BreachStepper({
             }
         }
 
+        if (!skipOcr && result?.plateText && result?.bbox && !result?.cutoffImage && captured[0]) {
+            const bboxCutoff = await createPlateCutoutDataUrl(captured[0], result.bbox);
+            if (bboxCutoff) {
+                result = {
+                    ...result,
+                    cutoffImage: bboxCutoff,
+                };
+            }
+        }
+
+        if (!skipOcr && result?.plateText && !result?.cutoffImage && captured[0] && typeof onPlateScan === 'function') {
+            try {
+                const fallback = await withTimeout(onPlateScan(captured[0]), IMAGE_SCAN_TIMEOUT_MS);
+                if (fallback?.cutoffImage) {
+                    result = {
+                        ...result,
+                        cutoffImage: fallback.cutoffImage,
+                        bbox: result?.bbox || fallback?.bbox || null,
+                    };
+                }
+            } catch (_) {
+                // Keep primary OCR result if fallback crop extraction fails.
+            }
+        }
+
         if (result?.plateText) {
             const cleanedPlate = normalizeVrm(result.plateText);
             setVrm((current) => current || cleanedPlate);
@@ -516,6 +670,7 @@ export default function BreachStepper({
             if (nextFiles[0]) {
                 nextFiles[0].detectedPlateText = cleanedPlate;
                 nextFiles[0].detectedPlateConfidence = Number(result.confidence || 0);
+                nextFiles[0].detectedPlateBbox = result.bbox || null;
             }
             setScanState({
                 loading: false,
@@ -529,8 +684,13 @@ export default function BreachStepper({
         if (result?.cutoffImage) {
             const cutoffFile = dataUrlToFile(result.cutoffImage, `plate_cutoff_${evidencePhase}_${Date.now()}.jpg`);
             if (cutoffFile) {
-                nextFiles.push(cutoffFile);
-                nextPreviews.push(result.cutoffImage);
+                const cutoffCapturedAt = normalizeCapturedAt(stampedCaptured?.[0]?.capturedAt) || new Date().toISOString();
+                const stampedCutoff = await stampEvidenceImage(cutoffFile, { capturedAt: cutoffCapturedAt, phase: 'plate' });
+                stampedCutoff.capturedAt = cutoffCapturedAt;
+                const stampedCutoffPreview = await fileToDataUrl(stampedCutoff);
+                nextFiles.push(stampedCutoff);
+                nextPreviews.push(stampedCutoffPreview || result.cutoffImage);
+                result.cutoffImage = stampedCutoffPreview || result.cutoffImage;
             }
             if (nextFiles[0]) {
                 nextFiles[0].detectedPlateCutoffImage = result.cutoffImage;
@@ -540,16 +700,39 @@ export default function BreachStepper({
         setFiles((prev) => [...prev, ...nextFiles]);
         setPreviews((prev) => [...prev, ...nextPreviews]);
 
+        const hasPairArtifacts = evidencePhase === 'closing'
+            ? hasCapturePairArtifacts([...files, ...nextFiles], {
+                requireExtractedVrm: false,
+                requirePlateCutoff: false,
+                minimumImages: 2,
+            })
+            : hasCapturePairArtifacts(nextFiles);
+        if (!hasPairArtifacts) {
+            setScanState({
+                loading: false,
+                text: evidencePhase === 'closing'
+                    ? 'Closing evidence needs at least 2 images: full vehicle and plate image.'
+                    : 'Full vehicle image captured. Plate cutout is missing - recapture plate and try again.',
+                confidence: 0,
+            });
+            return false;
+        }
+
         if (step === 0 && !captureOnly) {
             setTimeout(() => setStep(1), 150);
         }
+
+        return true;
     }
 
     async function handleFileCapture(event) {
         const captured = Array.from(event.target.files || []);
         event.target.value = '';
         if (!captured.length) return;
-        await appendCapturedFiles(captured, null, { allowWebFallback: !Capacitor.isNativePlatform() });
+        await appendCapturedFiles(captured, null, {
+            allowWebFallback: !Capacitor.isNativePlatform(),
+            skipOcr: evidencePhase === 'closing',
+        });
     }
 
     async function startLiveCamera() {
@@ -569,8 +752,13 @@ export default function BreachStepper({
                     return;
                 }
                 stopLiveCamera();
-                await appendCapturedFiles([fallbackFrame], null, { allowWebFallback: false, skipOcr: true });
-                setScanState({ loading: false, text: 'No plate detected. Enter VRM manually.', confidence: 0 });
+                const appendedWithPair = await appendCapturedFiles([fallbackFrame], null, {
+                    allowWebFallback: true,
+                    skipOcr: false,
+                });
+                if (!appendedWithPair) {
+                    setScanState({ loading: false, text: 'No plate detected. Enter VRM manually.', confidence: 0 });
+                }
             };
 
             liveScanTimerRef.current = window.setInterval(async () => {
@@ -870,11 +1058,15 @@ export default function BreachStepper({
     }
 
     function handleConfirm() {
-        if (!vrm || !defaultSiteId || files.length === 0) return;
+        if (!vrm || files.length === 0 || !hasCapturePairArtifacts(files)) {
+            setScanState({ loading: false, text: 'Capture needs full vehicle and plate cutout.', confidence: 0 });
+            setScanState({ loading: false, text: 'Capture needs full vehicle, plate cutout, and VRM text.', confidence: 0 });
+            return;
+        }
         onComplete?.({
             vrm: normalizeVrm(vrm),
             siteId: defaultSiteId,
-            siteName: selectedSite?.displayName || selectedSite?.name || selectedSite?.location || defaultSiteId,
+            siteName: selectedSite?.displayName || selectedSite?.name || selectedSite?.location || defaultSiteId || 'Site not set',
             contraventionCode,
             contraventionLabel: getContraventionSelectionLabel(selectedContravention),
             observationMinutes,
@@ -882,6 +1074,8 @@ export default function BreachStepper({
             scan: {
                 plateText: stableCapturedVrm,
                 confidence: Number(scanState.confidence || 0),
+                cutoffImage: String(files?.[0]?.detectedPlateCutoffImage || ''),
+                bbox: files?.[0]?.detectedPlateBbox || null,
             },
             note,
         });
@@ -889,7 +1083,24 @@ export default function BreachStepper({
     }
 
     function handleCaptureOnlyComplete() {
-        if (!files.length) return;
+        const hasCaptureArtifacts = evidencePhase === 'closing'
+            ? hasCapturePairArtifacts(files, {
+                requireExtractedVrm: false,
+                requirePlateCutoff: false,
+                minimumImages: 2,
+            })
+            : hasCapturePairArtifacts(files);
+
+        if (!files.length || !hasCaptureArtifacts) {
+            setScanState({
+                loading: false,
+                text: evidencePhase === 'closing'
+                    ? 'Closing evidence needs at least 2 images: full vehicle and plate image.'
+                    : 'Capture needs full vehicle, plate cutout, and VRM text.',
+                confidence: 0,
+            });
+            return;
+        }
         onCaptureComplete?.({
             phase: evidencePhase,
             files,
@@ -897,6 +1108,8 @@ export default function BreachStepper({
             scan: {
                 plateText: stableCapturedVrm,
                 confidence: Number(scanState.confidence || 0),
+                cutoffImage: String(files?.[0]?.detectedPlateCutoffImage || ''),
+                bbox: files?.[0]?.detectedPlateBbox || null,
             },
         });
         reset();
@@ -907,9 +1120,16 @@ export default function BreachStepper({
     }
 
     // Step validations
+    const hasCapturePair = evidencePhase === 'closing'
+        ? hasCapturePairArtifacts(files, {
+            requireExtractedVrm: false,
+            requirePlateCutoff: false,
+            minimumImages: 2,
+        })
+        : hasCapturePairArtifacts(files);
     const canAdvanceFromCapture = Boolean(files.length > 0);
-    const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && defaultSiteId && files.length > 0);
-    const canConfirm = Boolean(normalizeVrm(vrm) && defaultSiteId && files.length > 0);
+    const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && files.length > 0 && hasCapturePair);
+    const canConfirm = Boolean(normalizeVrm(vrm) && files.length > 0 && hasCapturePair);
 
     if (!open) return null;
 
@@ -1007,7 +1227,10 @@ export default function BreachStepper({
                 <div
                     style={{
                         background: 'rgba(0,0,0,0.80)',
-                        padding: '12px 16px',
+                        paddingTop: 12,
+                        paddingRight: 16,
+                        paddingBottom: 'calc(12px + var(--scan-cta-bottom-clearance, var(--safe-bottom-effective, env(safe-area-inset-bottom, 0px))))',
+                        paddingLeft: 16,
                         display: 'flex',
                         alignItems: 'center',
                         gap: 12,
@@ -1107,6 +1330,11 @@ export default function BreachStepper({
                         )}
 
                         {scanState.loading ? <div className="text-muted">Scanning image for VRM...</div> : null}
+                        {!scanState.loading && files.length > 0 && !hasCapturePair ? (
+                            <div className="text-muted" style={{ color: '#ffbf47' }}>
+                                Full vehicle captured. Plate cutout missing - recapture plate to continue.
+                            </div>
+                        ) : null}
 
                         <div className="stepper-nav">
                             <button type="button" className="ghost-button" onClick={handleClose}>Cancel</button>
@@ -1122,9 +1350,12 @@ export default function BreachStepper({
                                     <button
                                         type="button"
                                         className="primary-button"
+                                        disabled={!hasCapturePair}
                                         onClick={captureOnly ? handleCaptureOnlyComplete : () => setStep(1)}
                                     >
-                                        {captureOnly ? `Use ${evidenceLabel.toLowerCase()} evidence` : 'Next — Vehicle details →'}
+                                        {hasCapturePair
+                                            ? (captureOnly ? `Use ${evidenceLabel.toLowerCase()} evidence` : 'Next — Vehicle details →')
+                                            : 'Need plate cutout to continue'}
                                     </button>
                                 ) : null}
                             </div>

@@ -1,7 +1,5 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
-import { onAuthStateChanged } from 'firebase/auth';
-import { auth } from '../lib/firebase-client.js';
 import { signInToWardenApp } from '../lib/auth';
 import { loadSession, restoreSession } from '../lib/session';
 
@@ -16,19 +14,20 @@ export default function LoginPage() {
   useEffect(() => {
     let cancelled = false;
 
-    const unsubscribe = onAuthStateChanged(auth, async () => {
+    async function bootstrapLoginSession() {
       const session = loadSession() || await restoreSession();
       if (cancelled) return;
-      if (session?.role) {
+      if (session?.role && session?.token) {
         router.replace('/dashboard');
         return;
       }
       setReady(true);
-    });
+    }
+
+    bootstrapLoginSession();
 
     return () => {
       cancelled = true;
-      unsubscribe();
     };
   }, [router]);
 
@@ -44,8 +43,16 @@ export default function LoginPage() {
       const code = String(signinError?.message || signinError?.code || '');
       if (code.includes('insufficient_role')) {
         setError('This account does not have warden access.');
+      } else if (code.includes('invalid_credentials')) {
+        setError('Email or password is incorrect.');
+      } else if (code.includes('network_unavailable')) {
+        setError('Network error: cannot reach sign-in services. Check connection and retry.');
+      } else if (code.includes('role_lookup_timeout')) {
+        setError('Sign-in timed out while contacting role services. Please retry.');
+      } else if (code.includes('role_lookup_failed')) {
+        setError('Sign-in succeeded but role verification failed. Please retry shortly.');
       } else {
-        setError('Sign in failed. Check your credentials and try again.');
+        setError('Sign-in failed due to a backend/service error. Please retry.');
       }
     } finally {
       setLoading(false);

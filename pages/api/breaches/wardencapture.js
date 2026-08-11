@@ -172,6 +172,18 @@ export default async function handler(req, res) {
       vehicleDetails || savedVehicleLookup,
       vrmNormalized
     );
+    if (!normalizedVehicleDetails) {
+      errors.push('vehicleDetails is required');
+    }
+
+    if (!authorization) {
+      errors.push('authorization is required');
+    }
+
+    if (errors.length > 0) {
+      console.warn(`[wardencapture] Validation failed: ${errors.join(', ')}`);
+      return res.status(400).json({ error: 'Validation failed', details: errors });
+    }
 
     const hasEntryEvidence = Boolean(
       evidence?.entry?.imageUrl || evidence?.entry?.vehicleImage || evidence?.entry?.plateImage
