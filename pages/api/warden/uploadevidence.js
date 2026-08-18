@@ -31,6 +31,9 @@ export const config = {
  *   500 { error: "..." }
  */
 export default async function handler(req, res) {
+  const MAX_UPLOAD_FILE_BYTES = 8 * 1024 * 1024;
+  const MAX_UPLOAD_TOTAL_BYTES = 40 * 1024 * 1024;
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -59,7 +62,8 @@ export default async function handler(req, res) {
     const form = formidable({
       multiples: true,
       keepExtensions: true,
-      maxFileSize: 5 * 1024 * 1024, // 5MB per file
+      maxFileSize: MAX_UPLOAD_FILE_BYTES,
+      maxTotalFileSize: MAX_UPLOAD_TOTAL_BYTES,
       filter: (part) => {
         const isImage = (part.mimetype || '').startsWith('image/');
         if (!isImage) {
@@ -71,15 +75,35 @@ export default async function handler(req, res) {
       },
     });
 
-    const [fields, files] = await new Promise((resolve, reject) => {
-      form.parse(req, (err, fields, files) => {
-        if (err) {
-          console.error('[uploadevidence] Formidable parse error:', err?.message);
-          reject(err);
-        }
-        resolve([fields, files]);
+    let fields;
+    let files;
+    try {
+      [fields, files] = await new Promise((resolve, reject) => {
+        form.parse(req, (err, parsedFields, parsedFiles) => {
+          if (err) {
+            console.error('[uploadevidence] Formidable parse error:', err?.message);
+            reject(err);
+            return;
+          }
+          resolve([parsedFields, parsedFiles]);
+        });
       });
-    });
+    } catch (parseErr) {
+      const parseMessage = String(parseErr?.message || '').toLowerCase();
+      const isTooLarge =
+        Number(parseErr?.httpCode) === 413 ||
+        Number(parseErr?.code) === 1009 ||
+        parseMessage.includes('maxtotalfilesize') ||
+        parseMessage.includes('maxfilesize') ||
+        parseMessage.includes('too large');
+
+      if (isTooLarge) {
+        return res.status(413).json({
+          error: `Evidence upload too large. Each image must be <= ${Math.floor(MAX_UPLOAD_FILE_BYTES / (1024 * 1024))}MB.`,
+        });
+      }
+      throw parseErr;
+    }
 
     // ───── VALIDATE FILES ─────
     let fileArray = files.file || [];
@@ -92,7 +116,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'No files uploaded' });
     }
 
-    const validFileArray = fileArray.filter((file) => file?.filepath && file.size <= 5 * 1024 * 1024);
+    const validFileArray = fileArray.filter((file) => file?.filepath && file.size <= MAX_UPLOAD_FILE_BYTES);
 
     if (validFileArray.length === 0) {
       fileArray.forEach((file) => {

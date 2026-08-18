@@ -419,7 +419,10 @@ export default function BreachStepper({
     const captureOnly = mode === 'capture-only';
     const evidencePhase = capturePhase === 'closing' ? 'closing' : 'entry';
     const evidenceLabel = evidencePhase === 'closing' ? 'Closing' : 'Entry';
+    const supportsManualCaptureMode = true;
     const [step, setStep] = useState(0);
+    const [captureMode, setCaptureMode] = useState(supportsManualCaptureMode ? 'scan' : 'manual');
+    const [skipCapture, setSkipCapture] = useState(false);
     const [vrm, setVrm] = useState('');
     const [capturedVrm, setCapturedVrm] = useState('');
     const [contraventionCode, setContraventionCode] = useState(contraventions[0]?.code || '');
@@ -432,7 +435,8 @@ export default function BreachStepper({
     const [livePlateBox, setLivePlateBox] = useState(null);
     const [lockFrames, setLockFrames] = useState(0);
     const [note, setNote] = useState('');
-    const fileInputRef = useRef(null);
+    const cameraInputRef = useRef(null);
+    const galleryInputRef = useRef(null);
     const liveVideoRef = useRef(null);
     const liveCanvasRef = useRef(null);
     const liveScanTimerRef = useRef(null);
@@ -448,6 +452,7 @@ export default function BreachStepper({
 
     const normalizeVrm = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     const stableCapturedVrm = normalizeVrm(vrm || capturedVrm || scanState.text);
+    const requiresOcrArtifacts = supportsManualCaptureMode && captureMode !== 'manual';
 
     const selectedContravention = useMemo(
         () => contraventions.find((c) => c.code === contraventionCode) || contraventions[0] || {},
@@ -458,6 +463,18 @@ export default function BreachStepper({
         () => sites.find((s) => String(s.id) === String(defaultSiteId)) || null,
         [sites, defaultSiteId]
     );
+
+    const selectedSiteName = useMemo(() => {
+        const preferred = String(
+            selectedSite?.displayName
+            || selectedSite?.name
+            || selectedSite?.siteName
+            || selectedSite?.location
+            || selectedSite?.title
+            || ''
+        ).trim();
+        return preferred || 'No site selected';
+    }, [selectedSite]);
 
     const defaultContraventionCode = useMemo(() => {
         if (!contraventions.length) return '';
@@ -487,6 +504,8 @@ export default function BreachStepper({
 
     function reset() {
         setStep(0);
+        setCaptureMode(supportsManualCaptureMode ? 'scan' : 'manual');
+        setSkipCapture(false);
         setVrm('');
         setCapturedVrm('');
         setContraventionCode(defaultContraventionCode || contraventions[0]?.code || '');
@@ -553,6 +572,11 @@ export default function BreachStepper({
     }, [step, liveCameraActive]);
 
     useEffect(() => {
+        if (!open) return;
+        setCaptureMode(supportsManualCaptureMode ? 'scan' : 'manual');
+    }, [open, supportsManualCaptureMode]);
+
+    useEffect(() => {
         if (!liveCameraActive || liveEngine !== 'native-preview' || typeof document === 'undefined') return undefined;
 
         // Inject a stylesheet that forces every element inside #__next (the Next.js
@@ -595,10 +619,37 @@ export default function BreachStepper({
         onClose?.();
     }
 
+    function setCaptureModeSafely(nextMode) {
+        const normalizedMode = nextMode === 'manual' ? 'manual' : 'scan';
+        if (!supportsManualCaptureMode || normalizedMode === captureMode) return;
+        if (liveCameraActive) {
+            stopLiveCamera();
+        }
+        setCaptureMode(normalizedMode);
+        setScanState({ loading: false, text: '', confidence: 0 });
+    }
+
+    function handleSkipCapture() {
+        if (liveCameraActive) {
+            stopLiveCamera();
+        }
+        setSkipCapture(true);
+        setScanState({ loading: false, text: '', confidence: 0 });
+        setStep(1);
+    }
+
+    function hasRequiredCaptureArtifacts(candidateFiles) {
+        return hasCapturePairArtifacts(candidateFiles, {
+            requireExtractedVrm: requiresOcrArtifacts,
+            requirePlateCutoff: requiresOcrArtifacts,
+            minimumImages: 1,
+        });
+    }
+
     async function appendCapturedFiles(captured, initialScanResult = null, options = {}) {
         if (!captured.length) return;
         const allowWebFallback = Boolean(options.allowWebFallback);
-        const skipOcr = Boolean(options.skipOcr) || evidencePhase === 'closing';
+        const skipOcr = Boolean(options.skipOcr);
 
         const fallbackCapturedAt = await getServerTimestamp();
         const stampedCaptured = await Promise.all(
@@ -699,20 +750,23 @@ export default function BreachStepper({
 
         setFiles((prev) => [...prev, ...nextFiles]);
         setPreviews((prev) => [...prev, ...nextPreviews]);
+        if (nextFiles.length > 0) {
+            setSkipCapture(false);
+        }
 
-        const hasPairArtifacts = evidencePhase === 'closing'
-            ? hasCapturePairArtifacts([...files, ...nextFiles], {
-                requireExtractedVrm: false,
-                requirePlateCutoff: false,
-                minimumImages: 2,
-            })
-            : hasCapturePairArtifacts(nextFiles);
+        const hasPairArtifacts = hasRequiredCaptureArtifacts(evidencePhase === 'closing'
+            ? [...files, ...nextFiles]
+            : nextFiles);
         if (!hasPairArtifacts) {
             setScanState({
                 loading: false,
                 text: evidencePhase === 'closing'
-                    ? 'Closing evidence needs at least 2 images: full vehicle and plate image.'
-                    : 'Full vehicle image captured. Plate cutout is missing - recapture plate and try again.',
+                    ? (requiresOcrArtifacts
+                        ? 'Full vehicle image captured. Plate cutout is missing - recapture plate and try again.'
+                        : 'Closing evidence captured.')
+                    : (requiresOcrArtifacts
+                        ? 'Full vehicle image captured. Plate cutout is missing - recapture plate and try again.'
+                        : 'Capture at least 1 entry evidence image.'),
                 confidence: 0,
             });
             return false;
@@ -731,7 +785,7 @@ export default function BreachStepper({
         if (!captured.length) return;
         await appendCapturedFiles(captured, null, {
             allowWebFallback: !Capacitor.isNativePlatform(),
-            skipOcr: evidencePhase === 'closing',
+            skipOcr: !requiresOcrArtifacts,
         });
     }
 
@@ -1058,15 +1112,20 @@ export default function BreachStepper({
     }
 
     function handleConfirm() {
-        if (!vrm || files.length === 0 || !hasCapturePairArtifacts(files)) {
-            setScanState({ loading: false, text: 'Capture needs full vehicle and plate cutout.', confidence: 0 });
-            setScanState({ loading: false, text: 'Capture needs full vehicle, plate cutout, and VRM text.', confidence: 0 });
+        if (!vrm || (!skipCapture && (files.length === 0 || !hasRequiredCaptureArtifacts(files)))) {
+            setScanState({
+                loading: false,
+                text: requiresOcrArtifacts
+                    ? 'Capture needs full vehicle, plate cutout, and VRM text.'
+                    : 'Capture at least 1 entry image, then enter VRM manually.',
+                confidence: 0,
+            });
             return;
         }
         onComplete?.({
             vrm: normalizeVrm(vrm),
             siteId: defaultSiteId,
-            siteName: selectedSite?.displayName || selectedSite?.name || selectedSite?.location || defaultSiteId || 'Site not set',
+            siteName: selectedSiteName,
             contraventionCode,
             contraventionLabel: getContraventionSelectionLabel(selectedContravention),
             observationMinutes,
@@ -1077,26 +1136,26 @@ export default function BreachStepper({
                 cutoffImage: String(files?.[0]?.detectedPlateCutoffImage || ''),
                 bbox: files?.[0]?.detectedPlateBbox || null,
             },
+            captureMode,
+            skippedCapture: skipCapture,
             note,
         });
         reset();
     }
 
     function handleCaptureOnlyComplete() {
-        const hasCaptureArtifacts = evidencePhase === 'closing'
-            ? hasCapturePairArtifacts(files, {
-                requireExtractedVrm: false,
-                requirePlateCutoff: false,
-                minimumImages: 2,
-            })
-            : hasCapturePairArtifacts(files);
+        const hasCaptureArtifacts = hasRequiredCaptureArtifacts(files);
 
         if (!files.length || !hasCaptureArtifacts) {
             setScanState({
                 loading: false,
                 text: evidencePhase === 'closing'
-                    ? 'Closing evidence needs at least 2 images: full vehicle and plate image.'
-                    : 'Capture needs full vehicle, plate cutout, and VRM text.',
+                    ? (requiresOcrArtifacts
+                        ? 'Capture needs full vehicle, plate cutout, and VRM text.'
+                        : 'Capture at least 1 closing evidence image.')
+                    : (requiresOcrArtifacts
+                        ? 'Capture needs full vehicle, plate cutout, and VRM text.'
+                        : 'Capture at least 1 entry evidence image.'),
                 confidence: 0,
             });
             return;
@@ -1105,6 +1164,7 @@ export default function BreachStepper({
             phase: evidencePhase,
             files,
             previews,
+            captureMode,
             scan: {
                 plateText: stableCapturedVrm,
                 confidence: Number(scanState.confidence || 0),
@@ -1116,20 +1176,50 @@ export default function BreachStepper({
     }
 
     function openCamera() {
-        fileInputRef.current?.click();
+        cameraInputRef.current?.click();
+    }
+
+    function openGallery() {
+        galleryInputRef.current?.click();
+    }
+
+    function handleDeleteCapturedImage(index) {
+        const targetIndex = Math.max(0, Number(index) || 0);
+        if (!files.length || targetIndex >= files.length) return;
+
+        const nextFiles = files.filter((_, fileIndex) => fileIndex !== targetIndex);
+        const nextPreviews = previews.filter((_, previewIndex) => previewIndex !== targetIndex);
+        setFiles(nextFiles);
+        setPreviews(nextPreviews);
+
+        if (!nextFiles.length) {
+            setCapturedVrm('');
+            setScanState({ loading: false, text: '', confidence: 0 });
+            return;
+        }
+
+        const nextDetected = nextFiles.find((file) => Boolean(normalizeVrm(file?.detectedPlateText || ''))) || null;
+        const nextDetectedVrm = normalizeVrm(nextDetected?.detectedPlateText || '');
+        if (nextDetectedVrm) {
+            setCapturedVrm(nextDetectedVrm);
+            setScanState({
+                loading: false,
+                text: nextDetectedVrm,
+                confidence: Number(nextDetected?.detectedPlateConfidence || 0),
+            });
+            return;
+        }
+
+        setCapturedVrm('');
+        setScanState({ loading: false, text: '', confidence: 0 });
     }
 
     // Step validations
-    const hasCapturePair = evidencePhase === 'closing'
-        ? hasCapturePairArtifacts(files, {
-            requireExtractedVrm: false,
-            requirePlateCutoff: false,
-            minimumImages: 2,
-        })
-        : hasCapturePairArtifacts(files);
+    const hasCapturePair = skipCapture ? true : hasRequiredCaptureArtifacts(files);
+    const hasContraventionChoice = Boolean(String(contraventionCode || '').trim());
     const canAdvanceFromCapture = Boolean(files.length > 0);
-    const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && files.length > 0 && hasCapturePair);
-    const canConfirm = Boolean(normalizeVrm(vrm) && files.length > 0 && hasCapturePair);
+    const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && hasContraventionChoice && (skipCapture || (files.length > 0 && hasCapturePair)));
+    const canConfirm = Boolean(normalizeVrm(vrm) && hasContraventionChoice && (skipCapture || (files.length > 0 && hasCapturePair)));
 
     if (!open) return null;
 
@@ -1239,7 +1329,7 @@ export default function BreachStepper({
                 >
                     <div style={{ flex: 1, color: '#fff', fontSize: 12, lineHeight: 1.4 }}>
                         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 2 }}>
-                            {selectedSite?.displayName || selectedSite?.name || selectedSite?.location || defaultSiteId}
+                            {selectedSiteName}
                         </div>
                         {scanState.text ? (
                             <div>Detected: {scanState.text} ({Math.round(scanState.confidence)}%)</div>
@@ -1295,7 +1385,7 @@ export default function BreachStepper({
 
                 {/* Hidden file input */}
                 <input
-                    ref={fileInputRef}
+                    ref={cameraInputRef}
                     type="file"
                     accept="image/*"
                     capture="environment"
@@ -1304,33 +1394,87 @@ export default function BreachStepper({
                     className="file-input"
                 />
 
+                <input
+                    ref={galleryInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    onChange={handleFileCapture}
+                    className="file-input"
+                />
+
                 {/* Step 0: Entry evidence capture first */}
                 {step === 0 ? (
                     <div className="stepper-step">
-                        <p className="stepper-step-label">Step 1 — Capture full {evidenceLabel.toLowerCase()} evidence image</p>
+                        <p className="stepper-step-label">Step 1 — Capture {evidenceLabel.toLowerCase()} evidence image</p>
+                        {supportsManualCaptureMode ? (
+                            <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                                <button
+                                    type="button"
+                                    className={captureMode === 'scan' ? 'primary-button' : 'secondary-button'}
+                                    onClick={() => setCaptureModeSafely('scan')}
+                                >
+                                    OCR scan
+                                </button>
+                                <button
+                                    type="button"
+                                    className={captureMode === 'manual' ? 'primary-button' : 'secondary-button'}
+                                    onClick={() => setCaptureModeSafely('manual')}
+                                >
+                                    Manual capture
+                                </button>
+                            </div>
+                        ) : null}
                         <div className="stepper-fixed-site">
                             <span className="stepper-fixed-site-label">Patrol site</span>
                             <strong className="stepper-fixed-site-value">
-                                {selectedSite?.displayName || selectedSite?.name || selectedSite?.location || defaultSiteId || 'No site selected'}
+                                {selectedSiteName}
                             </strong>
                         </div>
 
                         {previews.length > 0 ? (
                             <div className="stepper-preview-grid">
                                 {previews.map((p, i) => (
-                                    <img key={i} src={p} alt={`Entry evidence ${i + 1}`} className="stepper-preview-img" />
+                                    <div key={i} className="stepper-preview-tile">
+                                        <img src={p} alt={`Entry evidence ${i + 1}`} className="stepper-preview-img" />
+                                        <button
+                                            type="button"
+                                            className="stepper-preview-remove"
+                                            onClick={() => handleDeleteCapturedImage(i)}
+                                            title="Delete image"
+                                        >
+                                            Remove image
+                                        </button>
+                                    </div>
                                 ))}
                             </div>
                         ) : (
                             <div className="stepper-capture-prompt">
                                 <span className="stepper-capture-icon">📸</span>
-                                <p>Tap the button below to start live ANPR scanning</p>
-                                <p className="text-muted">Camera opens full-screen — plate locks automatically</p>
+                                {requiresOcrArtifacts ? (
+                                    <>
+                                        <p>Use OCR scan mode to auto-capture the plate and evidence.</p>
+                                        <p className="text-muted">Switch to Manual capture tab if OCR is not suitable.</p>
+                                    </>
+                                ) : (
+                                    <>
+                                        <p>Tap the button below to upload images from gallery.</p>
+                                        <p className="text-muted">Use circumstantial images when no clear plate is available.</p>
+                                        <button
+                                            type="button"
+                                            className="ghost-button"
+                                            onClick={openGallery}
+                                            style={{ marginTop: 6 }}
+                                        >
+                                            Upload from gallery
+                                        </button>
+                                    </>
+                                )}
                             </div>
                         )}
 
                         {scanState.loading ? <div className="text-muted">Scanning image for VRM...</div> : null}
-                        {!scanState.loading && files.length > 0 && !hasCapturePair ? (
+                        {!scanState.loading && files.length > 0 && !hasCapturePair && evidencePhase !== 'closing' && requiresOcrArtifacts ? (
                             <div className="text-muted" style={{ color: '#ffbf47' }}>
                                 Full vehicle captured. Plate cutout missing - recapture plate to continue.
                             </div>
@@ -1339,13 +1483,33 @@ export default function BreachStepper({
                         <div className="stepper-nav">
                             <button type="button" className="ghost-button" onClick={handleClose}>Cancel</button>
                             <div className="stepper-nav-actions">
-                                <button
-                                    type="button"
-                                    className="secondary-button"
-                                    onClick={liveCameraActive ? stopLiveCamera : startLiveCamera}
-                                >
-                                    {liveCameraActive ? 'Stop scan image' : 'Scan image'}
-                                </button>
+                                {requiresOcrArtifacts ? (
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={liveCameraActive ? stopLiveCamera : startLiveCamera}
+                                    >
+                                        {liveCameraActive ? 'Stop scan image' : 'Scan image'}
+                                    </button>
+                                ) : null}
+                                {!requiresOcrArtifacts ? (
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={openCamera}
+                                    >
+                                        Capture image
+                                    </button>
+                                ) : null}
+                                {!captureOnly && evidencePhase === 'entry' ? (
+                                    <button
+                                        type="button"
+                                        className="ghost-button"
+                                        onClick={handleSkipCapture}
+                                    >
+                                        Skip image capture
+                                    </button>
+                                ) : null}
                                 {canAdvanceFromCapture ? (
                                     <button
                                         type="button"
@@ -1355,7 +1519,9 @@ export default function BreachStepper({
                                     >
                                         {hasCapturePair
                                             ? (captureOnly ? `Use ${evidenceLabel.toLowerCase()} evidence` : 'Next — Vehicle details →')
-                                            : 'Need plate cutout to continue'}
+                                            : (evidencePhase === 'closing'
+                                                ? (requiresOcrArtifacts ? 'Need plate cutout to continue' : 'Need closing evidence image')
+                                                : (requiresOcrArtifacts ? 'Need plate cutout to continue' : 'Need entry evidence image'))}
                                     </button>
                                 ) : null}
                             </div>
@@ -1381,6 +1547,9 @@ export default function BreachStepper({
                         <label className="stepper-field">
                             <span className="stepper-field-label">Contravention</span>
                             <select className="stepper-select" value={contraventionCode} onChange={(e) => { setContraventionCode(e.target.value); setContraventionTouched(true); }}>
+                                {!contraventions.length ? (
+                                    <option value="">No enabled contraventions for this site</option>
+                                ) : null}
                                 {contraventions.map((c, index) => (
                                     <option key={c.code || `contravention-${index + 1}`} value={c.code || ''}>{getContraventionSelectionLabel(c)}</option>
                                 ))}
@@ -1407,7 +1576,9 @@ export default function BreachStepper({
                                     onClick={() => setStep(2)}
                                     disabled={!canAdvanceFromVrm}
                                 >
-                                    {canAdvanceFromVrm ? 'Next — Confirm →' : 'Enter VRM to continue'}
+                                    {canAdvanceFromVrm
+                                        ? 'Next — Confirm →'
+                                        : (hasContraventionChoice ? 'Enter VRM to continue' : 'Select site contravention to continue')}
                                 </button>
                             </div>
                         </div>
@@ -1426,7 +1597,7 @@ export default function BreachStepper({
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Site</span>
-                                <span className="stepper-summary-val">{selectedSite?.displayName || selectedSite?.name || defaultSiteId}</span>
+                                <span className="stepper-summary-val">{selectedSiteName}</span>
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Contravention</span>
@@ -1441,9 +1612,19 @@ export default function BreachStepper({
                                 <span className="stepper-summary-val">{files.length} image{files.length !== 1 ? 's' : ''}</span>
                             </div>
                             {previews.length > 0 ? (
-                                <div className="stepper-preview-grid" style={{ marginTop: 8 }}>
+                                <div className="stepper-preview-grid stepper-preview-grid--compact">
                                     {previews.slice(0, 3).map((p, i) => (
-                                        <img key={i} src={p} alt={`Preview ${i + 1}`} className="stepper-preview-img" style={{ maxHeight: 100 }} />
+                                        <div key={i} className="stepper-preview-tile">
+                                            <img src={p} alt={`Preview ${i + 1}`} className="stepper-preview-img stepper-preview-img--compact" />
+                                            <button
+                                                type="button"
+                                                className="stepper-preview-remove"
+                                                onClick={() => handleDeleteCapturedImage(i)}
+                                                title="Delete image"
+                                            >
+                                                Remove image
+                                            </button>
+                                        </div>
                                     ))}
                                 </div>
                             ) : null}

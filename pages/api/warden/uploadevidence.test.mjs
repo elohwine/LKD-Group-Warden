@@ -114,7 +114,7 @@ describe('POST /api/warden/uploadevidence', () => {
               {
                 originalFilename: 'large.jpg',
                 mimetype: 'image/jpeg',
-                size: 6 * 1024 * 1024, // 6MB
+                size: 10 * 1024 * 1024, // 10MB
                 filepath: '/tmp/large.jpg',
               },
             ],

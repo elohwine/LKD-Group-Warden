@@ -177,6 +177,9 @@ print_step "Validating camera service API base URL..."
 validate_camera_service_base
 echo -e "${GREEN}Using NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL=${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL}${NC}"
 
+export NEXT_PUBLIC_DEMO_MODE="${NEXT_PUBLIC_DEMO_MODE:-true}"
+echo -e "${GREEN}Using NEXT_PUBLIC_DEMO_MODE=${NEXT_PUBLIC_DEMO_MODE}${NC}"
+
 print_step "APK API preflight summary..."
 print_preflight_api_targets
 

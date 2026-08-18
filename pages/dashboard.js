@@ -16,6 +16,7 @@ import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
 import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
 import { formatLocalTimestamp } from '../lib/ukTimestamp';
+import { isLikelyCurrentUkVrm, normalizeUkVrmFromOcr, scoreUkVrmCandidate } from '../lib/ukVrmOcr.mjs';
 import { getServerTimestamp, syncWithServerTime } from '../lib/timeSync';
 import { getBillableMinutes } from '../lib/duration';
 import { buildVehicleDetailsRecord } from '../lib/vehicleDetails';
@@ -26,6 +27,7 @@ import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
 import BreachStepper from '../components/BreachStepper';
 import PcnPreviewDialog from '../components/PcnPreviewDialog';
+import { buildDemoSites, isDemoModeEnabled } from '../lib/demoMode';
 
 function formatElapsed(startIso, endIso = '') {
   const startMs = new Date(startIso || '').getTime();
@@ -42,6 +44,13 @@ function formatElapsed(startIso, endIso = '') {
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
   }
 
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatRemaining(secondsRemaining) {
+  const totalSeconds = Math.max(0, Math.floor(Number(secondsRemaining) || 0));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
@@ -256,6 +265,144 @@ function normalizeVrm(value) {
   return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
+const CONFUSABLE_VRM_PAIRS = new Set([
+  '0O', 'O0',
+  '1I', 'I1',
+  '1L', 'L1',
+  '2Z', 'Z2',
+  '5S', 'S5',
+  '8B', 'B8',
+]);
+
+function substitutionCost(leftChar, rightChar) {
+  if (leftChar === rightChar) return 0;
+  if (CONFUSABLE_VRM_PAIRS.has(`${leftChar}${rightChar}`)) return 0.35;
+  return 1;
+}
+
+function weightedEditDistance(left, right) {
+  const a = String(left || '');
+  const b = String(right || '');
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const dp = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+  for (let i = 0; i < rows; i += 1) dp[i][0] = i;
+  for (let j = 0; j < cols; j += 1) dp[0][j] = j;
+
+  for (let i = 1; i < rows; i += 1) {
+    for (let j = 1; j < cols; j += 1) {
+      const subCost = substitutionCost(a[i - 1], b[j - 1]);
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + subCost,
+      );
+    }
+  }
+
+  return dp[rows - 1][cols - 1];
+}
+
+function vrmSimilarityPercent(left, right) {
+  const a = normalizeVrm(left);
+  const b = normalizeVrm(right);
+  if (!a || !b) return 0;
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 0;
+  const distance = weightedEditDistance(a, b);
+  const similarity = Math.max(0, 1 - (distance / maxLen));
+  return Math.round(similarity * 100);
+}
+
+function collectAuthorizationVrmCandidates(payload, options = {}) {
+  const minLen = Number(options.minLen || 5);
+  const maxLen = Number(options.maxLen || 8);
+  const candidates = new Set();
+  const seen = new Set();
+  const queue = [payload];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) continue;
+
+    if (typeof current === 'string') {
+      const normalized = normalizeVrm(current);
+      if (normalized.length >= minLen && normalized.length <= maxLen) {
+        candidates.add(normalized);
+      }
+      continue;
+    }
+
+    if (Array.isArray(current)) {
+      current.forEach((item) => queue.push(item));
+      continue;
+    }
+
+    if (typeof current !== 'object') continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+
+    Object.entries(current).forEach(([key, value]) => {
+      const normalizedKey = String(key || '').toLowerCase();
+      if (typeof value === 'string' && /vrm|reg|registration|plate|vehicle/i.test(normalizedKey)) {
+        const normalizedValue = normalizeVrm(value);
+        if (normalizedValue.length >= minLen && normalizedValue.length <= maxLen) {
+          candidates.add(normalizedValue);
+        }
+      }
+
+      if (value && (typeof value === 'object' || Array.isArray(value))) {
+        queue.push(value);
+      }
+    });
+  }
+
+  return Array.from(candidates);
+}
+
+function withAuthorizationMatchConfidence(result, inputVrm) {
+  if (!result || typeof result !== 'object') return result;
+
+  const targetVrm = normalizeVrm(inputVrm);
+  if (!targetVrm) return result;
+
+  const hasAuthorization = Boolean(result?.hasAuthorization);
+  const candidateVrmsRaw = collectAuthorizationVrmCandidates(result);
+  const candidateVrms = hasAuthorization
+    ? candidateVrmsRaw
+    : candidateVrmsRaw.filter((candidate) => candidate !== targetVrm);
+  if (candidateVrms.length === 0) {
+    return {
+      ...result,
+      matchConfidence: {
+        targetVrm,
+        bestVrm: '',
+        scorePercent: 0,
+        comparedCount: 0,
+      },
+    };
+  }
+
+  let best = { vrm: '', scorePercent: 0 };
+  for (const candidate of candidateVrms) {
+    const scorePercent = vrmSimilarityPercent(targetVrm, candidate);
+    if (scorePercent > best.scorePercent) {
+      best = { vrm: candidate, scorePercent };
+    }
+  }
+
+  return {
+    ...result,
+    matchConfidence: {
+      targetVrm,
+      bestVrm: best.vrm,
+      scorePercent: Number(best.scorePercent || 0),
+      comparedCount: candidateVrms.length,
+    },
+  };
+}
+
 let ocrWorkerPromise = null;
 const TESSERACT_WORKER_PATH = 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/worker.min.js';
 
@@ -281,10 +428,6 @@ async function getOcrWorker() {
   }
 
   return ocrWorkerPromise;
-}
-
-function isLikelyUkVrm(value) {
-  return /^[A-Z]{2}[0-9]{2}[A-Z]{3}$/.test(value);
 }
 
 function normalizeBboxForImage(rawBbox, imageWidth, imageHeight) {
@@ -360,6 +503,8 @@ function buildPlateCandidatesFromWords(words) {
         .replace(/[^A-Z0-9]/g, '');
 
       if (!raw || raw.length < 5 || raw.length > 8) return;
+      const normalized = normalizeUkVrmFromOcr(raw);
+      if (!normalized) return;
 
       const confidences = parts
         .map((part) => Number(part?.confidence || 0))
@@ -381,12 +526,13 @@ function buildPlateCandidatesFromWords(words) {
         y1: Math.max(...boxes.map((box) => box.y1)),
       };
 
-      const formatBonus = isLikelyUkVrm(raw) ? 100 : 0;
-      const lengthPenalty = Math.abs(raw.length - 7) * 2;
-      const score = formatBonus + avgConfidence - lengthPenalty;
+      const ukFormatBonus = isLikelyCurrentUkVrm(normalized) ? 60 : 0;
+      const modelScore = scoreUkVrmCandidate(normalized);
+      const lengthPenalty = Math.abs(normalized.length - 7) * 2;
+      const score = modelScore + ukFormatBonus + avgConfidence - lengthPenalty;
 
       candidates.push({
-        text: raw,
+        text: normalized,
         confidence: avgConfidence,
         score,
         bbox,
@@ -490,7 +636,7 @@ async function scanPlateFromImage(file) {
       }
     }
     return {
-      plateText: normalizeVrm(best.text),
+      plateText: normalizeUkVrmFromOcr(best.text),
       confidence: Number(best.confidence || 0),
       cutoffImage,
       bbox: best.bbox,
@@ -1028,6 +1174,7 @@ export default function DashboardPage() {
   const [entryFiles, setEntryFiles] = useState([]);
   const [entryPreviews, setEntryPreviews] = useState([]);
   const [entryCapturedAt, setEntryCapturedAt] = useState('');
+  const [entryCaptureMode, setEntryCaptureMode] = useState('scan');
   const [closingFiles, setClosingFiles] = useState([]);
   const [closingPreviews, setClosingPreviews] = useState([]);
   const [closingCapturedAt, setClosingCapturedAt] = useState('');
@@ -1074,6 +1221,7 @@ export default function DashboardPage() {
   const [pcnReasonInput, setPcnReasonInput] = useState('No valid permit or payment found');
   const [monitoringSessionActive, setMonitoringSessionActive] = useState(false);
   const [monitoringSessionStartedAt, setMonitoringSessionStartedAt] = useState('');
+  const [demoAlarmAcknowledged, setDemoAlarmAcknowledged] = useState(false);
   const [cameraRawViewMode, setCameraRawViewMode] = useState('grid');
   const [cameraRawVrmQuery, setCameraRawVrmQuery] = useState('');
   const [cameraRawSiteFilter, setCameraRawSiteFilter] = useState('all');
@@ -1092,11 +1240,11 @@ export default function DashboardPage() {
     embeddedCapturedAt: '',
     dimensions: null,
     error: '',
+    imageIndex: -1,
+    allowDelete: false,
   });
-  const fileInputRef = useRef(null);
   const qrFileInputRef = useRef(null);
   const authReadyRef = useRef(false);
-  const capturePhaseRef = useRef('entry');
   const pcnAutoCheckSignatureRef = useRef('');
 
   async function resolveAuthToken({ forceRefresh = false } = {}) {
@@ -1164,6 +1312,14 @@ export default function DashboardPage() {
     });
   }, [mobileCameras]);
   const contraventions = useMemo(() => getContraventionOptions(selectedSite), [selectedSite]);
+  const selectedContravention = useMemo(
+    () => contraventions.find((item) => String(item?.code || '') === String(selectedContraventionCode || '')) || null,
+    [contraventions, selectedContraventionCode]
+  );
+  const selectedObservationMinutes = useMemo(
+    () => normalizeObservationMinutes(selectedContravention?.defaultObservationMinutes ?? manualObservationMinutes ?? 0),
+    [manualObservationMinutes, selectedContravention]
+  );
   const activeTimers = useMemo(() => {
     return queueItems
       .filter((item) => {
@@ -1175,15 +1331,27 @@ export default function DashboardPage() {
         if (status === 'submitted' || status === 'synced') return false;
         return Boolean(item?.payload?.observationStartTime || item?.payload?.entryCapturedAt) && !exitCaptured;
       })
-      .map((item) => ({
-        id: item.id,
-        vrm: item.payload.vrm,
-        reason: item.payload.contraventionReason,
-        startsAt: item.payload.observationStartTime || item.payload.entryCapturedAt,
-        requiredMinutes: 0,
-        siteName: item.payload.siteName || selectedSite?.name || 'Site'
-      }));
-  }, [queueItems, selectedSite?.name]);
+      .map((item) => {
+        const startsAt = item.payload.observationStartTime || item.payload.entryCapturedAt || '';
+        const requiredMinutes = normalizeObservationMinutes(
+          item.payload.expectedObservationMinutes || item.payload.requiredObservationMinutes || item.payload.observationMinutes
+        );
+        const startMs = new Date(startsAt).getTime();
+        const remainingSeconds = requiredMinutes > 0 && Number.isFinite(startMs) && startMs > 0
+          ? Math.max(0, Math.ceil((requiredMinutes * 60) - ((Date.now() - startMs) / 1000)))
+          : 0;
+
+        return {
+          id: item.id,
+          vrm: item.payload.vrm,
+          reason: item.payload.contraventionReason,
+          startsAt,
+          requiredMinutes,
+          remainingSeconds,
+          siteName: item.payload.siteName || selectedSite?.name || 'Site'
+        };
+      });
+  }, [queueItems, selectedSite?.name, ticks]);
   const hasEntryEvidence = entryFiles.length > 0;
   const hasClosingEvidence = closingFiles.length > 0;
   const canRunImageAnalysis = hasEntryEvidence || hasClosingEvidence;
@@ -1204,11 +1372,20 @@ export default function DashboardPage() {
         Boolean(item?.payload?.closingCapturedAt) ||
         lifecycle.code === 'CONVERTED';
       const isOpen = lifecycle.code === 'DRAFT_OPEN' && !hasExitEvidence;
+      const requiredMinutes = normalizeObservationMinutes(
+        item?.payload?.expectedObservationMinutes ||
+        item?.payload?.requiredObservationMinutes ||
+        item?.payload?.observationMinutes ||
+        0
+      );
+      const startMs = new Date(observationStartTime).getTime();
       const elapsedMinutes = observationStartTime
         ? Math.max(0, diffMinutes(observationStartTime, hasExitEvidence ? observationEndTime : new Date().toISOString()))
         : 0;
-      const requiredMinutes = 0;
-      const isPastRequired = false;
+      const remainingSeconds = observationStartTime && requiredMinutes > 0 && isOpen && Number.isFinite(startMs) && startMs > 0
+        ? Math.max(0, Math.ceil((requiredMinutes * 60) - ((Date.now() - startMs) / 1000)))
+        : 0;
+      const isPastRequired = requiredMinutes > 0 ? remainingSeconds <= 0 : false;
       return {
         id: item.id,
         createdAt: item.createdAt,
@@ -1224,6 +1401,7 @@ export default function DashboardPage() {
         isOpen,
         elapsedMinutes,
         requiredMinutes,
+        remainingSeconds,
         isPastRequired,
         payload: item.payload || {},
         files: Array.isArray(item.files) ? item.files : [],
@@ -1244,10 +1422,18 @@ export default function DashboardPage() {
   );
   const selectedLifecycleCode = selectedTracked?.lifecycle?.code || '';
   const selectedConvertedToPcn = selectedLifecycleCode === 'CONVERTED';
+  const demoObservationExpired = isDemoModeEnabled() && trackedBreaches.some((item) => item.isOpen && item.requiredMinutes > 0 && item.remainingSeconds <= 0);
+  const canProceedWithPcnActions = !demoObservationExpired || demoAlarmAcknowledged;
   const canIssuePcnFromCurrentState = !selectedConvertedToPcn && (
     canFinalizeBreach ||
     (selectedLifecycleCode === 'SUBMITTED' && Boolean(selectedTracked?.payload?.breachId))
   );
+
+  useEffect(() => {
+    if (!demoObservationExpired) {
+      setDemoAlarmAcknowledged(false);
+    }
+  }, [demoObservationExpired]);
   const selectedTrackedVehicleLookup = useMemo(() => {
     const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm);
     if (!trackedVrm) return null;
@@ -1435,6 +1621,19 @@ export default function DashboardPage() {
       paymentStatus,
     };
   }, [selectedTracked, selectedTrackedAuthorization, entryFiles, closingFiles]);
+  const detailMessageLooksLikeCheckStatus = useMemo(() => {
+    const text = String(detailMessage || '').toLowerCase();
+    if (!text) return false;
+    return text.includes('carcheck')
+      || text.includes('e-permit')
+      || text.includes('permit check')
+      || text.includes('checks refreshed');
+  }, [detailMessage]);
+  const hideDetailMessageForClosedSession = useMemo(() => {
+    const lifecycleCode = String(selectedTracked?.lifecycle?.code || '').toUpperCase();
+    const isClosedLifecycle = lifecycleCode === 'SUBMITTED' || lifecycleCode === 'CONVERTED';
+    return Boolean(isClosedLifecycle && detailMessageLooksLikeCheckStatus);
+  }, [selectedTracked, detailMessageLooksLikeCheckStatus]);
   const cameraRawFeed = useMemo(() => {
     const feed = [];
 
@@ -1713,15 +1912,25 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    const contravention = contraventions.find((item) => item.code === selectedContraventionCode);
-    if (contravention) {
-      setSelectedReason(contravention.label);
-      setManualObservationMinutes(Number(contravention.defaultObservationMinutes ?? 0));
-    } else if (!selectedReason && contraventions[0]) {
-      setSelectedReason(contraventions[0].label || '');
-      setManualObservationMinutes(Number(contraventions[0].defaultObservationMinutes ?? 0));
+    if (!contraventions.length) {
+      setSelectedContraventionCode('');
+      setSelectedReason('');
+      setManualObservationMinutes(0);
+      return;
     }
-  }, [contraventions, selectedContraventionCode, selectedReason]);
+
+    if (selectedContravention) {
+      setSelectedReason(String(selectedContravention.label || '').trim());
+      setManualObservationMinutes(Number(selectedContravention.defaultObservationMinutes ?? 0));
+      return;
+    }
+
+    const fallback = contraventions[0] || null;
+    const fallbackCode = String(fallback?.code || '').trim();
+    setSelectedContraventionCode(fallbackCode);
+    setSelectedReason(String(fallback?.label || '').trim());
+    setManualObservationMinutes(Number(fallback?.defaultObservationMinutes ?? 0));
+  }, [contraventions, selectedContravention]);
 
   useEffect(() => {
     const nextReason = String(selectedReason || '').trim();
@@ -1738,6 +1947,20 @@ export default function DashboardPage() {
       saveStoredSiteId(selectedSiteId);
     }
   }, [selectedSiteId]);
+
+  useEffect(() => {
+    if (!isDemoModeEnabled()) return;
+    if (!Array.isArray(sites) || sites.length === 0) return;
+
+    const hasSelectedDemoSite = Boolean(selectedSite && sites.some((site) => String(site.id) === String(selectedSite?.id || '')));
+    if (hasSelectedDemoSite) return;
+
+    const firstDemoSite = sites[0];
+    if (!firstDemoSite?.id) return;
+
+    setSelectedSiteId(firstDemoSite.id);
+    saveStoredSiteId(firstDemoSite.id);
+  }, [selectedSiteId, sites]);
 
   useEffect(() => {
     if (selectedMobileCameraId) {
@@ -1801,6 +2024,24 @@ export default function DashboardPage() {
   }, [selectedTrackedId]);
 
   useEffect(() => {
+    if (activeTab !== 'tracked') return;
+    if (!selectedTrackedId) return;
+
+    const lifecycleCode = String(selectedTracked?.lifecycle?.code || '').toUpperCase();
+    const isClosedLifecycle = lifecycleCode === 'SUBMITTED' || lifecycleCode === 'CONVERTED';
+    if (!isClosedLifecycle) return;
+
+    setDetailMessage((current) => {
+      const text = String(current || '').toLowerCase();
+      const isCheckStatus = text.includes('carcheck')
+        || text.includes('e-permit')
+        || text.includes('permit check')
+        || text.includes('checks refreshed');
+      return isCheckStatus ? '' : current;
+    });
+  }, [activeTab, selectedTrackedId, selectedTracked]);
+
+  useEffect(() => {
     if (typeof window === 'undefined') return;
     const storedTheme = window.localStorage.getItem('warden-theme');
     const preferDark = storedTheme !== 'light';
@@ -1850,6 +2091,14 @@ export default function DashboardPage() {
   }, [selectedVrm, vehicleLookupByVrm]);
 
   async function loadSites(token) {
+    if (isDemoModeEnabled()) {
+      // const data = await fetchJson('/api/sites?forceAdmin=true', { token });
+      const nextSites = buildDemoSites();
+      const activeSites = nextSites.filter((site) => site.active !== false && site.isActive !== false);
+      setSites(activeSites);
+      return;
+    }
+
     const data = await fetchJson('/api/sites?forceAdmin=true', { token });
     const nextSites = Array.isArray(data?.sites) ? data.sites : [];
     const activeSites = nextSites.filter((site) => site.active !== false && site.isActive !== false);
@@ -2038,14 +2287,8 @@ export default function DashboardPage() {
 
   function openCaptureDialog(phase) {
     const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
-    if (selectedTrackedId) {
-      setCaptureStepperPhase(normalizedPhase);
-      setCaptureStepperOpen(true);
-      return;
-    }
-
-    capturePhaseRef.current = normalizedPhase;
-    fileInputRef.current?.click();
+    setCaptureStepperPhase(normalizedPhase);
+    setCaptureStepperOpen(true);
   }
 
   function closeImageDetailDialog() {
@@ -2054,6 +2297,16 @@ export default function DashboardPage() {
 
   function toggleImageDetailFullscreen() {
     setImageDetailDialog((current) => ({ ...current, fullscreen: !current.fullscreen }));
+  }
+
+  async function handleDeleteFromImageDetail() {
+    const phase = imageDetailDialog?.phase === 'closing' ? 'closing' : 'entry';
+    const imageIndex = Number(imageDetailDialog?.imageIndex);
+    const allowDelete = Boolean(imageDetailDialog?.allowDelete);
+    if (!allowDelete || !Number.isInteger(imageIndex) || imageIndex < 0) return;
+
+    closeImageDetailDialog();
+    await handleDeleteEvidenceImage(phase, imageIndex);
   }
 
   async function openImageDetailDialog({
@@ -2067,6 +2320,8 @@ export default function DashboardPage() {
     mimeType = '',
     sizeBytes = 0,
     record = null,
+    imageIndex = -1,
+    allowDelete = false,
   } = {}) {
     const imageSrc = String(src || '').trim();
     if (!imageSrc) return;
@@ -2086,6 +2341,8 @@ export default function DashboardPage() {
       embeddedCapturedAt: '',
       dimensions: null,
       error: '',
+      imageIndex: Number.isInteger(Number(imageIndex)) ? Number(imageIndex) : -1,
+      allowDelete: Boolean(allowDelete),
     });
 
     try {
@@ -2111,285 +2368,11 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleFileSelection(event) {
-    const rawFiles = Array.from(event.target.files || []);
-    const fallbackCapturedAt = await getServerTimestamp();
-    const phase = capturePhaseRef.current === 'closing' ? 'closing' : 'entry';
-    const isClosingCapture = phase === 'closing';
-    const nextFiles = await Promise.all(
-      rawFiles.map(async (file) => {
-        const capturedAt = await resolveCameraCaptureTimestamp(file, fallbackCapturedAt);
-        const stamped = await stampEvidenceImage(file, { capturedAt, phase });
-        stamped.capturedAt = capturedAt;
-        return stamped;
-      })
-    );
-    const capturedAt = normalizeCapturedAt(nextFiles[0]?.capturedAt) || fallbackCapturedAt;
-    const nextPreviews = await toPreviewSrcList(nextFiles);
-    let nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase, capturedAt });
-    let plateScanResult = null;
-
-    if (nextFiles.length > 0 && !isClosingCapture) {
-      plateScanResult = await scanPlateFromImage(nextFiles[0]);
-      if (plateScanResult?.plateText && !plateScanResult?.cutoffImage) {
-        try {
-          const fallbackScan = await scanPlateFromImage(nextFiles[0]);
-          if (fallbackScan?.cutoffImage) {
-            plateScanResult = {
-              ...plateScanResult,
-              cutoffImage: fallbackScan.cutoffImage,
-              bbox: plateScanResult?.bbox || fallbackScan?.bbox || null,
-            };
-          }
-        } catch (_) {
-          // Validation below determines whether capture can be committed.
-        }
-      }
-
-      if (plateScanResult?.plateText && !plateScanResult?.cutoffImage) {
-        setMessage('Plate text detected but plate image could not be extracted. Reframe plate and capture again.');
-        event.target.value = '';
-        return;
-      }
-
-      if (plateScanResult?.cutoffImage) {
-        const cutoffFile = dataUrlToFile(
-          plateScanResult.cutoffImage,
-          `plate_cutoff_${phase}_${Date.now()}.jpg`
-        );
-        if (cutoffFile) {
-          cutoffFile.capturedAt = capturedAt;
-          nextFiles.push(cutoffFile);
-        }
-      }
-
-      if (!hasCapturePairArtifacts(nextFiles)) {
-        setMessage('Capture requires 2 images: full vehicle and plate cutout. Reframe plate and capture again.');
-        event.target.value = '';
-        return;
-      }
-
-      const refreshedPreviews = await toPreviewSrcList(nextFiles);
-      nextPreviews.splice(0, nextPreviews.length, ...refreshedPreviews);
-      if (nextFiles[0]) {
-        nextFiles[0].detectedPlateText = normalizeVrm(plateScanResult?.plateText || '');
-        nextFiles[0].detectedPlateCutoffImage = plateScanResult?.cutoffImage || '';
-        nextFiles[0].detectedPlateConfidence = Number(plateScanResult?.confidence || 0);
-        nextFiles[0].detectedVehicleImage = nextPreviews[0] || '';
-      }
-      nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase, capturedAt });
-      if (plateScanResult?.plateText && nextCameraRawRecords[0]) {
-        nextCameraRawRecords[0] = {
-          ...nextCameraRawRecords[0],
-          plateText: plateScanResult.plateText,
-          plateConfidence: plateScanResult.confidence,
-          plateCutoffImage: plateScanResult.cutoffImage || '',
-          plateBbox: plateScanResult.bbox || null,
-        };
-      }
-    }
-
-    if (isClosingCapture) {
-      const mergedClosingFiles = [...closingFiles, ...nextFiles];
-      const hasClosingPair = hasCapturePairArtifacts(mergedClosingFiles, {
-        requireExtractedVrm: false,
-        requirePlateCutoff: false,
-        minimumImages: 2,
-      });
-      if (!hasClosingPair) {
-        setMessage('Closing evidence requires at least 2 images before continuing: full vehicle and plate image.');
-        event.target.value = '';
-        return;
-      }
-    }
-
-    const nextPhaseFiles = nextFiles.map((file) => ({
-      name: file.name,
-      type: file.type,
-      blob: file,
-      phase,
-    }));
-
-    if (phase === 'entry') {
-      const mergedEntryFiles = [...entryFiles, ...nextFiles];
-      const mergedEntryPreviews = [...entryPreviews, ...nextPreviews];
-      setEntryFiles(mergedEntryFiles);
-      setEntryPreviews(mergedEntryPreviews);
-      if (entryFiles.length === 0) {
-        setMainEntryImageIndex(0);
-      } else {
-        setMainEntryImageIndex((current) => (
-          mergedEntryFiles.length > 0
-            ? Math.min(current, mergedEntryFiles.length - 1)
-            : 0
-        ));
-      }
-      setEntryCapturedAt((current) => current || capturedAt);
-      setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'entry'));
-      if (plateScanResult?.plateText) {
-        setSelectedVrm(plateScanResult.plateText);
-      }
-
-      const entryCaptureMessage = plateScanResult?.plateText
-        ? `Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}. Plate detected: ${plateScanResult.plateText}.`
-        : `Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`;
-      setMessage(entryCaptureMessage);
-
-      if (selectedTrackedId) {
-        try {
-          const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
-          const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
-          const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
-          const preservedFiles = existingFiles.filter((file) => file?.phase !== 'entry');
-          const existingEntryFiles = existingFiles.filter((file) => file?.phase === 'entry');
-          const mergedTrackedEntryFiles = [...existingEntryFiles, ...nextPhaseFiles];
-          const selectedMainEntryIndex = Number.isFinite(Number(selectedPayload?.mainEntryImageIndex))
-            ? Number(selectedPayload.mainEntryImageIndex)
-            : mainEntryImageIndex;
-
-          const entryPhaseEvidence = buildPhaseSessionEvidence({
-            phase: 'entry',
-            capturedAt,
-            detection: {
-              plateText: plateScanResult?.plateText || selectedPayload?.detectedEntryPlateText || '',
-              plateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedEntryPlateCutoffImage || '',
-              plateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedEntryPlateConfidence || 0),
-              vehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedEntryVehicleImage || selectedPayload?.startVehicleImage || '',
-            },
-          });
-
-          await updateQueueItem(selectedTrackedId, {
-            payload: {
-              ...selectedPayload,
-              observationStartTime: capturedAt,
-              observationEndTime: null,
-              entryCapturedAt: capturedAt,
-              closingCapturedAt: null,
-              breachLifecycle: 'DRAFT_OPEN',
-              mainEntryImageIndex: Math.min(
-                Math.max(0, selectedMainEntryIndex),
-                Math.max(0, mergedTrackedEntryFiles.length - 1)
-              ),
-              detectedEntryPlateText: plateScanResult?.plateText || selectedPayload?.detectedEntryPlateText || '',
-              detectedEntryPlateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedEntryPlateCutoffImage || '',
-              detectedEntryPlateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedEntryPlateConfidence || 0),
-              detectedEntryVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedEntryVehicleImage || '',
-              startVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.startVehicleImage || '',
-              sessionEvidence: mergeSessionEvidence(selectedPayload?.sessionEvidence, entryPhaseEvidence),
-              cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'entry'),
-            },
-            files: [...preservedFiles, ...mergedTrackedEntryFiles],
-            updatedAt: new Date().toISOString(),
-          });
-          await refreshQueue();
-        } catch (persistError) {
-          console.error('[warden] failed to persist entry capture evidence', persistError);
-        }
-      }
-    } else {
-      const mergedClosingFiles = [...closingFiles, ...nextFiles];
-      const mergedClosingPreviews = [...closingPreviews, ...nextPreviews];
-      const closingTime = capturedAt;
-      setClosingFiles(mergedClosingFiles);
-      setClosingPreviews(mergedClosingPreviews);
-      if (closingFiles.length === 0) {
-        setMainClosingImageIndex(0);
-      } else {
-        setMainClosingImageIndex((current) => (
-          mergedClosingFiles.length > 0
-            ? Math.min(current, mergedClosingFiles.length - 1)
-            : 0
-        ));
-      }
-      setClosingCapturedAt(capturedAt);
-      setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'closing'));
-      setMonitoringSessionActive(false);
-      setMonitoringSessionStartedAt('');
-
-      if (selectedTrackedId) {
-        try {
-          const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
-          const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
-          const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
-          const preservedFiles = existingFiles.filter((file) => file?.phase !== 'closing');
-          const existingClosingFiles = existingFiles.filter((file) => file?.phase === 'closing');
-          const mergedTrackedClosingFiles = [...existingClosingFiles, ...nextPhaseFiles];
-          const selectedMainClosingIndex = Number.isFinite(Number(selectedPayload?.mainClosingImageIndex))
-            ? Number(selectedPayload.mainClosingImageIndex)
-            : mainClosingImageIndex;
-          const entryTime =
-            entryCapturedAt ||
-            selectedPayload.entryCapturedAt ||
-            selectedPayload.observationStartTime ||
-            monitoringSessionStartedAt ||
-            capturedAt;
-          const closingTime = capturedAt;
-          const computedMinutes = diffMinutes(entryTime, closingTime);
-
-          const closingPhaseEvidence = buildPhaseSessionEvidence({
-            phase: 'closing',
-            capturedAt,
-            detection: {
-              plateText: plateScanResult?.plateText || selectedPayload?.detectedClosingPlateText || '',
-              plateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedClosingPlateCutoffImage || '',
-              plateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedClosingPlateConfidence || 0),
-              vehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedClosingVehicleImage || '',
-            },
-          });
-
-          await updateQueueItem(selectedTrackedId, {
-            payload: {
-              ...selectedPayload,
-              observationStartTime: entryTime,
-              observationEndTime: closingTime,
-              entryCapturedAt: entryTime,
-              closingCapturedAt: closingTime,
-              actualMinutes: computedMinutes,
-              mainClosingImageIndex: Math.min(
-                Math.max(0, selectedMainClosingIndex),
-                Math.max(0, mergedTrackedClosingFiles.length - 1)
-              ),
-              breachLifecycle: computedMinutes > 0 ? 'READY_FOR_SYNC' : selectedPayload.breachLifecycle,
-              detectedClosingPlateText: plateScanResult?.plateText || selectedPayload?.detectedClosingPlateText || '',
-              detectedClosingPlateCutoffImage: plateScanResult?.cutoffImage || selectedPayload?.detectedClosingPlateCutoffImage || '',
-              detectedClosingPlateConfidence: Number(plateScanResult?.confidence || selectedPayload?.detectedClosingPlateConfidence || 0),
-              detectedClosingVehicleImage: nextCameraRawRecords[0]?.imageUrl || selectedPayload?.detectedClosingVehicleImage || '',
-              sessionEvidence: mergeSessionEvidence(selectedPayload?.sessionEvidence, closingPhaseEvidence),
-              cameraRawData: mergeCameraRawRecords(selectedPayload?.cameraRawData || [], nextCameraRawRecords, 'closing'),
-            },
-            files: [...preservedFiles, ...mergedTrackedClosingFiles],
-            updatedAt: new Date().toISOString(),
-          });
-          await refreshQueue();
-        } catch (persistError) {
-          console.error('[warden] failed to persist closing capture timing', persistError);
-        }
-      }
-
-      const capturedMessage = plateScanResult?.plateText
-        ? `Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}. Plate detected: ${plateScanResult.plateText}.`
-        : `Closing evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`;
-      const shouldAutoSubmit = autoSubmitOnClosingCapture && Boolean(selectedTrackedId);
-
-      if (shouldAutoSubmit && !online) {
-        setMessage(`${capturedMessage} Auto-submit is enabled but you are offline; review and submit manually when online.`);
-      } else if (shouldAutoSubmit) {
-        setMessage(`${capturedMessage} Auto-submitting evidence package...`);
-        await queueOrSendCapture({
-          targetItemId: selectedTrackedId,
-          openPcnDialogAfterSync: false,
-        });
-      } else {
-        setMessage(`${capturedMessage} Review and submit manually when ready.`);
-      }
-    }
-
-    event.target.value = '';
-  }
-
-  async function handleStepperCaptureComplete({ files = [], phase = 'entry', scan = null } = {}) {
+  async function handleStepperCaptureComplete({ files = [], phase = 'entry', scan = null, captureMode = 'scan' } = {}) {
     const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
     const isClosingCapture = normalizedPhase === 'closing';
+    const normalizedCaptureMode = String(captureMode || 'scan').toLowerCase() === 'manual' ? 'manual' : 'scan';
+    const requiresOcrArtifacts = !isClosingCapture && normalizedCaptureMode !== 'manual';
     const rawFiles = Array.isArray(files) ? files : [];
     if (rawFiles.length === 0) {
       setCaptureStepperOpen(false);
@@ -2407,7 +2390,7 @@ export default function DashboardPage() {
     let nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase: normalizedPhase, capturedAt });
 
     let plateScanResult = null;
-    if (!isClosingCapture) {
+    if (requiresOcrArtifacts) {
       const scanPlateText = normalizeVrm(scan?.plateText || '');
       if (scanPlateText) {
         plateScanResult = {
@@ -2493,15 +2476,30 @@ export default function DashboardPage() {
           plateCutoffImage: plateScanResult?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || '',
         };
       }
+    } else if (!isClosingCapture) {
+      if (!hasCapturePairArtifacts(nextFiles, {
+        requireExtractedVrm: false,
+        requirePlateCutoff: false,
+        minimumImages: 1,
+      })) {
+        setMessage('Capture at least 1 opening evidence image before continuing.');
+        return;
+      }
+
+      if (nextFiles[0]) {
+        nextFiles[0].detectedVehicleImage = nextPreviews[0] || '';
+      }
+
+      nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase: normalizedPhase, capturedAt });
     } else {
       const mergedClosingFiles = [...closingFiles, ...nextFiles];
       const hasClosingPair = hasCapturePairArtifacts(mergedClosingFiles, {
         requireExtractedVrm: false,
         requirePlateCutoff: false,
-        minimumImages: 2,
+        minimumImages: 1,
       });
       if (!hasClosingPair) {
-        setMessage('Closing evidence requires at least 2 images before continuing: full vehicle and plate image.');
+        setMessage('Closing evidence requires at least 1 image before continuing.');
         return;
       }
     }
@@ -2528,6 +2526,7 @@ export default function DashboardPage() {
         ));
       }
       setEntryCapturedAt((current) => current || capturedAt);
+      setEntryCaptureMode(normalizedCaptureMode);
       setCameraRawData((current) => mergeCameraRawRecords(current, nextCameraRawRecords, 'entry'));
       if (plateScanResult?.plateText || nextFiles[0]?.detectedPlateText) {
         setSelectedVrm(normalizeVrm(plateScanResult?.plateText || nextFiles[0]?.detectedPlateText || ''));
@@ -2563,6 +2562,7 @@ export default function DashboardPage() {
             entryCapturedAt: capturedAt,
             closingCapturedAt: null,
             breachLifecycle: 'DRAFT_OPEN',
+            entryCaptureMode: normalizedCaptureMode,
             mainEntryImageIndex: Math.min(
               Math.max(0, selectedMainEntryIndex),
               Math.max(0, mergedTrackedEntryFiles.length - 1)
@@ -2581,7 +2581,9 @@ export default function DashboardPage() {
         await refreshQueue();
       }
 
-      setMessage(`Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`);
+      setMessage(requiresOcrArtifacts
+        ? `Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}.`
+        : `Opening evidence captured: ${nextFiles.length} image${nextFiles.length === 1 ? '' : 's'}. Enter VRM manually when ready.`);
     } else {
       const mergedClosingFiles = [...closingFiles, ...nextFiles];
       const mergedClosingPreviews = [...closingPreviews, ...nextPreviews];
@@ -2679,33 +2681,56 @@ export default function DashboardPage() {
   }
 
   async function uploadEvidenceFiles(evidenceFiles, manualVrm, siteIdOverride = '') {
-    const formData = new FormData();
-    evidenceFiles.forEach((file) => formData.append('file', file.blob || file, file.name));
-    formData.append('siteId', String(siteIdOverride || selectedSiteId || '').trim());
-    formData.append('manualVrm', manualVrm || selectedVrm);
+    const uploadCandidates = (Array.isArray(evidenceFiles) ? evidenceFiles : []).filter(Boolean);
+    const siteId = String(siteIdOverride || selectedSiteId || '').trim();
+    const fallbackVrm = normalizeVrm(manualVrm || selectedVrm || '');
+    let resolvedVrm = fallbackVrm;
+    const uploadedImages = [];
 
-    let token = await resolveAuthToken();
-    let response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: formData,
-    });
+    for (const file of uploadCandidates) {
+      const blob = file?.blob || file;
+      if (!blob) continue;
 
-    if (response.status === 401) {
-      token = await resolveAuthToken({ forceRefresh: true });
-      response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+      const formData = new FormData();
+      formData.append('file', blob, file?.name || blob?.name || `evidence_${Date.now()}.jpg`);
+      formData.append('siteId', siteId);
+      formData.append('manualVrm', resolvedVrm || fallbackVrm || '');
+
+      let token = await resolveAuthToken();
+      let response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
         body: formData,
       });
+
+      if (response.status === 401) {
+        token = await resolveAuthToken({ forceRefresh: true });
+        response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: formData,
+        });
+      }
+
+      const data = await response.json();
+      if (!response.ok) {
+        const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
+        throw new Error(`${prefix}${data?.error || 'Failed to analyse evidence'}`);
+      }
+
+      if (data?.vrm) {
+        resolvedVrm = normalizeVrm(data.vrm) || resolvedVrm;
+      }
+
+      if (Array.isArray(data?.images)) {
+        uploadedImages.push(...data.images);
+      }
     }
 
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data?.error || 'Failed to analyse evidence');
-    }
-
-    return data;
+    return {
+      vrm: resolvedVrm || fallbackVrm || null,
+      images: uploadedImages.filter((url, index, all) => typeof url === 'string' && url && all.indexOf(url) === index),
+    };
   }
 
   async function inferVrmFromImage() {
@@ -2739,9 +2764,10 @@ export default function DashboardPage() {
     const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(effectiveSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, {
       token
     });
-    setAuthorization(result);
-    setAuthorizationByVrm((current) => ({ ...current, [vrm]: result }));
-    return result;
+    const decoratedResult = withAuthorizationMatchConfidence(result, vrm);
+    setAuthorization(decoratedResult);
+    setAuthorizationByVrm((current) => ({ ...current, [vrm]: decoratedResult }));
+    return decoratedResult;
   }
 
   async function persistSelectedTrackedVrm() {
@@ -2781,9 +2807,10 @@ export default function DashboardPage() {
     const nextSite = sites.find((site) => String(site.id) === nextSiteId) || null;
     const nextSiteName = String(nextSite?.name || nextSite?.displayName || selectedTracked?.payload?.siteName || '').trim() || 'Site not set';
 
-    const nextContravention = contraventions.find((item) => item.code === selectedContraventionCode) || null;
-    const nextContraventionCode = String(selectedContraventionCode || selectedTracked?.payload?.selectedContraventionCode || selectedTracked?.payload?.contraventionCode || '').trim();
-    const nextReason = String(nextContravention?.label || selectedReason || selectedTracked?.payload?.contraventionReason || '').trim();
+    const nextContravention = contraventions.find((item) => String(item?.code || '') === String(selectedContraventionCode || '')) || null;
+    const nextContraventionCode = String(nextContravention?.code || '').trim();
+    const nextReason = String(nextContravention?.label || '').trim();
+    const nextObservationMinutes = normalizeObservationMinutes(nextContravention?.defaultObservationMinutes ?? 0);
 
     if (!nextContraventionCode || !nextReason) {
       if (!silent) setDetailMessage('Select a contravention before saving PCN details.');
@@ -2800,6 +2827,7 @@ export default function DashboardPage() {
         contraventionReason: nextReason,
         contravention: nextReason,
         reason: nextReason,
+        expectedObservationMinutes: nextObservationMinutes,
       },
       updatedAt: new Date().toISOString(),
     });
@@ -2817,9 +2845,21 @@ export default function DashboardPage() {
     try {
       const result = await checkAuthorization(selectedVrm);
       if (result?.hasAuthorization) {
-        setDetailMessage('E-permit lookup matched an active authorisation for this site.');
+        const score = Number(result?.matchConfidence?.scorePercent || 0);
+        const bestVrm = String(result?.matchConfidence?.bestVrm || '').trim();
+        if (score > 0 && bestVrm) {
+          setDetailMessage(`E-permit lookup matched an active authorisation for this site (${score}% VRM match with ${bestVrm}).`);
+        } else {
+          setDetailMessage('E-permit lookup matched an active authorisation for this site.');
+        }
       } else {
-        setDetailMessage('E-permit lookup completed. No active authorisation matched this site.');
+        const score = Number(result?.matchConfidence?.scorePercent || 0);
+        const bestVrm = String(result?.matchConfidence?.bestVrm || '').trim();
+        if (score > 0 && bestVrm) {
+          setDetailMessage(`E-permit lookup completed. No active authorisation matched this site. Closest exemption match: ${bestVrm} (${score}%).`);
+        } else {
+          setDetailMessage('E-permit lookup completed. No active authorisation matched this site.');
+        }
       }
     } catch (error) {
       console.error('[warden] permit lookup failed', error);
@@ -2946,6 +2986,47 @@ export default function DashboardPage() {
     }
   }
 
+  function publishCheckFailure(messageText) {
+    const text = String(messageText || '').trim();
+    if (!text) return;
+    setDetailMessage(text);
+    // Keep list/home notices scoped: detail check failures should stay in detail view.
+    if (!selectedTrackedId) {
+      setMessage(text);
+    }
+  }
+
+  async function retryDraftChecks() {
+    const detailsSaved = await persistTrackedPcnDetails({ silent: true });
+    if (detailsSaved === false) return;
+
+    await persistSelectedTrackedVrm();
+
+    const targetVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm);
+    const targetSiteId = String(selectedTracked?.payload?.siteId || selectedSiteId || '').trim();
+    if (!targetVrm || !targetSiteId) {
+      publishCheckFailure('Set a valid VRM and patrol site before retrying checks.');
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const checks = await ensurePcnSubmissionChecks({
+        vrm: targetVrm,
+        siteId: targetSiteId,
+        forceCarcheck: true,
+        openDialog: false,
+        allowNetwork: true,
+      });
+
+      if (checks.ok) {
+        setDetailMessage('Carcheck and e-permit checks refreshed for this draft.');
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function ensurePcnSubmissionChecks({
     vrm: inputVrm = selectedVrm,
     siteId: inputSiteId = selectedSiteId,
@@ -2982,8 +3063,7 @@ export default function DashboardPage() {
       const error = allowNetwork
         ? 'Carcheck returned no result. Cross-check the plate image VRM, edit VRM, then retry checks.'
         : 'Carcheck is required before submission. Use Retry carcheck in Draft PCN details.';
-      setMessage(error);
-      setDetailMessage(error);
+      publishCheckFailure(error);
       return { ok: false, error };
     }
 
@@ -2999,8 +3079,7 @@ export default function DashboardPage() {
         const message = allowNetwork
           ? (error?.message || 'E-permit check failed. Retry after confirming the VRM and site.')
           : 'E-permit check is required before submission. Use Retry e-permit check in Draft PCN details.';
-        setMessage(message);
-        setDetailMessage(message);
+        publishCheckFailure(message);
         return { ok: false, error: message };
       }
     }
@@ -3009,8 +3088,7 @@ export default function DashboardPage() {
       const error = allowNetwork
         ? 'E-permit check returned no result. Retry the lookup before submitting.'
         : 'E-permit check is required before submission. Use Retry e-permit check in Draft PCN details.';
-      setMessage(error);
-      setDetailMessage(error);
+      publishCheckFailure(error);
       return { ok: false, error };
     }
 
@@ -3137,6 +3215,14 @@ export default function DashboardPage() {
   }
 
   async function queueOrSendCapture({ immediate = false, targetItemId = '', openPcnDialogAfterSync = false } = {}) {
+    const resolveObservationMinutesFromCode = (code, fallbackMinutes = 0) => {
+      const resolvedCode = String(code || '').trim();
+      if (!resolvedCode) return normalizeObservationMinutes(fallbackMinutes);
+      const matched = contraventions.find((item) => String(item?.code || '').trim() === resolvedCode) || null;
+      if (!matched) return normalizeObservationMinutes(fallbackMinutes);
+      return normalizeObservationMinutes(matched.defaultObservationMinutes ?? fallbackMinutes ?? 0);
+    };
+
     if (targetItemId) {
       const existing = (await listQueueItems()).find((item) => item.id === targetItemId);
       if (existing) {
@@ -3164,8 +3250,15 @@ export default function DashboardPage() {
       setMessage('Capture opening evidence before creating a breach.');
       return;
     }
-    if (!hasCapturePairArtifacts(entryFiles)) {
-      setMessage('Opening evidence must include full vehicle image, plate cutout, and extracted VRM text. Recapture entry evidence.');
+    const requiresEntryOcrArtifacts = entryCaptureMode !== 'manual';
+    if (!hasCapturePairArtifacts(entryFiles, {
+      requireExtractedVrm: requiresEntryOcrArtifacts,
+      requirePlateCutoff: requiresEntryOcrArtifacts,
+      minimumImages: 1,
+    })) {
+      setMessage(requiresEntryOcrArtifacts
+        ? 'Opening evidence must include full vehicle image, plate cutout, and extracted VRM text. Recapture entry evidence.'
+        : 'Opening evidence must include at least 1 image.');
       return;
     }
 
@@ -3176,13 +3269,19 @@ export default function DashboardPage() {
     if (!hasCapturePairArtifacts(closingFiles, {
       requireExtractedVrm: false,
       requirePlateCutoff: false,
-      minimumImages: 2,
+      minimumImages: 1,
     })) {
-      setMessage('Closing evidence must include at least 2 images before submission: full vehicle and plate image.');
+      setMessage('Closing evidence must include at least 1 image before submission.');
       return;
     }
 
-    const requiredObservationMinutes = 0;
+    const resolvedContraventionCode = String(
+      selectedContraventionCode ||
+      selectedTracked?.payload?.selectedContraventionCode ||
+      selectedTracked?.payload?.contraventionCode ||
+      ''
+    ).trim();
+    const requiredObservationMinutes = resolveObservationMinutesFromCode(resolvedContraventionCode, selectedObservationMinutes);
     const now = new Date();
     const locationSnapshot = location || (await getCurrentLocation());
     const entryTime = entryCapturedAt || now.toISOString();
@@ -3225,7 +3324,8 @@ export default function DashboardPage() {
       authorization,
       savedVehicleLookup,
       vehicleDetails: savedVehicleLookup,
-      selectedContraventionCode,
+      selectedContraventionCode: resolvedContraventionCode,
+      contraventionCode: resolvedContraventionCode,
       mainEntryImageIndex,
       mainClosingImageIndex,
       detectedEntryPlateText: entryDetection.plateText,
@@ -3303,8 +3403,15 @@ export default function DashboardPage() {
       setMessage('Capture opening evidence before saving a draft.');
       return;
     }
-    if (!hasCapturePairArtifacts(entryFiles)) {
-      setMessage('Opening evidence must include full vehicle image, plate cutout, and extracted VRM text before saving draft.');
+    const requiresEntryOcrArtifacts = entryCaptureMode !== 'manual';
+    if (!hasCapturePairArtifacts(entryFiles, {
+      requireExtractedVrm: requiresEntryOcrArtifacts,
+      requirePlateCutoff: requiresEntryOcrArtifacts,
+      minimumImages: 1,
+    })) {
+      setMessage(requiresEntryOcrArtifacts
+        ? 'Opening evidence must include full vehicle image, plate cutout, and extracted VRM text before saving draft.'
+        : 'Opening evidence must include at least 1 image before saving draft.');
       return;
     }
 
@@ -3330,12 +3437,14 @@ export default function DashboardPage() {
       source: 'WARDEN',
       wardenId: profile?.uid,
       actorId: profile?.uid,
+      entryCaptureMode,
       contraventionReason: selectedReason,
       status: 'DRAFT_OPEN',
       breachLifecycle: 'DRAFT_OPEN',
       location: location || null,
       observationStartTime: entryTime,
       observationEndTime: null,
+      expectedObservationMinutes: selectedObservationMinutes,
       entryCapturedAt: entryTime,
       closingCapturedAt: null,
       manualNote,
@@ -3406,18 +3515,29 @@ export default function DashboardPage() {
     observationMinutes,
     files,
     note,
-    scan = null
+    scan = null,
+    captureMode = 'scan',
+    skippedCapture = false
   }) {
     try {
       setBusy(true);
-      if (!hasCapturePairArtifacts(files)) {
-        setMessage('Capture requires full vehicle image, plate cutout, and extracted VRM text. Reframe plate and scan again.');
+      const normalizedCaptureMode = String(captureMode || 'scan').toLowerCase() === 'manual' ? 'manual' : 'scan';
+      const requiresOcrArtifacts = normalizedCaptureMode !== 'manual';
+      const skipCapture = Boolean(skippedCapture);
+      if (!skipCapture && !hasCapturePairArtifacts(files, {
+        requireExtractedVrm: requiresOcrArtifacts,
+        requirePlateCutoff: requiresOcrArtifacts,
+        minimumImages: 1,
+      })) {
+        setMessage(requiresOcrArtifacts
+          ? 'Capture requires full vehicle image, plate cutout, and extracted VRM text. Reframe plate and scan again.'
+          : 'Capture at least one opening evidence image, then enter VRM manually.');
         return;
       }
       setMessage(`Saving Draft Parking Charge for VRM ${vrm}…`);
 
-      const entryTime = normalizeCapturedAt(files?.[0]?.capturedAt) || new Date().toISOString();
-      const requiredObservationMinutes = 0;
+      const entryTime = skipCapture ? '' : (normalizeCapturedAt(files?.[0]?.capturedAt) || new Date().toISOString());
+      const requiredObservationMinutes = normalizeObservationMinutes(observationMinutes);
       const stepperPreviews = await toPreviewSrcList(files);
       const entryFile = files?.[0] || null;
       const stepperEntryVehicleImage = stepperPreviews[0] || '';
@@ -3439,22 +3559,25 @@ export default function DashboardPage() {
         // can restore the selection without a key mismatch.
         selectedContraventionCode: contraventionCode,
         contraventionReason: contraventionLabel,
-        observationStartTime: entryTime,
+        observationStartTime: entryTime || null,
         observationEndTime: null,
         expectedObservationMinutes: requiredObservationMinutes,
         siteId: resolvedSiteId,
         siteName: siteName || resolvedSite?.name || resolvedSite?.displayName || 'Site not set',
         note,
-        detectedEntryPlateText: stepperEntryDetection.plateText,
-        detectedEntryPlateCutoffImage: stepperEntryDetection.plateCutoffImage,
-        detectedEntryPlateConfidence: stepperEntryDetection.plateConfidence,
-        detectedEntryVehicleImage: stepperEntryVehicleImage,
-        startVehicleImage: stepperEntryVehicleImage,
+        entryCaptureMode: normalizedCaptureMode,
+        detectedEntryPlateText: skipCapture ? '' : stepperEntryDetection.plateText,
+        detectedEntryPlateCutoffImage: skipCapture ? '' : stepperEntryDetection.plateCutoffImage,
+        detectedEntryPlateConfidence: skipCapture ? 0 : stepperEntryDetection.plateConfidence,
+        detectedEntryVehicleImage: skipCapture ? '' : stepperEntryVehicleImage,
+        startVehicleImage: skipCapture ? '' : stepperEntryVehicleImage,
         sessionEvidence: {
-          entry: buildPhaseSessionEvidence({ phase: 'entry', detection: stepperEntryDetection, capturedAt: entryTime }),
+          entry: buildPhaseSessionEvidence({ phase: 'entry', detection: skipCapture ? {} : stepperEntryDetection, capturedAt: entryTime || '' }),
           closing: buildPhaseSessionEvidence({ phase: 'closing', detection: {}, capturedAt: '' }),
         },
-        cameraRawData: buildCameraRawRecords(files, stepperPreviews, { phase: 'entry', capturedAt: entryTime, source: 'WARDEN_STEPPER' }),
+        cameraRawData: skipCapture
+          ? []
+          : buildCameraRawRecords(files, stepperPreviews, { phase: 'entry', capturedAt: entryTime, source: 'WARDEN_STEPPER' }),
       };
 
       const draftFiles = files.map((file, i) => ({
@@ -3473,6 +3596,7 @@ export default function DashboardPage() {
       setStepperOpen(false);
       setSelectedTrackedId(item.id);
       setActiveTab('tracked');
+      setEntryCaptureMode(normalizedCaptureMode);
 
       // Pre-load the new item into active workflow state using handleReviewTracked
       handleReviewTracked(item);
@@ -3787,6 +3911,7 @@ export default function DashboardPage() {
       setEntryFiles([]);
       setEntryPreviews([]);
       setEntryCapturedAt('');
+      setEntryCaptureMode('scan');
       setClosingFiles([]);
       setClosingPreviews([]);
       setClosingCapturedAt('');
@@ -3796,7 +3921,6 @@ export default function DashboardPage() {
       setCameraRawData([]);
       setMonitoringSessionActive(false);
       setMonitoringSessionStartedAt('');
-      if (fileInputRef.current) fileInputRef.current.value = '';
       return { ok: true, breachId, vrm };
     } catch (error) {
       console.error('[warden] sync failed', error);
@@ -3816,6 +3940,7 @@ export default function DashboardPage() {
   async function handleConvertToPcn() {
     if (!selectedTracked) return;
     if (convertLoading) return;
+    if (!canProceedWithPcnActions) return;
 
     setConvertLoading(true);
     setConvertError('');
@@ -3940,10 +4065,12 @@ export default function DashboardPage() {
         },
       });
       await refreshQueue();
+      setDetailMessage('');
       setMessage(`Breach converted to PCN ${response?.pcnNumber || ''} and routed for QA escalation.`);
       setPcnDialogOpen(false);
       setMonitoringSessionActive(false);
       setMonitoringSessionStartedAt('');
+      setDemoAlarmAcknowledged(false);
     } catch (error) {
       console.error('[warden] convert breach failed', error);
       const failureMessage = error?.message || 'Failed to convert breach to PCN';
@@ -3992,6 +4119,7 @@ export default function DashboardPage() {
 
   async function handleReviewTracked(item) {
     setDetailMessage('');
+    setMessage('');
     setSelectedTrackedId(item.id);
     if (item?.payload?.siteId) {
       setSelectedSiteId(item.payload.siteId);
@@ -4025,6 +4153,7 @@ export default function DashboardPage() {
       .map((file) => file.blob);
 
     setEntryFiles(entryEvidence);
+    setEntryCaptureMode(String(item?.payload?.entryCaptureMode || 'scan').toLowerCase() === 'manual' ? 'manual' : 'scan');
     setClosingFiles(closingEvidence);
     const [nextEntryPreviews, nextClosingPreviews] = await Promise.all([
       toPreviewSrcList(entryEvidence),
@@ -4074,7 +4203,79 @@ export default function DashboardPage() {
     await refreshQueue();
   }
 
+  async function handleDeleteEvidenceImage(phase, index) {
+    const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+    const targetIndex = Math.max(0, Number(index) || 0);
+    const sourceFiles = normalizedPhase === 'closing' ? closingFiles : entryFiles;
+    const sourcePreviews = normalizedPhase === 'closing' ? closingPreviews : entryPreviews;
+    if (!sourceFiles.length || targetIndex >= sourceFiles.length) return;
+
+    const nextFiles = sourceFiles.filter((_, fileIndex) => fileIndex !== targetIndex);
+    const nextPreviews = sourcePreviews.filter((_, previewIndex) => previewIndex !== targetIndex);
+    const currentMainIndex = normalizedPhase === 'closing' ? mainClosingImageIndex : mainEntryImageIndex;
+    const nextMainIndex = nextFiles.length === 0
+      ? 0
+      : (currentMainIndex > targetIndex
+        ? currentMainIndex - 1
+        : Math.min(currentMainIndex, nextFiles.length - 1));
+
+    if (normalizedPhase === 'closing') {
+      setClosingFiles(nextFiles);
+      setClosingPreviews(nextPreviews);
+      setMainClosingImageIndex(nextMainIndex);
+      if (nextFiles.length === 0) {
+        setClosingCapturedAt('');
+      }
+    } else {
+      setEntryFiles(nextFiles);
+      setEntryPreviews(nextPreviews);
+      setMainEntryImageIndex(nextMainIndex);
+      if (nextFiles.length === 0) {
+        setEntryCapturedAt('');
+      }
+    }
+
+    if (!selectedTrackedId) {
+      setMessage(`${normalizedPhase === 'closing' ? 'Closing' : 'Entry'} photo deleted.`);
+      return;
+    }
+
+    try {
+      const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+      const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
+      const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
+      const phaseFiles = existingFiles.filter((file) => file?.phase === normalizedPhase);
+      const preservedFiles = existingFiles.filter((file) => file?.phase !== normalizedPhase);
+      const nextPhaseFiles = phaseFiles.filter((_, fileIndex) => fileIndex !== targetIndex);
+
+      const payloadKey = normalizedPhase === 'closing' ? 'mainClosingImageIndex' : 'mainEntryImageIndex';
+      const capturedAtKey = normalizedPhase === 'closing' ? 'closingCapturedAt' : 'entryCapturedAt';
+
+      await updateQueueItem(selectedTrackedId, {
+        payload: {
+          ...selectedPayload,
+          [payloadKey]: nextMainIndex,
+          [capturedAtKey]: nextPhaseFiles.length > 0 ? selectedPayload[capturedAtKey] : null,
+          observationEndTime: normalizedPhase === 'closing' && nextPhaseFiles.length === 0
+            ? null
+            : selectedPayload?.observationEndTime,
+          breachLifecycle: normalizedPhase === 'closing' && nextPhaseFiles.length === 0
+            ? 'DRAFT_OPEN'
+            : selectedPayload?.breachLifecycle,
+        },
+        files: [...preservedFiles, ...nextPhaseFiles],
+        updatedAt: new Date().toISOString(),
+      });
+      await refreshQueue();
+      setMessage(`${normalizedPhase === 'closing' ? 'Closing' : 'Entry'} photo deleted.`);
+    } catch (error) {
+      console.error('[warden] failed to delete evidence image', error);
+      setMessage(error?.message || 'Failed to delete evidence image');
+    }
+  }
+
   async function handleFinalize({ openPcnDialogAfterSync = false } = {}) {
+    if (!canProceedWithPcnActions) return;
     await persistTrackedPcnDetails({ silent: true });
     const checks = await ensurePcnSubmissionChecks({ forceCarcheck: false, openDialog: false, allowNetwork: false });
     if (!checks.ok) return;
@@ -4087,6 +4288,7 @@ export default function DashboardPage() {
   }
 
   async function handleOpenPcnSubmitPreview() {
+    if (!canProceedWithPcnActions) return;
     await persistTrackedPcnDetails({ silent: true });
     const checks = await ensurePcnSubmissionChecks({ forceCarcheck: false, openDialog: false, allowNetwork: false });
     if (!checks.ok) return;
@@ -4100,6 +4302,7 @@ export default function DashboardPage() {
 
   async function confirmFinalize() {
     if (!pendingFinalize) return;
+    if (!canProceedWithPcnActions) return;
 
     await persistTrackedPcnDetails({ silent: true });
 
@@ -4170,6 +4373,7 @@ export default function DashboardPage() {
     setEntryFiles([]);
     setEntryPreviews([]);
     setEntryCapturedAt('');
+    setEntryCaptureMode('scan');
     setMainEntryImageIndex(0);
     setClosingFiles([]);
     setClosingPreviews([]);
@@ -4201,12 +4405,15 @@ export default function DashboardPage() {
 
   function selectContravention(code) {
     const next = contraventions.find((item) => item.code === code) || contraventions[0];
-    setSelectedContraventionCode(code);
+    setSelectedContraventionCode(String(next?.code || '').trim());
     if (next) {
       setSelectedReason(next.label);
       setManualObservationMinutes(Number(next.defaultObservationMinutes ?? 0));
       setPcnReasonInput(next.label || '');
+      return;
     }
+    setSelectedReason('');
+    setManualObservationMinutes(0);
   }
 
   if (!profile) {
@@ -4398,11 +4605,11 @@ export default function DashboardPage() {
                         <>
                           <div className="sc-timer">
                             <span className="sc-timer-icon">⏱</span>
-                            <span className="sc-timer-val">{formatElapsed(item.observationStartTime)}</span>
+                            <span className="sc-timer-val">{item.requiredMinutes > 0 ? formatRemaining(item.remainingSeconds) : formatElapsed(item.observationStartTime)}</span>
                           </div>
                           {item.isPastRequired ? (
                             <div className="sc-cta-pill sc-cta-pill--overtime" style={{ marginTop: 6 }}>
-                              Overstay
+                              Alarm
                             </div>
                           ) : null}
                         </>
@@ -4449,17 +4656,34 @@ export default function DashboardPage() {
               <span className="obs-dot" />
               <div className="obs-text">
                 <div className="obs-label">
-                  {selectedTracked.isOpen ? 'Observation active (count up)' : 'Exit captured'}
+                  {selectedTracked.isOpen ? 'Consideration active (countdown)' : 'Exit captured'}
                 </div>
-                <div className="obs-value">Elapsed: {selectedTracked.elapsedMinutes || 0} min</div>
+                <div className="obs-value">Remaining: {selectedTracked.requiredMinutes > 0 ? formatRemaining(selectedTracked.remainingSeconds) : `${selectedTracked.elapsedMinutes || 0} min`}</div>
                 {selectedTracked.isOpen ? (
                   <div className="obs-value" style={{ color: 'var(--danger, #ff6b6b)', fontWeight: 700 }}>
-                    Capture closing evidence to stop timer.
+                    Capture closing evidence before the countdown reaches zero.
                   </div>
                 ) : null}
               </div>
               <div className="obs-countdown">
-                {formatElapsed(selectedTracked.observationStartTime, selectedTracked.isOpen ? '' : selectedTracked.observationEndTime)}
+                {selectedTracked.isOpen && selectedTracked.requiredMinutes > 0
+                  ? formatRemaining(selectedTracked.remainingSeconds)
+                  : formatElapsed(selectedTracked.observationStartTime, selectedTracked.observationEndTime)}
+              </div>
+            </div>
+          ) : null}
+
+          {demoObservationExpired ? (
+            <div className="notice notice-error" style={{ marginTop: 12 }}>
+              Demo consideration time has expired. Acknowledge the alarm before closing the PCN.
+              <div style={{ marginTop: 8 }}>
+                <button
+                  type="button"
+                  className="action-btn action-btn--issue"
+                  onClick={() => setDemoAlarmAcknowledged(true)}
+                >
+                  Acknowledge alarm
+                </button>
               </div>
             </div>
           ) : null}
@@ -4496,6 +4720,9 @@ export default function DashboardPage() {
                 value={selectedContraventionCode}
                 onChange={(event) => selectContravention(event.target.value)}
               >
+                {!contraventions.length ? (
+                  <option value="">No enabled contraventions for this site</option>
+                ) : null}
                 {contraventions.map((c, index) => (
                   <option key={c.code || `detail-contravention-${index + 1}`} value={c.code || ''}>
                     {getContraventionSelectionLabel(c)}
@@ -4550,16 +4777,33 @@ export default function DashboardPage() {
             >
               Retry e-permit check
             </button>
+            <button
+              type="button"
+              className="action-btn action-btn--secondary"
+              disabled={!selectedVrm || busy || vehicleLookupLoading}
+              onClick={retryDraftChecks}
+              style={{ marginTop: 8 }}
+            >
+              Retry carcheck + e-permit
+            </button>
 
             {selectedTrackedAuthorization ? (
               <div className={`auth-result ${selectedTrackedAuthorization.hasAuthorization ? 'auth-result--ok' : 'auth-result--none'}`}>
                 <span className="auth-result-icon">{selectedTrackedAuthorization.hasAuthorization ? '✓' : '✗'}</span>
-                <div>
+                <div className="auth-result-content">
                   <div className="auth-result-text">
                     {selectedTrackedAuthorization.hasAuthorization
                       ? `Authorised - ${selectedTrackedAuthorization.authorization?.type || 'permit found'}`
                       : 'No active permit or payment found'}
                   </div>
+                  {Number(selectedTrackedAuthorization?.matchConfidence?.scorePercent || 0) > 0
+                  && String(selectedTrackedAuthorization?.matchConfidence?.bestVrm || '').trim() ? (
+                    <div className="auth-match-pill" role="status" aria-label="Closest exemption match confidence">
+                      <span className="auth-match-pill-label">Closest exemption match</span>
+                      <span className="auth-match-pill-vrm">{selectedTrackedAuthorization.matchConfidence.bestVrm}</span>
+                      <span className="auth-match-pill-score">{selectedTrackedAuthorization.matchConfidence.scorePercent}%</span>
+                    </div>
+                    ) : null}
                   {selectedTrackedAuthorization.authorization?.site ? (
                     <div className="auth-result-sub">{selectedTrackedAuthorization.authorization.site}</div>
                   ) : null}
@@ -4646,6 +4890,8 @@ export default function DashboardPage() {
                               src: p,
                               label: `Entry ${i + 1}`,
                               phase: 'entry',
+                              imageIndex: i,
+                              allowDelete: true,
                               isMain: mainEntryImageIndex === i,
                               file: entryFiles[i] || null,
                               capturedAt: entryFiles[i]?.capturedAt || entryCapturedAt,
@@ -4667,6 +4913,14 @@ export default function DashboardPage() {
                             title={mainEntryImageIndex === i ? 'Main entry image' : 'Set as main entry image'}
                           >
                             {mainEntryImageIndex === i ? 'Main image' : 'Set main'}
+                          </button>
+                          <button
+                            type="button"
+                            className="evidence-delete-btn"
+                            onClick={() => handleDeleteEvidenceImage('entry', i)}
+                            title="Delete entry image"
+                          >
+                            Delete
                           </button>
                         </div>
                       ))}
@@ -4705,6 +4959,8 @@ export default function DashboardPage() {
                               src: p,
                               label: `Closing ${i + 1}`,
                               phase: 'closing',
+                              imageIndex: i,
+                              allowDelete: true,
                               isMain: mainClosingImageIndex === i,
                               file: closingFiles[i] || null,
                               capturedAt: closingFiles[i]?.capturedAt || closingCapturedAt,
@@ -4726,6 +4982,14 @@ export default function DashboardPage() {
                             title={mainClosingImageIndex === i ? 'Main closing image' : 'Set as main closing image'}
                           >
                             {mainClosingImageIndex === i ? 'Main image' : 'Set main'}
+                          </button>
+                          <button
+                            type="button"
+                            className="evidence-delete-btn"
+                            onClick={() => handleDeleteEvidenceImage('closing', i)}
+                            title="Delete closing image"
+                          >
+                            Delete
                           </button>
                         </div>
                       ))}
@@ -4771,6 +5035,7 @@ export default function DashboardPage() {
                       type="button"
                       className="action-btn action-btn--issue pcn-submit-cta"
                       onClick={async () => {
+                        if (!canProceedWithPcnActions) return;
                         await persistTrackedPcnDetails({ silent: true });
                         if (!pcnSubmissionGate.ready) {
                           setDetailMessage('Checks required. Use Retry carcheck and Retry e-permit check in Draft PCN details.');
@@ -4778,7 +5043,7 @@ export default function DashboardPage() {
                         }
                         await handleOpenPcnSubmitPreview();
                       }}
-                      disabled={busy || convertLoading}
+                      disabled={busy || convertLoading || !canProceedWithPcnActions}
                     >
                       {convertLoading
                         ? 'Submitting...'
@@ -4804,7 +5069,7 @@ export default function DashboardPage() {
 
           </div>
 
-          {detailMessage ? (
+          {detailMessage && !hideDetailMessageForClosedSession ? (
             <div className="notice notice-info" style={{ marginTop: 12 }}>{detailMessage}</div>
           ) : null}
 
@@ -4894,7 +5159,7 @@ export default function DashboardPage() {
                     <div className="sc-right">
                       <div className="sc-timer">
                         <span className="sc-timer-icon">⏱</span>
-                        <span className="sc-timer-val">{formatElapsed(timer.startsAt)}</span>
+                        <span className="sc-timer-val">{timer.requiredMinutes > 0 ? formatRemaining(timer.remainingSeconds) : formatElapsed(timer.startsAt)}</span>
                       </div>
                       {timer.requiredMinutes > 0 ? <div className="text-muted" style={{ fontSize: 11 }}>Baseline {timer.requiredMinutes}m</div> : null}
                     </div>
@@ -5264,6 +5529,11 @@ export default function DashboardPage() {
                 </div>
               </div>
               <div className="image-detail-actions">
+                {imageDetailDialog.allowDelete ? (
+                  <button type="button" className="evidence-delete-btn image-detail-delete-btn" onClick={handleDeleteFromImageDetail}>
+                    Delete
+                  </button>
+                ) : null}
                 <button type="button" className="ghost-button" onClick={toggleImageDetailFullscreen}>
                   {imageDetailDialog.fullscreen ? 'Window' : 'Full'}
                 </button>
@@ -5764,15 +6034,6 @@ export default function DashboardPage() {
       />
 
       {/* Hidden file inputs */}
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        capture="environment"
-        multiple
-        onChange={handleFileSelection}
-        className="file-input"
-      />
       <input
         ref={qrFileInputRef}
         type="file"
