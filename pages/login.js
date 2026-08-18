@@ -41,8 +41,10 @@ export default function LoginPage() {
       router.replace('/dashboard');
     } catch (signinError) {
       const code = String(signinError?.message || signinError?.code || '');
-      if (code.includes('insufficient_role')) {
-        setError('This account does not have warden access.');
+      if (code.includes('role_missing')) {
+        setError('This account is authenticated but has no usable role mapping yet.');
+      } else if (code.includes('insufficient_role')) {
+        setError('This account role is not allowed for this app.');
       } else if (code.includes('invalid_credentials')) {
         setError('Email or password is incorrect.');
       } else if (code.includes('network_unavailable')) {
