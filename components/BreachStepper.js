@@ -434,6 +434,9 @@ export default function BreachStepper({
     const [liveCameraActive, setLiveCameraActive] = useState(false);
     const [livePlateBox, setLivePlateBox] = useState(null);
     const [lockFrames, setLockFrames] = useState(0);
+    const [nightModeActive, setNightModeActive] = useState(false);
+    const [torchEnabled, setTorchEnabled] = useState(false);
+    const [autoNightTorchEnabled, setAutoNightTorchEnabled] = useState(true);
     const [note, setNote] = useState('');
     const cameraInputRef = useRef(null);
     const galleryInputRef = useRef(null);
@@ -441,6 +444,7 @@ export default function BreachStepper({
     const liveCanvasRef = useRef(null);
     const liveScanTimerRef = useRef(null);
     const liveStreamRef = useRef(null);
+    const liveVideoTrackRef = useRef(null);
     const liveScanBusyRef = useRef(false);
     const liveStableRef = useRef({ plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 });
     const liveReplacementRef = useRef({ plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 });
@@ -516,7 +520,49 @@ export default function BreachStepper({
         setLiveEngine('none');
         setLivePlateBox(null);
         setLockFrames(0);
+        setNightModeActive(false);
+        setTorchEnabled(false);
+        setAutoNightTorchEnabled(true);
         setNote('');
+    }
+
+    async function applyLiveTorchState(enabled) {
+        const nextEnabled = Boolean(enabled);
+        if (nativePreviewActiveRef.current) {
+            await setNativeCameraTorchEnabled(nextEnabled);
+            setTorchEnabled(nextEnabled);
+            return;
+        }
+
+        const track = liveVideoTrackRef.current;
+        if (!track) {
+            setTorchEnabled(false);
+            return;
+        }
+
+        await setWebTrackTorch(track, nextEnabled);
+        setTorchEnabled(nextEnabled);
+    }
+
+    async function toggleFlashlight() {
+        if (!nightModeActive || !liveCameraActive) return;
+        await applyLiveTorchState(!torchEnabled);
+    }
+
+    async function toggleAutoNightTorch() {
+        const nextAutoNightTorch = !autoNightTorchEnabled;
+        setAutoNightTorchEnabled(nextAutoNightTorch);
+
+        if (!liveCameraActive || !nightModeActive) return;
+
+        if (!nextAutoNightTorch && torchEnabled) {
+            await applyLiveTorchState(false);
+            return;
+        }
+
+        if (nextAutoNightTorch && !torchEnabled) {
+            await applyLiveTorchState(true);
+        }
     }
 
     function stopLiveCamera() {
@@ -537,6 +583,7 @@ export default function BreachStepper({
         }
 
         liveStreamRef.current = null;
+        liveVideoTrackRef.current = null;
         liveScanBusyRef.current = false;
         liveStableRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
         liveReplacementRef.current = { plateText: '', bbox: null, frames: 0, confidence: 0, confidenceSum: 0 };
@@ -551,6 +598,8 @@ export default function BreachStepper({
         setLiveCameraActive(false);
         setLivePlateBox(null);
         setLockFrames(0);
+        setNightModeActive(false);
+        setTorchEnabled(false);
     }
 
     useEffect(() => {
@@ -792,6 +841,9 @@ export default function BreachStepper({
     async function startLiveCamera() {
         if (liveCameraActive) return;
         const autoNightTorch = shouldEnableNightTorch();
+        const initialTorchEnabled = autoNightTorch && autoNightTorchEnabled;
+        setNightModeActive(autoNightTorch);
+        setTorchEnabled(initialTorchEnabled);
 
         const runScanLoop = () => {
             liveScanStartedAtRef.current = Date.now();
@@ -1033,7 +1085,7 @@ export default function BreachStepper({
         if (canUseNativeCameraPreview()) {
             try {
                 await startNativeCameraPreview();
-                await setNativeCameraTorchEnabled(autoNightTorch);
+                await setNativeCameraTorchEnabled(initialTorchEnabled);
                 nativePreviewActiveRef.current = true;
                 setLiveCameraActive(true);
                 setLiveEngine('native-preview');
@@ -1061,7 +1113,8 @@ export default function BreachStepper({
 
             const [videoTrack] = stream.getVideoTracks();
             if (videoTrack) {
-                await setWebTrackTorch(videoTrack, autoNightTorch);
+                liveVideoTrackRef.current = videoTrack;
+                await setWebTrackTorch(videoTrack, initialTorchEnabled);
             }
 
             liveStreamRef.current = stream;
@@ -1314,45 +1367,42 @@ export default function BreachStepper({
                 </div>
 
                 {/* Bottom controls bar — semi-opaque so camera shows through sides */}
-                <div
-                    style={{
-                        background: 'rgba(0,0,0,0.80)',
-                        paddingTop: 12,
-                        paddingRight: 16,
-                        paddingBottom: 'calc(12px + var(--scan-cta-bottom-clearance, var(--safe-bottom-effective, env(safe-area-inset-bottom, 0px))))',
-                        paddingLeft: 16,
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 12,
-                        flexShrink: 0,
-                    }}
-                >
-                    <div style={{ flex: 1, color: '#fff', fontSize: 12, lineHeight: 1.4 }}>
-                        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 2 }}>
+                <div className="stepper-live-controls">
+                    <div className="stepper-live-info">
+                        <div className="stepper-live-site">
                             {selectedSiteName}
                         </div>
                         {scanState.text ? (
-                            <div>Detected: {scanState.text} ({Math.round(scanState.confidence)}%)</div>
+                            <div className="stepper-live-detected">Detected: {scanState.text} ({Math.round(scanState.confidence)}%)</div>
                         ) : (
-                            <div style={{ color: 'rgba(255,255,255,0.55)' }}>Point camera at number plate</div>
+                            <div className="stepper-live-hint">Point camera at number plate</div>
                         )}
                     </div>
                     <button
                         type="button"
                         onClick={stopLiveCamera}
-                        style={{
-                            background: 'rgba(229,57,53,0.9)',
-                            color: '#fff',
-                            border: 'none',
-                            borderRadius: 8,
-                            padding: '9px 20px',
-                            fontSize: 14,
-                            fontWeight: 600,
-                            cursor: 'pointer',
-                        }}
+                        className="stepper-live-btn stepper-live-btn--cancel"
                     >
                         Cancel
                     </button>
+                    {nightModeActive ? (
+                        <button
+                            type="button"
+                            onClick={toggleAutoNightTorch}
+                            className={`stepper-live-btn stepper-live-btn--auto ${autoNightTorchEnabled ? 'is-active' : ''}`}
+                        >
+                            Auto night flash: {autoNightTorchEnabled ? 'On' : 'Off'}
+                        </button>
+                    ) : null}
+                    {nightModeActive ? (
+                        <button
+                            type="button"
+                            onClick={toggleFlashlight}
+                            className={`stepper-live-btn stepper-live-btn--flash ${torchEnabled ? 'is-active' : ''}`}
+                        >
+                            {torchEnabled ? 'Flash on' : 'Flash off'}
+                        </button>
+                    ) : null}
                 </div>
             </div>
         );

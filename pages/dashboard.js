@@ -90,6 +90,21 @@ function buildVehicleLookupFingerprint(lookup) {
   ].join('|');
 }
 
+function hasVehicleLookupEvidence(lookup) {
+  if (!lookup || typeof lookup !== 'object') return false;
+  const hasImage = Boolean(String(lookup.imageUrl || lookup.savedVehicleImageUrl || '').trim())
+    || (Array.isArray(lookup.imageUrls) && lookup.imageUrls.length > 0);
+  const hasVehicleFields = [
+    lookup.make,
+    lookup.model,
+    lookup.color,
+    lookup.yearOfManufacture,
+    lookup.fuelType,
+    lookup.bodyStyle,
+  ].some((value) => String(value || '').trim().length > 0);
+  return hasImage || hasVehicleFields;
+}
+
 function fileToDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1246,6 +1261,63 @@ export default function DashboardPage() {
   const qrFileInputRef = useRef(null);
   const authReadyRef = useRef(false);
   const pcnAutoCheckSignatureRef = useRef('');
+  const syncPipelineRef = useRef(Promise.resolve());
+  const syncInFlightCountRef = useRef(0);
+
+  function isRetriableSyncError(errorMessage) {
+    const message = String(errorMessage || '').toLowerCase();
+    if (!message) return false;
+
+    return (
+      message.includes('network request failed') ||
+      message.includes('failed to fetch') ||
+      message.includes('unable to resolve host') ||
+      message.includes('no address associated with hostname') ||
+      message.includes('connection abort') ||
+      message.includes('software caused connection abort') ||
+      message.includes('timeout') ||
+      message.includes('timed out') ||
+      message.includes('503') ||
+      message.includes('504') ||
+      message.includes('429')
+    );
+  }
+
+  function getSyncRetryDelayMs(attemptNumber) {
+    const base = Math.min(30000, 2000 * (2 ** Math.max(0, attemptNumber - 1)));
+    const jitter = Math.floor(base * 0.2 * Math.random());
+    return base + jitter;
+  }
+
+  async function sleepMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+  }
+
+  async function enqueueSyncTask(task) {
+    const run = syncPipelineRef.current.then(
+      async () => {
+        syncInFlightCountRef.current += 1;
+        setSyncing(true);
+        return task();
+      },
+      async () => {
+        syncInFlightCountRef.current += 1;
+        setSyncing(true);
+        return task();
+      }
+    );
+
+    syncPipelineRef.current = run
+      .catch(() => undefined)
+      .finally(() => {
+        syncInFlightCountRef.current = Math.max(0, syncInFlightCountRef.current - 1);
+        if (syncInFlightCountRef.current === 0) {
+          setSyncing(false);
+        }
+      });
+
+    return run;
+  }
 
   async function resolveAuthToken({ forceRefresh = false } = {}) {
     const token = await getValidToken({ forceRefresh });
@@ -1497,8 +1569,15 @@ export default function DashboardPage() {
   const pcnSubmissionGate = useMemo(() => {
     const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || selectedTracked?.vrm || selectedVrm);
     const siteId = String(selectedTracked?.payload?.siteId || selectedSiteId || '').trim();
-    const carcheckReady = Boolean(
+    const hasExactLookupMatch = Boolean(
       trackedVrm && activeCarcheckLookup && normalizeVrm(activeCarcheckLookup?.vrm || '') === trackedVrm
+    );
+    const hasLookupEvidence = Boolean(
+      hasVehicleLookupEvidence(activeCarcheckLookup) ||
+      hasVehicleLookupEvidence(selectedTracked?.payload?.savedVehicleLookup)
+    );
+    const carcheckReady = Boolean(
+      trackedVrm && (hasExactLookupMatch || hasLookupEvidence)
     );
     const permitChecked = Boolean(trackedVrm && selectedTrackedAuthorization && typeof selectedTrackedAuthorization === 'object');
 
@@ -3051,6 +3130,12 @@ export default function DashboardPage() {
     if (!vehicleDetails && normalizeVrm(selectedTrackedVehicleDetails?.vrm || '') === vrm) {
       vehicleDetails = selectedTrackedVehicleDetails;
     }
+    if (!vehicleDetails && hasVehicleLookupEvidence(selectedTracked?.payload?.savedVehicleLookup)) {
+      vehicleDetails = buildVehicleDetailsRecord(selectedTracked.payload.savedVehicleLookup, vrm);
+    }
+    if (!vehicleDetails && hasVehicleLookupEvidence(selectedTrackedVehicleDetails)) {
+      vehicleDetails = buildVehicleDetailsRecord(selectedTrackedVehicleDetails, vrm);
+    }
 
     if ((!vehicleDetails || forceCarcheck) && allowNetwork) {
       vehicleDetails = await runVehicleLookupForVrm(vrm, {
@@ -3293,8 +3378,10 @@ export default function DashboardPage() {
       closing: buildPhaseSessionEvidence({ phase: 'closing', detection: closingDetection, capturedAt: closingTime }),
     };
     const elapsedMinutes = diffMinutes(entryTime, closingTime);
+    const entryMs = new Date(entryTime).getTime();
+    const closingMs = new Date(closingTime).getTime();
 
-    if (!elapsedMinutes) {
+    if (!Number.isFinite(entryMs) || !Number.isFinite(closingMs) || closingMs <= entryMs) {
       setMessage('Closing evidence must be captured after opening evidence.');
       return;
     }
@@ -3609,7 +3696,7 @@ export default function DashboardPage() {
     }
   }
 
-  async function syncQueueItem(itemId, { openPcnDialogAfterSuccess = false, forceBreachCapture = false } = {}) {
+  async function syncQueueItemInternal(itemId, { openPcnDialogAfterSuccess = false, forceBreachCapture = false } = {}) {
     const queuedItem = (await listQueueItems()).find((item) => item.id === itemId);
     if (!queuedItem) {
       return { ok: false, error: 'Draft Parking Charge not found for sync' };
@@ -3937,6 +4024,36 @@ export default function DashboardPage() {
     }
   }
 
+  async function syncQueueItem(itemId, options = {}) {
+    return enqueueSyncTask(async () => {
+      const maxAttempts = 3;
+      let lastResult = { ok: false, error: 'Sync failed' };
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const result = await syncQueueItemInternal(itemId, options);
+        if (result?.ok) return result;
+
+        lastResult = result || lastResult;
+        const shouldRetry = attempt < maxAttempts && isRetriableSyncError(lastResult?.error);
+        if (!shouldRetry) {
+          return lastResult;
+        }
+
+        const delayMs = getSyncRetryDelayMs(attempt);
+        await updateQueueItem(itemId, {
+          status: 'queued',
+          lastError: `${lastResult?.error || 'Sync failed'} (retry ${attempt + 1}/${maxAttempts})`,
+          updatedAt: new Date().toISOString(),
+        });
+        await refreshQueue();
+        setMessage(`Network unstable. Retrying sync (${attempt + 1}/${maxAttempts})...`);
+        await sleepMs(delayMs);
+      }
+
+      return lastResult;
+    });
+  }
+
   async function handleConvertToPcn() {
     if (!selectedTracked) return;
     if (convertLoading) return;
@@ -4082,15 +4199,9 @@ export default function DashboardPage() {
   }
 
   async function syncQueue() {
-    if (syncing) return;
-    setSyncing(true);
-    try {
-      const items = await listQueueItems();
-      for (const item of items.filter((entry) => getBreachLifecycle(entry).syncable || entry.status === 'syncing')) {
-        await syncQueueItem(item.id);
-      }
-    } finally {
-      setSyncing(false);
+    const items = await listQueueItems();
+    for (const item of items.filter((entry) => getBreachLifecycle(entry).syncable || entry.status === 'syncing')) {
+      await syncQueueItem(item.id);
     }
   }
 
@@ -4109,12 +4220,7 @@ export default function DashboardPage() {
   }
 
   async function handleRetryTracked(id) {
-    setSyncing(true);
-    try {
-      await syncQueueItem(id);
-    } finally {
-      setSyncing(false);
-    }
+    await syncQueueItem(id);
   }
 
   async function handleReviewTracked(item) {
