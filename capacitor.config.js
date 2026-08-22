@@ -1,4 +1,5 @@
 const backendBase = (process.env.NEXT_PUBLIC_API_BASE_URL || '').replace(/\/$/, '');
+const secondaryBackendBase = (process.env.NEXT_PUBLIC_API_BASE_URL_SECONDARY || '').replace(/\/$/, '');
 const cameraServiceBase = (process.env.NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL || '').replace(/\/$/, '');
 let allowNavigation = [];
 
@@ -7,6 +8,14 @@ const allowNavigationSet = new Set();
 if (backendBase) {
   try {
     allowNavigationSet.add(new URL(backendBase).host);
+  } catch (_) {
+    // Ignore invalid URL and keep existing allowNavigation entries.
+  }
+}
+
+if (secondaryBackendBase) {
+  try {
+    allowNavigationSet.add(new URL(secondaryBackendBase).host);
   } catch (_) {
     // Ignore invalid URL and keep existing allowNavigation entries.
   }

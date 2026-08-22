@@ -41,24 +41,62 @@ ensure_public_firebase_config() {
 }
 
 validate_public_api_base() {
-    local base="${NEXT_PUBLIC_API_BASE_URL:-https://ldk-group-ltd-website-react-p2ea.onrender.com}"
+    local base="${NEXT_PUBLIC_API_BASE_URL:-}"
+    local secondary="${NEXT_PUBLIC_API_BASE_URL_SECONDARY:-}"
+    local render_primary="https://ldk-group-ltd-website-react-p2ea.onrender.com"
+
+    # Respect inline/exported values first. Only fall back to env files when unset.
+    if [ -z "$base" ]; then
+        load_env_file_if_present ".env.local"
+        load_env_file_if_present ".env.production"
+        base="${NEXT_PUBLIC_API_BASE_URL:-}"
+        secondary="${NEXT_PUBLIC_API_BASE_URL_SECONDARY:-$secondary}"
+    fi
+
+    if [ -z "$base" ]; then
+        base="$render_primary"
+    fi
 
     if [[ ! "$base" =~ ^https?:// ]]; then
         base="https://$base"
     fi
 
     base="${base%/}"
+    secondary="${secondary%/}"
 
-    if [[ ! "$base" =~ ^https://((www\.)?ldkgroup\.co\.uk|ldk-group-ltd-website-react-p2ea\.onrender\.com)$ ]]; then
-        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL must point to ldkgroup.co.uk, www.ldkgroup.co.uk, or ldk-group-ltd-website-react-p2ea.onrender.com over HTTPS (got: $base)${NC}"
+    # Never keep www as first preference for API origin in APK builds.
+    if [[ "$base" =~ ^https://www\.ldkgroup\.co\.uk$ ]]; then
+        base="https://ldkgroup.co.uk"
+    fi
+
+    if [[ "$secondary" =~ ^https://www\.ldkgroup\.co\.uk$ ]]; then
+        secondary="https://ldkgroup.co.uk"
+    fi
+
+    if [[ ! "$base" =~ ^https://(ldkgroup\.co\.uk|ldk-group-ltd-website-react-p2ea\.onrender\.com)$ ]]; then
+        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL must point to ldkgroup.co.uk or ldk-group-ltd-website-react-p2ea.onrender.com over HTTPS (got: $base)${NC}"
         exit 1
     fi
 
-    if [[ "$base" == "https://ldkgroup.co.uk" ]]; then
-        echo -e "${YELLOW}Using apex host may trigger cross-host redirects that can drop auth on mobile. Prefer https://ldk-group-ltd-website-react-p2ea.onrender.com for APK builds.${NC}"
+    # Enforce Render as primary to avoid host redirect/auth drift in mobile runtime.
+    if [[ "$base" != "$render_primary" ]]; then
+        secondary="$base"
+        base="$render_primary"
+    elif [[ -z "$secondary" ]]; then
+        secondary="https://ldkgroup.co.uk"
+    fi
+
+    if [[ -n "$secondary" && ! "$secondary" =~ ^https://(ldkgroup\.co\.uk|ldk-group-ltd-website-react-p2ea\.onrender\.com)$ ]]; then
+        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL_SECONDARY must point to ldkgroup.co.uk or ldk-group-ltd-website-react-p2ea.onrender.com over HTTPS (got: $secondary)${NC}"
+        exit 1
+    fi
+
+    if [[ "$secondary" == "$base" ]]; then
+        secondary=""
     fi
 
     export NEXT_PUBLIC_API_BASE_URL="$base"
+    export NEXT_PUBLIC_API_BASE_URL_SECONDARY="$secondary"
 }
 
 validate_camera_service_base() {
@@ -66,14 +104,20 @@ validate_camera_service_base() {
 
     # Respect inline/exported values first. Only fall back to env files when unset.
     if [ -z "$base" ]; then
+        # Loading env files can unintentionally overwrite NEXT_PUBLIC_API_BASE_URL.
+        # Preserve it so API preflight output stays deterministic.
+        local preserved_api_base="${NEXT_PUBLIC_API_BASE_URL:-}"
         load_env_file_if_present ".env.local"
         load_env_file_if_present ".env.production"
+        if [ -n "$preserved_api_base" ]; then
+            export NEXT_PUBLIC_API_BASE_URL="$preserved_api_base"
+        fi
         base="${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL:-${CAMERA_SERVICE_BASE_URL:-}}"
     fi
 
     if [ -z "$base" ]; then
         echo -e "${RED}NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL is required for APK builds.${NC}"
-        echo -e "${YELLOW}Expected value example: https://camera.ldkgroup.co.uk${NC}"
+        echo -e "${YELLOW}Expected value example: https://ldk-group-camera-service.onrender.com${NC}"
         exit 1
     fi
 
@@ -84,8 +128,13 @@ validate_camera_service_base() {
 
     base="${base%/}"
 
-    if [[ ! "$base" =~ ^https?://([a-zA-Z0-9-]+\.)*ldkgroup\.co\.uk$ ]]; then
-        echo -e "${RED}NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL must point to *.ldkgroup.co.uk (got: $base)${NC}"
+    # Never keep www camera host as first preference for APK builds.
+    if [[ "$base" =~ ^https://www\.camera\.ldkgroup\.co\.uk$ ]]; then
+        base="https://camera.ldkgroup.co.uk"
+    fi
+
+    if [[ ! "$base" =~ ^https?://(([a-zA-Z0-9-]+\.)*ldkgroup\.co\.uk|ldk-group-camera-service\.onrender\.com)$ ]]; then
+        echo -e "${RED}NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL must point to *.ldkgroup.co.uk or ldk-group-camera-service.onrender.com (got: $base)${NC}"
         exit 1
     fi
 
@@ -98,6 +147,9 @@ print_preflight_api_targets() {
 
     echo -e "${GREEN}APK preflight API targets:${NC}"
     echo -e "  NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}"
+    if [ -n "${NEXT_PUBLIC_API_BASE_URL_SECONDARY:-}" ]; then
+        echo -e "  NEXT_PUBLIC_API_BASE_URL_SECONDARY=${NEXT_PUBLIC_API_BASE_URL_SECONDARY}"
+    fi
     echo -e "  NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL=${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL}"
 }
 
@@ -115,9 +167,22 @@ normalize_signing_env() {
     repo_root="$(pwd)"
     local local_keystore="$repo_root/.keystore/warden-release.jks"
 
+    if [ -z "${WARDEN_KEYSTORE_PATH:-}" ] || [ -z "${WARDEN_KEYSTORE_ALIAS:-}" ] || [ -z "${WARDEN_KEYSTORE_PASSWORD:-}" ] || [ -z "${WARDEN_KEY_PASSWORD:-}" ]; then
+        load_env_file_if_present ".env.local"
+        load_env_file_if_present ".env.production"
+    fi
+
+    if [ -z "${WARDEN_KEYSTORE_PATH:-}" ] && [ -f "$local_keystore" ]; then
+        export WARDEN_KEYSTORE_PATH="$local_keystore"
+    fi
+
     if [ -n "${WARDEN_KEYSTORE_PATH:-}" ] && [ ! -f "$WARDEN_KEYSTORE_PATH" ] && [ -f "$local_keystore" ]; then
         echo -e "${YELLOW}Adjusting WARDEN_KEYSTORE_PATH to local keystore: $local_keystore${NC}"
         export WARDEN_KEYSTORE_PATH="$local_keystore"
+    fi
+
+    if [ -z "${WARDEN_KEYSTORE_ALIAS:-}" ] && [ -n "${WARDEN_KEYSTORE_PATH:-}" ] && [ -f "$WARDEN_KEYSTORE_PATH" ]; then
+        echo -e "${YELLOW}WARDEN_KEYSTORE_ALIAS is still unset after env loading; release signing will fail until it is provided.${NC}"
     fi
 }
 

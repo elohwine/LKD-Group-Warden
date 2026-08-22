@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import pLimit from 'p-limit';
 import { useRouter } from 'next/router';
 import { fetchCameraServiceJson, fetchJson } from '../lib/api';
 import {
@@ -14,7 +15,7 @@ import { signOutFromWardenApp, getStoredToken, getValidToken } from '../lib/auth
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
-import { createQueueItem, createSerialTaskQueue, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
+import { createQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
 import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { isLikelyCurrentUkVrm, normalizeUkVrmFromOcr, scoreUkVrmCandidate } from '../lib/ukVrmOcr.mjs';
 import { getServerTimestamp, syncWithServerTime } from '../lib/timeSync';
@@ -54,34 +55,185 @@ function formatRemaining(secondsRemaining) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
-function createConcurrencyLimiter(maxConcurrency = 4) {
-  const concurrency = Number.isFinite(Number(maxConcurrency)) ? Math.max(1, Math.floor(Number(maxConcurrency))) : 4;
-  let activeCount = 0;
-  const queue = [];
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  if (typeof fetch !== 'function') {
+    throw new Error('fetch_unavailable');
+  }
 
-  const runNext = () => {
-    if (activeCount >= concurrency) return;
-    const next = queue.shift();
-    if (!next) return;
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  let timeoutId = null;
+  const { signal, ...rest } = options || {};
 
-    activeCount += 1;
-    Promise.resolve()
-      .then(next.task)
-      .then(next.resolve, next.reject)
-      .finally(() => {
-        activeCount = Math.max(0, activeCount - 1);
-        runNext();
-      });
-  };
+  if (controller && signal) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+    } else {
+      signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+    }
+  }
 
-  return (task) => new Promise((resolve, reject) => {
-    queue.push({ task, resolve, reject });
-    runNext();
-  });
+  if (controller && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutId = setTimeout(() => controller.abort(new Error('request_timeout')), timeoutMs);
+  }
+
+  try {
+    return await fetch(url, {
+      ...rest,
+      signal: controller ? controller.signal : signal,
+    });
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function isRetryableEvidenceUploadError(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('timed out')
+    || text.includes('network error')
+    || text.includes('failed to fetch')
+    || text.includes('request failed')
+    || text.includes('abort')
+    || text.includes('server error (5')
+    || text.includes('server error (429)')
+    || text.includes('server error (408)')
+    || text.includes('server error (0)');
 }
 
 const PCN_SYNC_CONCURRENCY = 1;
 const IMAGE_UPLOAD_CONCURRENCY = 1;
+const EVIDENCE_UPLOAD_TIMEOUT_MS = 120000;
+const EVIDENCE_UPLOAD_MAX_RETRIES = 2;
+const EVIDENCE_UPLOAD_COMPLETING_STALL_MS = 120000;
+const EVIDENCE_UPLOAD_PROGRESS_STALL_MS = 120000;
+
+function uploadEvidenceBlobWithXhr({ url, blob, contentType, fileName, uploadLabel, onProgress }) {
+  const xhr = new XMLHttpRequest();
+
+  const promise = new Promise((resolve, reject) => {
+    let progressFired = false;
+    let settled = false;
+    let lastProgressAt = Date.now();
+    let completingSince = null;
+    let progressTimeout = null;
+    let watchdogTimer = null;
+
+    const settle = (handler) => {
+      if (settled) return;
+      settled = true;
+      if (progressTimeout) clearTimeout(progressTimeout);
+      if (watchdogTimer) clearInterval(watchdogTimer);
+      handler();
+    };
+
+    const emitProgress = (progress) => {
+      if (typeof onProgress !== 'function') return;
+      try {
+        onProgress({
+          status: 'uploading',
+          progress,
+          fileName: fileName || '',
+          completingSince,
+        });
+      } catch (_) {
+        // Ignore progress callback failures so the upload can continue.
+      }
+    };
+
+    xhr.upload.addEventListener('progress', (event) => {
+      progressFired = true;
+      lastProgressAt = Date.now();
+      const safeProgress = event.lengthComputable
+        ? Math.round((event.loaded / event.total) * 100)
+        : (event.loaded > 0 ? 50 : 10);
+
+      if (safeProgress >= 100 && !completingSince) {
+        completingSince = Date.now();
+      }
+
+      console.log(`[warden] evidence upload ${uploadLabel} progress: ${safeProgress}% (${event.loaded}/${event.total} bytes, readyState=${xhr.readyState})`);
+      emitProgress(safeProgress);
+    });
+
+    progressTimeout = setTimeout(() => {
+      if (!progressFired) {
+        console.warn(`[warden] evidence upload ${uploadLabel} produced no progress events - forcing initial progress`);
+        emitProgress(5);
+      }
+    }, 1000);
+
+    watchdogTimer = setInterval(() => {
+      if (settled) return;
+      const now = Date.now();
+      const progressAge = now - lastProgressAt;
+      const completingAge = completingSince ? now - completingSince : 0;
+      const stalledCompleting = Boolean(completingSince) && completingAge > EVIDENCE_UPLOAD_COMPLETING_STALL_MS;
+      const stalledNoProgress = progressAge > EVIDENCE_UPLOAD_PROGRESS_STALL_MS;
+
+      if (!stalledCompleting && !stalledNoProgress) return;
+
+      const reason = stalledCompleting ? 'upload completion timeout' : 'upload progress timeout';
+      try { xhr.abort(); } catch (_) { }
+      settle(() => reject(new Error(`Upload stalled (${reason})`)));
+    }, 5000);
+
+    xhr.addEventListener('readystatechange', () => {
+      if (xhr.readyState === 4 && !settled) {
+        settle(() => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve({
+              url: String(url || '').split('?')[0],
+              fileName,
+            });
+            return;
+          }
+
+          const errText = xhr.responseText?.slice(0, 200) || 'No response';
+          reject(new Error(`Upload failed (${xhr.status}): ${errText}`));
+        });
+      }
+    });
+
+    xhr.addEventListener('load', () => {
+      if (settled) return;
+      settle(() => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve({
+            url: String(url || '').split('?')[0],
+            fileName,
+          });
+          return;
+        }
+        reject(new Error(`Upload failed (${xhr.status})`));
+      });
+    });
+
+    xhr.addEventListener('error', (event) => {
+      console.error(`[warden] evidence upload ${uploadLabel} error event:`, event, `readyState=${xhr.readyState}, status=${xhr.status}`);
+      settle(() => reject(new Error('Network error')));
+    });
+
+    xhr.addEventListener('abort', () => {
+      console.warn(`[warden] evidence upload ${uploadLabel} aborted`);
+      settle(() => reject(new Error('Upload aborted')));
+    });
+
+    xhr.addEventListener('timeout', () => {
+      console.error(`[warden] evidence upload ${uploadLabel} timed out after 300s`);
+      settle(() => reject(new Error('Upload timed out — please try again')));
+    });
+
+    try {
+      xhr.timeout = 300000;
+      xhr.open('PUT', url);
+      xhr.setRequestHeader('Content-Type', contentType || 'image/jpeg');
+      xhr.send(blob);
+    } catch (error) {
+      settle(() => reject(error));
+    }
+  });
+
+  return { xhr, promise };
+}
 
 function normalizeObservationMinutes(value) {
   const numeric = Number(value);
@@ -1262,6 +1414,7 @@ export default function DashboardPage() {
   const [breachStatusFilter, setBreachStatusFilter] = useState('all');
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
+  const [submissionProgressText, setSubmissionProgressText] = useState('');
   const [pcnReasonInput, setPcnReasonInput] = useState('No valid permit or payment found');
   const [monitoringSessionActive, setMonitoringSessionActive] = useState(false);
   const [monitoringSessionStartedAt, setMonitoringSessionStartedAt] = useState('');
@@ -1290,8 +1443,8 @@ export default function DashboardPage() {
   const qrFileInputRef = useRef(null);
   const authReadyRef = useRef(false);
   const pcnAutoCheckSignatureRef = useRef('');
-  const syncPipelineRef = useRef(createSerialTaskQueue());
-  const convertPipelineRef = useRef(createSerialTaskQueue());
+  const pcnSubmitLimitRef = useRef(pLimit(1));
+  const convertPipelineLimitRef = useRef(pLimit(1));
   const syncInFlightCountRef = useRef(0);
   const syncAbortControllersRef = useRef(new Map());
 
@@ -1336,8 +1489,8 @@ export default function DashboardPage() {
     return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
   }
 
-  async function enqueueSyncTask(task, key = '__sync__') {
-    const run = syncPipelineRef.current.enqueue(async () => {
+  async function enqueueSyncTask(task) {
+    const run = pcnSubmitLimitRef.current(async () => {
       syncInFlightCountRef.current += 1;
       setSyncing(true);
       try {
@@ -1348,7 +1501,7 @@ export default function DashboardPage() {
           setSyncing(false);
         }
       }
-    }, key);
+    });
 
     return run;
   }
@@ -2793,12 +2946,31 @@ export default function DashboardPage() {
     setCaptureStepperOpen(false);
   }
 
-  async function uploadEvidenceFiles(evidenceFiles, manualVrm, siteIdOverride = '') {
+  async function uploadEvidenceFiles(evidenceFiles, manualVrm, siteIdOverride = '', options = {}) {
     const uploadCandidates = (Array.isArray(evidenceFiles) ? evidenceFiles : []).filter(Boolean);
     const siteId = String(siteIdOverride || selectedSiteId || '').trim();
     const fallbackVrm = normalizeVrm(manualVrm || selectedVrm || '');
-    const limitUpload = createConcurrencyLimiter(IMAGE_UPLOAD_CONCURRENCY);
+    const limitUpload = pLimit(IMAGE_UPLOAD_CONCURRENCY);
     const totalUploads = uploadCandidates.length;
+    const onProgress = typeof options?.onProgress === 'function' ? options.onProgress : null;
+    const phaseLabel = String(options?.phase || 'evidence');
+    let completedUploads = 0;
+
+    const emitProgress = (payload) => {
+      if (!onProgress) return;
+      try {
+        onProgress({
+          phase: phaseLabel,
+          total: totalUploads,
+          completed: completedUploads,
+          ...payload,
+        });
+      } catch (_) {
+        // Ignore progress callback failures so uploads continue.
+      }
+    };
+
+    emitProgress({ status: 'starting', current: 0, fileName: '' });
 
     const uploadViaServerFallback = async ({ blob, fileName, siteIdValue, vrmValue }) => {
       const formData = new FormData();
@@ -2807,23 +2979,23 @@ export default function DashboardPage() {
       formData.append('manualVrm', vrmValue || '');
 
       let token = await resolveAuthToken();
-      let response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+      let response = await fetchWithTimeout(buildApiUrl('/api/warden/uploadevidence'), {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
         },
         body: formData,
-      });
+      }, EVIDENCE_UPLOAD_TIMEOUT_MS);
 
       if (response.status === 401) {
         token = await resolveAuthToken({ forceRefresh: true });
-        response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+        response = await fetchWithTimeout(buildApiUrl('/api/warden/uploadevidence'), {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
           },
           body: formData,
-        });
+        }, EVIDENCE_UPLOAD_TIMEOUT_MS);
       }
 
       const data = await response.json().catch(() => ({}));
@@ -2840,17 +3012,20 @@ export default function DashboardPage() {
     const uploadTasks = uploadCandidates.map((file, index) => limitUpload(async () => {
       const blob = file?.blob || file;
       if (!blob) {
+        completedUploads += 1;
+        emitProgress({ status: 'uploaded', current: index + 1, fileName: file?.name || '' });
         return { index, images: [], vrm: '' };
       }
 
       const uploadLabel = `${index + 1}/${totalUploads}`;
+      const fileName = file?.name || blob?.name || `evidence_${Date.now()}_${index}.jpg`;
+      emitProgress({ status: 'uploading', current: index + 1, fileName });
       console.log(`[warden] evidence upload queue start ${uploadLabel}`, {
-        fileName: file?.name || blob?.name || null,
+        fileName: fileName || null,
         size: Number(blob?.size || 0),
         contentType: blob?.type || 'image/jpeg',
       });
 
-      const fileName = file?.name || blob?.name || `evidence_${Date.now()}_${index}.jpg`;
       const contentType = blob?.type || 'image/jpeg';
       const signedFolder = siteId
         ? `warden_evidence/${encodeURIComponent(siteId)}`
@@ -2860,101 +3035,142 @@ export default function DashboardPage() {
         `/api/warden/uploadevidence?mode=signed-upload&folder=${signedFolder}&filename=${encodeURIComponent(fileName)}&contentType=${encodeURIComponent(contentType)}`
       );
 
-      try {
-        let token = await resolveAuthToken();
-        let response = await fetch(signedEndpoint, {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: 'application/json',
-          },
-        });
-
-        if (response.status === 401) {
-          token = await resolveAuthToken({ forceRefresh: true });
-          response = await fetch(signedEndpoint, {
+      let lastError = null;
+      for (let attempt = 0; attempt <= EVIDENCE_UPLOAD_MAX_RETRIES; attempt += 1) {
+        try {
+          let token = await resolveAuthToken();
+          let response = await fetchWithTimeout(signedEndpoint, {
             method: 'GET',
             headers: {
               Authorization: `Bearer ${token}`,
               Accept: 'application/json',
             },
-          });
-        }
+          }, EVIDENCE_UPLOAD_TIMEOUT_MS);
 
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
-          throw new Error(`${prefix}${data?.error || 'Failed to request signed upload URL'}`);
-        }
+          if (response.status === 401) {
+            token = await resolveAuthToken({ forceRefresh: true });
+            response = await fetchWithTimeout(signedEndpoint, {
+              method: 'GET',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/json',
+              },
+            }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+          }
 
-        const putResponse = await fetch(data?.url, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': contentType,
-          },
-          body: blob,
-        });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
+            throw new Error(`${prefix}${data?.error || 'Failed to request signed upload URL'}`);
+          }
 
-        if (!putResponse.ok) {
-          const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
-          throw new Error(`${prefix}Direct upload failed (${putResponse.status})`);
-        }
-
-        console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
-          fileName,
-          path: data?.path || null,
-          status: putResponse.status,
-          mode: 'signed-upload',
-        });
-
-        return {
-          index,
-          vrm: fallbackVrm || '',
-          images: data?.url ? [String(data.url).split('?')[0]] : [],
-        };
-      } catch (signedUploadError) {
-        console.warn(`[warden] signed evidence upload failed, using server fallback ${uploadLabel}`, {
-          fileName,
-          error: signedUploadError?.message || String(signedUploadError),
-        });
-
-        try {
-          const fallbackResult = await uploadViaServerFallback({
+          const putResult = await uploadEvidenceBlobWithXhr({
+            url: data?.url,
             blob,
+            contentType,
             fileName,
-            siteIdValue: siteId,
-            vrmValue: fallbackVrm,
-          });
+            uploadLabel,
+            onProgress: (payload) => {
+              emitProgress({
+                ...payload,
+                current: index + 1,
+                fileName,
+              });
+            },
+          }).promise;
 
           console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
             fileName,
-            mode: 'server-fallback',
-            uploaded: fallbackResult.images.length,
+            path: data?.path || null,
+            status: 200,
+            mode: 'signed-upload',
           });
+
+          completedUploads += 1;
+          emitProgress({ status: 'uploaded', current: index + 1, fileName });
 
           return {
             index,
-            vrm: fallbackResult.vrm || fallbackVrm || '',
-            images: fallbackResult.images,
+            vrm: fallbackVrm || '',
+            images: putResult?.url ? [putResult.url] : (data?.url ? [String(data.url).split('?')[0]] : []),
           };
-        } catch (fallbackError) {
-          throw new Error(
-            `Signed upload failed (${signedUploadError?.message || 'unknown'}) and fallback failed (${fallbackError?.message || 'unknown'})`
-          );
+        } catch (signedUploadError) {
+          lastError = signedUploadError;
+          const errorMessage = signedUploadError?.message || String(signedUploadError);
+          const retryable = isRetryableEvidenceUploadError(errorMessage);
+
+          if (retryable && attempt < EVIDENCE_UPLOAD_MAX_RETRIES) {
+            const backoffMs = 1000 * Math.pow(2, attempt);
+            emitProgress({
+              status: 'retrying',
+              current: index + 1,
+              fileName,
+              error: `Retrying ${attempt + 2}/${EVIDENCE_UPLOAD_MAX_RETRIES + 1}...`,
+            });
+            await sleepMs(backoffMs);
+            continue;
+          }
+
+          break;
         }
+      }
+
+      const signedUploadError = lastError || new Error('Upload failed');
+      console.warn(`[warden] signed evidence upload failed, using server fallback ${uploadLabel}`, {
+        fileName,
+        error: signedUploadError?.message || String(signedUploadError),
+      });
+
+      try {
+        const fallbackResult = await uploadViaServerFallback({
+          blob,
+          fileName,
+          siteIdValue: siteId,
+          vrmValue: fallbackVrm,
+        });
+
+        console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
+          fileName,
+          mode: 'server-fallback',
+          uploaded: fallbackResult.images.length,
+        });
+
+        completedUploads += 1;
+        emitProgress({ status: 'uploaded', current: index + 1, fileName });
+
+        return {
+          index,
+          vrm: fallbackResult.vrm || fallbackVrm || '',
+          images: fallbackResult.images,
+        };
+      } catch (fallbackError) {
+        emitProgress({
+          status: 'failed',
+          current: index + 1,
+          fileName,
+          error: fallbackError?.message || signedUploadError?.message || 'Upload failed',
+        });
+        throw new Error(
+          `Signed upload failed (${signedUploadError?.message || 'unknown'}) and fallback failed (${fallbackError?.message || 'unknown'})`
+        );
       }
     }));
 
     const uploadResults = await Promise.allSettled(uploadTasks);
-    const rejected = uploadResults.find((result) => result.status === 'rejected');
-    if (rejected && rejected.reason) {
-      throw rejected.reason;
-    }
+    const rejected = uploadResults
+      .filter((result) => result.status === 'rejected')
+      .map((result) => result.reason)
+      .filter(Boolean);
 
     const fulfilled = uploadResults
       .filter((result) => result.status === 'fulfilled')
       .map((result) => result.value)
       .sort((a, b) => a.index - b.index);
+
+    if (fulfilled.length === 0) {
+      const firstError = rejected[0];
+      throw firstError || new Error('Evidence upload failed for all files');
+    }
 
     const resolvedVrm = fulfilled
       .map((result) => normalizeVrm(result?.vrm || ''))
@@ -2962,9 +3178,19 @@ export default function DashboardPage() {
 
     const uploadedImages = fulfilled.flatMap((result) => (Array.isArray(result?.images) ? result.images : []));
 
+    emitProgress({
+      status: 'done',
+      current: totalUploads,
+      completed: completedUploads,
+      uploaded: uploadedImages.length,
+      failed: rejected.length,
+    });
+
     return {
       vrm: resolvedVrm || fallbackVrm || null,
       images: uploadedImages.filter((url, idx, all) => typeof url === 'string' && url && all.indexOf(url) === idx),
+      failedCount: rejected.length,
+      errors: rejected.map((error) => String(error?.message || error || 'Upload failed')),
     };
   }
 
@@ -3957,44 +4183,174 @@ export default function DashboardPage() {
         return '';
       };
 
-      const payloadEntryCameraRawImage = cameraRawRecords
+      const payloadEntryCameraRawImages = cameraRawRecords
         .filter((record) => record?.phase === 'entry')
         .map((record) => pickFirstHttpUrl(record?.uploadedUrl, record?.imageUrl, record?.url, record?.publicUrl))
-        .find(Boolean) || '';
+        .filter(Boolean);
 
-      const payloadClosingCameraRawImage = cameraRawRecords
+      const payloadClosingCameraRawImages = cameraRawRecords
         .filter((record) => record?.phase === 'closing')
         .map((record) => pickFirstHttpUrl(record?.uploadedUrl, record?.imageUrl, record?.url, record?.publicUrl))
-        .find(Boolean) || '';
+        .filter(Boolean);
 
-      const payloadEntryImage =
-        queuedItem?.payload?.evidence?.entry?.imageUrl ||
-        queuedItem?.payload?.evidence?.entry?.vehicleImage ||
-        payloadEntryCameraRawImage ||
-        existingPayloadImages[0] ||
-        '';
-      const payloadClosingImage =
-        queuedItem?.payload?.evidence?.exit?.imageUrl ||
-        queuedItem?.payload?.closingEvidence?.imageUrl ||
-        queuedItem?.payload?.evidence?.latest?.imageUrl ||
-        payloadClosingCameraRawImage ||
-        existingPayloadImages[1] ||
-        '';
+      const uniqueHttpUrls = (values) => values
+        .map((value) => String(value || '').trim())
+        .filter((value) => /^https?:\/\//i.test(value))
+        .filter((value, index, all) => all.indexOf(value) === index);
 
-      const hasPayloadPairedEvidence = Boolean(payloadEntryImage && payloadClosingImage);
+      const payloadEntryImages = uniqueHttpUrls([
+        queuedItem?.payload?.evidence?.entry?.imageUrl,
+        queuedItem?.payload?.evidence?.entry?.vehicleImage,
+        queuedItem?.payload?.sessionEvidence?.entry?.vehicleImage,
+        queuedItem?.payload?.detectedEntryVehicleImage,
+        queuedItem?.payload?.startVehicleImage,
+        ...payloadEntryCameraRawImages,
+      ]);
+
+      const payloadClosingImages = uniqueHttpUrls([
+        queuedItem?.payload?.evidence?.exit?.imageUrl,
+        queuedItem?.payload?.closingEvidence?.imageUrl,
+        queuedItem?.payload?.evidence?.latest?.imageUrl,
+        queuedItem?.payload?.sessionEvidence?.closing?.vehicleImage,
+        queuedItem?.payload?.detectedClosingVehicleImage,
+        ...payloadClosingCameraRawImages,
+      ]);
+
+      if (!payloadEntryImages.length && existingPayloadImages[0]) {
+        payloadEntryImages.push(existingPayloadImages[0]);
+      }
+      if (!payloadClosingImages.length && existingPayloadImages[1]) {
+        payloadClosingImages.push(existingPayloadImages[1]);
+      }
+
+      const payloadEntryImage = payloadEntryImages[0] || '';
+      const payloadClosingImage = payloadClosingImages[0] || '';
+      const hasPayloadPairedEvidence = payloadEntryImages.length > 0 && payloadClosingImages.length > 0;
 
       if (!hasLocalPairedEvidence && !hasPayloadPairedEvidence) {
         throw new Error('Paired opening and closing evidence is required before sync');
       }
 
-      const entryEvidence = hasLocalPairedEvidence
-        ? await uploadEvidenceFiles(entryEvidenceFiles, queuedItem.payload.vrm, queuedSiteId)
-        : { vrm: queuedItem.payload.vrm, images: [payloadEntryImage] };
-      const closingEvidence = hasLocalPairedEvidence
-        ? await uploadEvidenceFiles(closingEvidenceFiles, queuedItem.payload.vrm, queuedSiteId)
-        : { vrm: queuedItem.payload.vrm, images: [payloadClosingImage] };
+      const queueVrmLabel = normalizeVrm(queuedItem?.payload?.vrm || queuedItem?.vrm || '') || 'session';
+
+      if (hasLocalPairedEvidence) {
+        setMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (0/${entryEvidenceFiles.length})...`);
+      } else {
+        setMessage(`Sync ${queueVrmLabel} Step 1/4: Using stored opening evidence...`);
+      }
+
+      let entryEvidence;
+      if (hasLocalPairedEvidence) {
+        try {
+          entryEvidence = await uploadEvidenceFiles(entryEvidenceFiles, queuedItem.payload.vrm, queuedSiteId, {
+            phase: 'entry',
+            onProgress: ({ status, completed, total }) => {
+              if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
+              setMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (${Math.min(completed, total)}/${total})...`);
+            },
+          });
+        } catch (error) {
+          if (!payloadEntryImages.length) throw error;
+          console.warn('[warden] opening evidence upload failed, using stored payload evidence', {
+            error: error?.message || String(error),
+            storedCount: payloadEntryImages.length,
+          });
+          entryEvidence = {
+            vrm: queuedItem.payload.vrm,
+            images: payloadEntryImages,
+            failedCount: entryEvidenceFiles.length,
+            errors: [String(error?.message || 'Opening evidence upload failed')],
+            fromStoredPayload: true,
+          };
+        }
+      } else {
+        entryEvidence = {
+          vrm: queuedItem.payload.vrm,
+          images: payloadEntryImages,
+          failedCount: 0,
+          errors: [],
+          fromStoredPayload: true,
+        };
+      }
+
+      if ((!entryEvidence?.images || entryEvidence.images.length === 0) && payloadEntryImages.length > 0) {
+        entryEvidence = {
+          ...(entryEvidence || {}),
+          vrm: entryEvidence?.vrm || queuedItem.payload.vrm,
+          images: payloadEntryImages,
+          fromStoredPayload: true,
+        };
+      }
+
+      if (Number(entryEvidence?.failedCount || 0) > 0) {
+        console.warn('[warden] opening evidence partial upload', {
+          failed: entryEvidence.failedCount,
+          errors: entryEvidence.errors || [],
+        });
+      }
+
+      if (hasLocalPairedEvidence) {
+        setMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (0/${closingEvidenceFiles.length})...`);
+      } else {
+        setMessage(`Sync ${queueVrmLabel} Step 2/4: Using stored closing evidence...`);
+      }
+
+      let closingEvidence;
+      if (hasLocalPairedEvidence) {
+        try {
+          closingEvidence = await uploadEvidenceFiles(closingEvidenceFiles, queuedItem.payload.vrm, queuedSiteId, {
+            phase: 'closing',
+            onProgress: ({ status, completed, total }) => {
+              if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
+              setMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (${Math.min(completed, total)}/${total})...`);
+            },
+          });
+        } catch (error) {
+          if (!payloadClosingImages.length) throw error;
+          console.warn('[warden] closing evidence upload failed, using stored payload evidence', {
+            error: error?.message || String(error),
+            storedCount: payloadClosingImages.length,
+          });
+          closingEvidence = {
+            vrm: queuedItem.payload.vrm,
+            images: payloadClosingImages,
+            failedCount: closingEvidenceFiles.length,
+            errors: [String(error?.message || 'Closing evidence upload failed')],
+            fromStoredPayload: true,
+          };
+        }
+      } else {
+        closingEvidence = {
+          vrm: queuedItem.payload.vrm,
+          images: payloadClosingImages,
+          failedCount: 0,
+          errors: [],
+          fromStoredPayload: true,
+        };
+      }
+
+      if ((!closingEvidence?.images || closingEvidence.images.length === 0) && payloadClosingImages.length > 0) {
+        closingEvidence = {
+          ...(closingEvidence || {}),
+          vrm: closingEvidence?.vrm || queuedItem.payload.vrm,
+          images: payloadClosingImages,
+          fromStoredPayload: true,
+        };
+      }
+
+      if (Number(closingEvidence?.failedCount || 0) > 0) {
+        console.warn('[warden] closing evidence partial upload', {
+          failed: closingEvidence.failedCount,
+          errors: closingEvidence.errors || [],
+        });
+      }
+
+      if (!entryEvidence?.images?.length || !closingEvidence?.images?.length) {
+        throw new Error('Paired opening and closing evidence is required before sync');
+      }
 
       const vrm = normalizeVrm(closingEvidence.vrm || entryEvidence.vrm || queuedItem.payload.vrm);
+      setMessage(`Sync ${queueVrmLabel} Step 3/4: Validating permit and carcheck...`);
       const submissionChecks = await ensurePcnSubmissionChecks({
         vrm,
         siteId: queuedSiteId,
@@ -4011,7 +4367,9 @@ export default function DashboardPage() {
         throw new Error('E-permit check is required before submission. Use Retry e-permit check in Draft PCN details.');
       }
       const { entryTime, closingTime } = resolveObservationWindow(queuedItem.payload || {});
-      const allImages = [...(entryEvidence.images || []), ...(closingEvidence.images || [])];
+      const allImages = [...(entryEvidence.images || []), ...(closingEvidence.images || [])]
+        .filter((value) => typeof value === 'string' && /^https?:\/\//i.test(value))
+        .filter((value, index, all) => all.indexOf(value) === index);
       const cameraRawDataForLos = enrichCameraRawRecordsWithUploadedUrls(
         queuedItem?.payload?.cameraRawData || [],
         entryEvidence.images || [],
@@ -4041,6 +4399,20 @@ export default function DashboardPage() {
         closingEvidenceFiles,
         submissionSafePayload?.detectedClosingPlateCutoffImage || submissionSafePayload?.sessionEvidence?.closing?.plateCutoffImage || ''
       );
+      const supplementalEvidenceUrls = uniqueHttpUrls([
+        submissionSafePayload?.detectedEntryPlateCutoffImage,
+        submissionSafePayload?.detectedClosingPlateCutoffImage,
+        submissionSafePayload?.sessionEvidence?.entry?.plateCutoffImage,
+        submissionSafePayload?.sessionEvidence?.closing?.plateCutoffImage,
+        entryPlateImageUrl,
+        closingPlateImageUrl,
+      ]);
+      const allEvidenceImages = uniqueHttpUrls([
+        ...allImages,
+        ...payloadEntryImages,
+        ...payloadClosingImages,
+        ...supplementalEvidenceUrls,
+      ]);
       const entryFrame = buildEvidenceFrame(entryEvidence.images?.[0], entryTime, entryPlateImageUrl);
       const closingFrame = buildEvidenceFrame(closingEvidence.images?.[0], closingTime, closingPlateImageUrl);
       const vehicleDetails = buildVehicleDetailsRecord(
@@ -4074,19 +4446,41 @@ export default function DashboardPage() {
           },
         }),
       };
+      const normalizedSubmissionPayload = {
+        contraventionReason: submissionSafePayload?.contraventionReason || null,
+        selectedContraventionCode: submissionSafePayload?.selectedContraventionCode || submissionSafePayload?.contraventionCode || null,
+        contraventionCode: submissionSafePayload?.contraventionCode || submissionSafePayload?.selectedContraventionCode || null,
+        location: submissionSafePayload?.location || null,
+        observationStartTime: entryTime || submissionSafePayload?.observationStartTime || null,
+        observationEndTime: closingTime || submissionSafePayload?.observationEndTime || null,
+        manualNote: submissionSafePayload?.manualNote || null,
+        authorization: authData,
+        vehicleDetails,
+        savedVehicleLookup: vehicleDetails,
+        detectedEntryPlateText: submissionSafePayload?.detectedEntryPlateText || null,
+        detectedClosingPlateText: submissionSafePayload?.detectedClosingPlateText || null,
+        detectedEntryPlateConfidence: Number(submissionSafePayload?.detectedEntryPlateConfidence || 0),
+        detectedClosingPlateConfidence: Number(submissionSafePayload?.detectedClosingPlateConfidence || 0),
+        detectedEntryVehicleImage: entryFrame?.imageUrl || submissionSafePayload?.detectedEntryVehicleImage || submissionSafePayload?.startVehicleImage || '',
+        detectedClosingVehicleImage: closingFrame?.imageUrl || submissionSafePayload?.detectedClosingVehicleImage || '',
+        detectedEntryPlateCutoffImage: entryPlateImageUrl || submissionSafePayload?.detectedEntryPlateCutoffImage || '',
+        detectedClosingPlateCutoffImage: closingPlateImageUrl || submissionSafePayload?.detectedClosingPlateCutoffImage || '',
+        mainEntryImageIndex: Number.isFinite(Number(submissionSafePayload?.mainEntryImageIndex)) ? Number(submissionSafePayload.mainEntryImageIndex) : 0,
+        mainClosingImageIndex: Number.isFinite(Number(submissionSafePayload?.mainClosingImageIndex)) ? Number(submissionSafePayload.mainClosingImageIndex) : 0,
+        source: 'WARDEN',
+        dispatchType: 'warden',
+      };
       const breachPayload = {
-        ...submissionSafePayload,
+        ...normalizedSubmissionPayload,
         vrm,
         siteId: queuedSiteId,
         siteName: queuedSiteName || 'Site not set',
         vehicleDetails,
-        make: vehicleDetails?.make || submissionSafePayload?.make || null,
-        model: vehicleDetails?.model || submissionSafePayload?.model || null,
-        colour: vehicleDetails?.color || submissionSafePayload?.colour || submissionSafePayload?.color || null,
-        detectedEntryPlateCutoffImage: entryPlateImageUrl || submissionSafePayload?.detectedEntryPlateCutoffImage || '',
-        detectedClosingPlateCutoffImage: closingPlateImageUrl || submissionSafePayload?.detectedClosingPlateCutoffImage || '',
-        images: allImages,
-        imageUrls: allImages,
+        make: vehicleDetails?.make || null,
+        model: vehicleDetails?.model || null,
+        colour: vehicleDetails?.color || null,
+        images: allEvidenceImages,
+        imageUrls: allEvidenceImages,
         evidence: {
           entry: entryFrame,
           latest: closingFrame,
@@ -4103,7 +4497,6 @@ export default function DashboardPage() {
           closedAt: closingTime,
           breachEvidenceMode: 'paired_exit',
         },
-        authorization: authData,
         status: 'QUEUED_FOR_QC',
         breachLifecycle: 'SUBMITTED',
         source: 'WARDEN',
@@ -4120,9 +4513,12 @@ export default function DashboardPage() {
         cameraRawData: cameraRawDataForSubmission,
       };
 
+      setMessage(`Sync ${queueVrmLabel} Step 4/4: Submitting breach to backend...`);
+
       const breachResult = await fetchJson('/api/breaches/wardencapture', {
         method: 'POST',
         token,
+        timeoutMs: 90000,
         body: breachPayload,
         signal: syncAbortController.signal,
       });
@@ -4239,9 +4635,11 @@ export default function DashboardPage() {
       throw new Error('No tracked session selected for final PCN submission.');
     }
 
-    return convertPipelineRef.current.enqueue(async () => {
+    return convertPipelineLimitRef.current(async () => {
       setConvertLoading(true);
       setConvertError('');
+      setSubmissionProgressText('Step 1/3: Validating checks...');
+      const convertAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
       try {
         setPcnDialogOpen(false);
         let workingItem = selectedTracked;
@@ -4259,6 +4657,7 @@ export default function DashboardPage() {
         }
 
         if (!breachId) {
+          setSubmissionProgressText('Step 2/3: Submitting evidence package...');
           setMessage('Submitting evidence package before final PCN submission...');
           const syncResult = await syncQueueItem(trackedItemId, {
             openPcnDialogAfterSuccess: false,
@@ -4287,6 +4686,7 @@ export default function DashboardPage() {
         }
 
         const token = await resolveAuthToken();
+  setSubmissionProgressText('Step 3/3: Submitting final PCN...');
         setMessage('Submitting PCN to backend...');
 
         const images = [
@@ -4315,7 +4715,8 @@ export default function DashboardPage() {
         const response = await fetchJson('/api/breaches/convert-to-pcn', {
           method: 'POST',
           token,
-          signal: syncAbortController.signal,
+          timeoutMs: 30000,
+          signal: convertAbortController ? convertAbortController.signal : undefined,
           body: {
             breachId,
             reason: finalReason,
@@ -4369,6 +4770,7 @@ export default function DashboardPage() {
         setMessage(`PCN submission failed: ${failureMessage}`);
         throw error;
       } finally {
+        setSubmissionProgressText('');
         setConvertLoading(false);
       }
     }, trackedItemId);
@@ -4386,9 +4788,8 @@ export default function DashboardPage() {
       uploadConcurrency: IMAGE_UPLOAD_CONCURRENCY,
     });
 
-    const limitSync = createConcurrencyLimiter(PCN_SYNC_CONCURRENCY);
     const results = await Promise.allSettled(
-      syncableItems.map((item, index) => limitSync(async () => {
+      syncableItems.map((item, index) => (async () => {
         const syncLabel = `${index + 1}/${syncableItems.length}`;
         console.log(`[warden] pcn sync queue start ${syncLabel}`, {
           itemId: item?.id || null,
@@ -4404,7 +4805,7 @@ export default function DashboardPage() {
         });
 
         return result;
-      }))
+      })())
     );
 
     const failedCount = results.filter((result) => result.status === 'rejected' || !result.value?.ok).length;
@@ -5390,7 +5791,7 @@ export default function DashboardPage() {
                       disabled={busy || convertLoading || !canProceedWithPcnActions}
                     >
                       {convertLoading
-                        ? 'Submitting...'
+                        ? (submissionProgressText || 'Submitting...')
                         : (pcnSubmissionGate.ready
                           ? (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')
                           : 'Checks required before submit')}
