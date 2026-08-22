@@ -117,7 +117,20 @@ export default async function handler(req, res) {
     const actorId = decoded.uid;
     const actorEmail = decoded.email || null;
 
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+    let body = req.body || {};
+    if (typeof body === 'string') {
+      const trimmed = body.trim();
+      if (!trimmed) {
+        body = {};
+      } else {
+        try {
+          body = JSON.parse(trimmed);
+        } catch (error) {
+          return res.status(400).json({ error: 'Request body is not valid JSON' });
+        }
+      }
+    }
+
     const {
       breachId,
       amount,
@@ -133,7 +146,7 @@ export default async function handler(req, res) {
       images,
       imageUrls,
       vehicleDetails,
-    } = body;
+    } = body && typeof body === 'object' ? body : {};
 
     if (!breachId) {
       return res.status(400).json({ error: 'Breach ID is required' });

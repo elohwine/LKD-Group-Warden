@@ -136,6 +136,18 @@ describe('POST /api/breaches/convert-to-pcn', () => {
     expect(res.json).toHaveBeenCalledWith({ error: 'Breach ID is required' });
   });
 
+  it('returns 400 when the request contains malformed JSON', async () => {
+    const res = mockResponse();
+    await handler({
+      method: 'POST',
+      headers: { authorization: 'Bearer valid-token' },
+      body: '{not-json',
+    }, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Request body is not valid JSON' });
+  });
+
   it('accepts conversion when amount is missing or invalid by applying backend default', async () => {
     const req = mockRequest({ body: { amount: 0 } });
     const res = mockResponse();

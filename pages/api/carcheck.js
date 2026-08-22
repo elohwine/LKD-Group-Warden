@@ -11,7 +11,7 @@ function resolveBackendBase() {
     process.env.BACKEND_BASE_URL,
   ].filter(Boolean);
 
-  const selected = String(candidates[0] || 'https://www.ldkgroup.co.uk').replace(/\/$/, '');
+  const selected = String(candidates[0] || 'https://ldkgroup.co.uk').replace(/\/$/, '');
   return selected;
 }
 

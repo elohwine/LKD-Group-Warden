@@ -2,7 +2,7 @@ let withPWA = (config) => config;
 
 const rewriteApiBase = (
   process.env.NEXT_PUBLIC_API_BASE_URL ||
-  'https://www.ldkgroup.co.uk'
+  'https://ldkgroup.co.uk'
 ).replace(/\/$/, '');
 
 try {

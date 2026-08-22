@@ -41,7 +41,7 @@ ensure_public_firebase_config() {
 }
 
 validate_public_api_base() {
-    local base="${NEXT_PUBLIC_API_BASE_URL:-www.ldkgroup.co.uk}"
+    local base="${NEXT_PUBLIC_API_BASE_URL:-https://ldkgroup.co.uk}"
 
     if [[ ! "$base" =~ ^https?:// ]]; then
         base="https://$base"
@@ -49,12 +49,13 @@ validate_public_api_base() {
 
     base="${base%/}"
 
-    if [[ "$base" == "https://ldkgroup.co.uk" ]]; then
-        base="https://www.ldkgroup.co.uk"
+    # Prefer the apex production host; Cloudflare handles the www alias cleanly.
+    if [[ "$base" == "https://www.ldkgroup.co.uk" ]]; then
+        base="https://ldkgroup.co.uk"
     fi
 
-    if [[ ! "$base" =~ ^https://([a-zA-Z0-9-]+\.)*ldkgroup\.co\.uk$ ]]; then
-        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL must point to *.ldkgroup.co.uk over HTTPS (got: $base)${NC}"
+    if [[ ! "$base" =~ ^https://(www\.)?ldkgroup\.co\.uk$ ]]; then
+        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL must point to ldkgroup.co.uk or www.ldkgroup.co.uk over HTTPS (got: $base)${NC}"
         exit 1
     fi
 
@@ -177,7 +178,7 @@ print_step "Validating camera service API base URL..."
 validate_camera_service_base
 echo -e "${GREEN}Using NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL=${NEXT_PUBLIC_CAMERA_SERVICE_BASE_URL}${NC}"
 
-export NEXT_PUBLIC_DEMO_MODE="${NEXT_PUBLIC_DEMO_MODE:-true}"
+export NEXT_PUBLIC_DEMO_MODE="${NEXT_PUBLIC_DEMO_MODE:-false}"
 echo -e "${GREEN}Using NEXT_PUBLIC_DEMO_MODE=${NEXT_PUBLIC_DEMO_MODE}${NC}"
 
 print_step "APK API preflight summary..."

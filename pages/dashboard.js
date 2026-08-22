@@ -14,7 +14,7 @@ import { signOutFromWardenApp, getStoredToken, getValidToken } from '../lib/auth
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
-import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
+import { createQueueItem, createSerialTaskQueue, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
 import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { isLikelyCurrentUkVrm, normalizeUkVrmFromOcr, scoreUkVrmCandidate } from '../lib/ukVrmOcr.mjs';
 import { getServerTimestamp, syncWithServerTime } from '../lib/timeSync';
@@ -53,6 +53,35 @@ function formatRemaining(secondsRemaining) {
   const seconds = totalSeconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
+
+function createConcurrencyLimiter(maxConcurrency = 4) {
+  const concurrency = Number.isFinite(Number(maxConcurrency)) ? Math.max(1, Math.floor(Number(maxConcurrency))) : 4;
+  let activeCount = 0;
+  const queue = [];
+
+  const runNext = () => {
+    if (activeCount >= concurrency) return;
+    const next = queue.shift();
+    if (!next) return;
+
+    activeCount += 1;
+    Promise.resolve()
+      .then(next.task)
+      .then(next.resolve, next.reject)
+      .finally(() => {
+        activeCount = Math.max(0, activeCount - 1);
+        runNext();
+      });
+  };
+
+  return (task) => new Promise((resolve, reject) => {
+    queue.push({ task, resolve, reject });
+    runNext();
+  });
+}
+
+const PCN_SYNC_CONCURRENCY = 1;
+const IMAGE_UPLOAD_CONCURRENCY = 1;
 
 function normalizeObservationMinutes(value) {
   const numeric = Number(value);
@@ -1261,8 +1290,10 @@ export default function DashboardPage() {
   const qrFileInputRef = useRef(null);
   const authReadyRef = useRef(false);
   const pcnAutoCheckSignatureRef = useRef('');
-  const syncPipelineRef = useRef(Promise.resolve());
+  const syncPipelineRef = useRef(createSerialTaskQueue());
+  const convertPipelineRef = useRef(createSerialTaskQueue());
   const syncInFlightCountRef = useRef(0);
+  const syncAbortControllersRef = useRef(new Map());
 
   function isRetriableSyncError(errorMessage) {
     const message = String(errorMessage || '').toLowerCase();
@@ -1283,6 +1314,18 @@ export default function DashboardPage() {
     );
   }
 
+  function isSyncCancelledError(errorMessage) {
+    const message = String(errorMessage || '').toLowerCase();
+    return (
+      !message ? false : (
+        message.includes('sync cancelled by user') ||
+        message.includes('cancelled by user') ||
+        message.includes('aborted') ||
+        message.includes('aborterror')
+      )
+    );
+  }
+
   function getSyncRetryDelayMs(attemptNumber) {
     const base = Math.min(30000, 2000 * (2 ** Math.max(0, attemptNumber - 1)));
     const jitter = Math.floor(base * 0.2 * Math.random());
@@ -1293,28 +1336,19 @@ export default function DashboardPage() {
     return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
   }
 
-  async function enqueueSyncTask(task) {
-    const run = syncPipelineRef.current.then(
-      async () => {
-        syncInFlightCountRef.current += 1;
-        setSyncing(true);
-        return task();
-      },
-      async () => {
-        syncInFlightCountRef.current += 1;
-        setSyncing(true);
-        return task();
-      }
-    );
-
-    syncPipelineRef.current = run
-      .catch(() => undefined)
-      .finally(() => {
+  async function enqueueSyncTask(task, key = '__sync__') {
+    const run = syncPipelineRef.current.enqueue(async () => {
+      syncInFlightCountRef.current += 1;
+      setSyncing(true);
+      try {
+        return await task();
+      } finally {
         syncInFlightCountRef.current = Math.max(0, syncInFlightCountRef.current - 1);
         if (syncInFlightCountRef.current === 0) {
           setSyncing(false);
         }
-      });
+      }
+    }, key);
 
     return run;
   }
@@ -2763,52 +2797,104 @@ export default function DashboardPage() {
     const uploadCandidates = (Array.isArray(evidenceFiles) ? evidenceFiles : []).filter(Boolean);
     const siteId = String(siteIdOverride || selectedSiteId || '').trim();
     const fallbackVrm = normalizeVrm(manualVrm || selectedVrm || '');
-    let resolvedVrm = fallbackVrm;
-    const uploadedImages = [];
+    const limitUpload = createConcurrencyLimiter(IMAGE_UPLOAD_CONCURRENCY);
+    const totalUploads = uploadCandidates.length;
 
-    for (const file of uploadCandidates) {
+    const uploadTasks = uploadCandidates.map((file, index) => limitUpload(async () => {
       const blob = file?.blob || file;
-      if (!blob) continue;
+      if (!blob) {
+        return { index, images: [], vrm: '' };
+      }
 
-      const formData = new FormData();
-      formData.append('file', blob, file?.name || blob?.name || `evidence_${Date.now()}.jpg`);
-      formData.append('siteId', siteId);
-      formData.append('manualVrm', resolvedVrm || fallbackVrm || '');
+      const uploadLabel = `${index + 1}/${totalUploads}`;
+      console.log(`[warden] evidence upload queue start ${uploadLabel}`, {
+        fileName: file?.name || blob?.name || null,
+        size: Number(blob?.size || 0),
+        contentType: blob?.type || 'image/jpeg',
+      });
+
+      const fileName = file?.name || blob?.name || `evidence_${Date.now()}_${index}.jpg`;
+      const contentType = blob?.type || 'image/jpeg';
+      const signedFolder = siteId
+        ? `warden_evidence/${encodeURIComponent(siteId)}`
+        : 'warden_evidence';
+
+      const signedEndpoint = buildApiUrl(
+        `/api/warden/uploadevidence?mode=signed-upload&folder=${signedFolder}&filename=${encodeURIComponent(fileName)}&contentType=${encodeURIComponent(contentType)}`
+      );
 
       let token = await resolveAuthToken();
-      let response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData,
+      let response = await fetch(signedEndpoint, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
       });
 
       if (response.status === 401) {
         token = await resolveAuthToken({ forceRefresh: true });
-        response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-          body: formData,
+        response = await fetch(signedEndpoint, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/json',
+          },
         });
       }
 
       const data = await response.json();
       if (!response.ok) {
         const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
-        throw new Error(`${prefix}${data?.error || 'Failed to analyse evidence'}`);
+        throw new Error(`${prefix}${data?.error || 'Failed to request signed upload URL'}`);
       }
 
-      if (data?.vrm) {
-        resolvedVrm = normalizeVrm(data.vrm) || resolvedVrm;
+      const putResponse = await fetch(data?.url, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': contentType,
+        },
+        body: blob,
+      });
+
+      if (!putResponse.ok) {
+        const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
+        throw new Error(`${prefix}Direct upload failed (${putResponse.status})`);
       }
 
-      if (Array.isArray(data?.images)) {
-        uploadedImages.push(...data.images);
-      }
+      console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
+        fileName,
+        path: data?.path || null,
+        status: putResponse.status,
+      });
+
+      return {
+        index,
+        vrm: fallbackVrm || '',
+        images: data?.url ? [String(data.url).split('?')[0]] : [],
+      };
+    }));
+
+    const uploadResults = await Promise.allSettled(uploadTasks);
+    const rejected = uploadResults.find((result) => result.status === 'rejected');
+    if (rejected && rejected.reason) {
+      throw rejected.reason;
     }
+
+    const fulfilled = uploadResults
+      .filter((result) => result.status === 'fulfilled')
+      .map((result) => result.value)
+      .sort((a, b) => a.index - b.index);
+
+    const resolvedVrm = fulfilled
+      .map((result) => normalizeVrm(result?.vrm || ''))
+      .find((value) => Boolean(value)) || fallbackVrm;
+
+    const uploadedImages = fulfilled.flatMap((result) => (Array.isArray(result?.images) ? result.images : []));
 
     return {
       vrm: resolvedVrm || fallbackVrm || null,
-      images: uploadedImages.filter((url, index, all) => typeof url === 'string' && url && all.indexOf(url) === index),
+      images: uploadedImages.filter((url, idx, all) => typeof url === 'string' && url && all.indexOf(url) === idx),
     };
   }
 
@@ -3702,6 +3788,9 @@ export default function DashboardPage() {
       return { ok: false, error: 'Draft Parking Charge not found for sync' };
     }
 
+    const syncAbortController = new AbortController();
+    syncAbortControllersRef.current.set(itemId, syncAbortController);
+
     const lifecycle = getBreachLifecycle(queuedItem);
     const missingBreachId = !queuedItem?.payload?.breachId;
     const canForceBreachCapture = forceBreachCapture && missingBreachId;
@@ -3964,7 +4053,8 @@ export default function DashboardPage() {
       const breachResult = await fetchJson('/api/breaches/wardencapture', {
         method: 'POST',
         token,
-        body: breachPayload
+        body: breachPayload,
+        signal: syncAbortController.signal,
       });
 
       const breachId = breachResult?.id || breachResult?.breachId || queuedItem?.payload?.breachId || '';
@@ -4010,16 +4100,31 @@ export default function DashboardPage() {
       setMonitoringSessionStartedAt('');
       return { ok: true, breachId, vrm };
     } catch (error) {
+      const errorName = String(error?.name || '').toLowerCase();
+      const errorMessage = String(error?.message || 'Sync failed');
+      const cancelled = errorName === 'aborterror' || isSyncCancelledError(errorMessage);
+
+      if (cancelled) {
+        syncAbortControllersRef.current.delete(itemId);
+        await updateQueueItem(itemId, {
+          status: 'queued',
+          lastError: 'Sync cancelled by user',
+          updatedAt: new Date().toISOString(),
+        });
+        setMessage('Sync cancelled. Draft PCN retained in queue.');
+        return { ok: false, error: 'Sync cancelled by user' };
+      }
+
       console.error('[warden] sync failed', error);
-      const failureMessage = error?.message || 'Sync failed';
       await updateQueueItem(itemId, {
         status: 'failed',
-        lastError: failureMessage,
+        lastError: errorMessage,
         updatedAt: new Date().toISOString()
       });
-      setMessage(failureMessage);
-      return { ok: false, error: failureMessage };
+      setMessage(errorMessage);
+      return { ok: false, error: errorMessage };
     } finally {
+      syncAbortControllersRef.current.delete(itemId);
       await refreshQueue();
     }
   }
@@ -4051,7 +4156,7 @@ export default function DashboardPage() {
       }
 
       return lastResult;
-    });
+    }, itemId);
   }
 
   async function handleConvertToPcn() {
@@ -4059,163 +4164,226 @@ export default function DashboardPage() {
     if (convertLoading) return;
     if (!canProceedWithPcnActions) return;
 
-    setConvertLoading(true);
-    setConvertError('');
-    try {
-      setPcnDialogOpen(false);
-      const trackedItemId = selectedTrackedId || selectedTracked?.id || '';
-      if (!trackedItemId) {
-        throw new Error('No tracked session selected for final PCN submission.');
-      }
+    const trackedItemId = selectedTrackedId || selectedTracked?.id || '';
+    if (!trackedItemId) {
+      throw new Error('No tracked session selected for final PCN submission.');
+    }
 
-      let workingItem = selectedTracked;
-      let breachId = workingItem?.payload?.breachId || '';
+    return convertPipelineRef.current.enqueue(async () => {
+      setConvertLoading(true);
+      setConvertError('');
+      try {
+        setPcnDialogOpen(false);
+        let workingItem = selectedTracked;
+        let breachId = workingItem?.payload?.breachId || '';
 
-      const submissionChecks = await ensurePcnSubmissionChecks({
-        vrm: workingItem?.vrm || workingItem?.payload?.vrm || selectedVrm,
-        siteId: workingItem?.payload?.siteId || selectedSiteId,
-        forceCarcheck: false,
-        openDialog: false,
-        allowNetwork: false,
-      });
-      if (!submissionChecks.ok) {
-        throw new Error(submissionChecks.error || 'Carcheck or e-permit validation failed before PCN submission');
-      }
+        const submissionChecks = await ensurePcnSubmissionChecks({
+          vrm: workingItem?.vrm || workingItem?.payload?.vrm || selectedVrm,
+          siteId: workingItem?.payload?.siteId || selectedSiteId,
+          forceCarcheck: false,
+          openDialog: false,
+          allowNetwork: false,
+        });
+        if (!submissionChecks.ok) {
+          throw new Error(submissionChecks.error || 'Carcheck or e-permit validation failed before PCN submission');
+        }
 
-      if (!breachId) {
-        setMessage('Submitting evidence package before final PCN submission...');
-        const syncResult = await syncQueueItem(trackedItemId, {
-          openPcnDialogAfterSuccess: false,
-          forceBreachCapture: true,
+        if (!breachId) {
+          setMessage('Submitting evidence package before final PCN submission...');
+          const syncResult = await syncQueueItem(trackedItemId, {
+            openPcnDialogAfterSuccess: false,
+            forceBreachCapture: true,
+          });
+
+          if (syncResult?.ok === false) {
+            throw new Error(syncResult.error || 'Failed to create breach record during sync');
+          }
+
+          const refreshedItems = await listQueueItems();
+          const refreshed = refreshedItems.find((item) => item.id === trackedItemId) || null;
+          if (refreshed) {
+            workingItem = {
+              ...selectedTracked,
+              payload: refreshed.payload,
+              vrm: refreshed?.payload?.vrm || selectedTracked?.vrm,
+              siteName: refreshed?.payload?.siteName || selectedTracked?.siteName,
+            };
+          }
+          breachId = workingItem?.payload?.breachId || refreshed?.payload?.breachId || '';
+        }
+
+        if (!breachId) {
+          throw new Error('Could not create breach record before final PCN submission. Please retry.');
+        }
+
+        const token = await resolveAuthToken();
+        setMessage('Submitting PCN to backend...');
+
+        const images = [
+          ...(Array.isArray(workingItem?.payload?.images) ? workingItem.payload.images : []),
+          ...(Array.isArray(workingItem?.payload?.imageUrls) ? workingItem.payload.imageUrls : []),
+        ]
+          .filter((value) => typeof value === 'string' && value.length > 0)
+          .filter((value, index, all) => all.indexOf(value) === index);
+        const vehicleDetails = buildVehicleDetailsRecord(
+          submissionChecks.vehicleDetails ||
+          workingItem?.payload?.vehicleDetails ||
+          workingItem?.payload?.savedVehicleLookup ||
+          selectedTrackedVehicleDetails ||
+          null,
+          workingItem?.vrm || selectedTracked?.vrm || selectedVrm
+        );
+        const resolvedWindow = resolveObservationWindow(workingItem?.payload || {});
+        const manualReason = String(pcnReasonInput || '').trim();
+        const payloadReason = getPreferredReason(workingItem?.payload || {}, '');
+        const finalReason =
+          (manualReason && manualReason !== DEFAULT_PCN_REASON && manualReason)
+          || String(selectedReason || '').trim()
+          || payloadReason
+          || manualReason
+          || DEFAULT_PCN_REASON;
+        const response = await fetchJson('/api/breaches/convert-to-pcn', {
+          method: 'POST',
+          token,
+          signal: syncAbortController.signal,
+          body: {
+            breachId,
+            reason: finalReason,
+            notes: `Converted from breach ${breachId}`,
+            vrm: workingItem?.vrm || selectedTracked?.vrm,
+            observationStartTime: resolvedWindow.entryTime || null,
+            observationEndTime: resolvedWindow.closingTime || null,
+            timestamp: (
+              resolvedWindow.closingTime ||
+              workingItem?.observationEndTime ||
+              workingItem?.createdAt ||
+              new Date().toISOString()
+            ),
+            siteId: workingItem?.payload?.siteId || '',
+            siteName: workingItem?.siteName || '',
+            evidence: workingItem?.payload?.evidence || {},
+            images,
+            vehicleDetails,
+          },
         });
 
-        if (syncResult?.ok === false) {
-          throw new Error(syncResult.error || 'Failed to create breach record during sync');
-        }
-
-        if (!breachId && syncResult?.breachId) {
-          breachId = syncResult.breachId;
-        }
-
-        const refreshedItems = await listQueueItems();
-        const refreshed = refreshedItems.find((item) => item.id === trackedItemId) || null;
-        if (refreshed) {
-          workingItem = {
-            ...selectedTracked,
-            payload: refreshed.payload,
-            vrm: refreshed?.payload?.vrm || selectedTracked?.vrm,
-            siteName: refreshed?.payload?.siteName || selectedTracked?.siteName,
-          };
-          breachId = refreshed?.payload?.breachId || '';
-        }
+        const convertedAt = new Date().toISOString();
+        await updateQueueItem(selectedTrackedId || selectedTracked.id, {
+          status: 'submitted',
+          updatedAt: convertedAt,
+          payload: {
+            ...(workingItem?.payload || selectedTracked.payload),
+            breachLifecycle: 'CONVERTED_TO_PCN',
+            convertedToPcn: true,
+            convertedAt,
+            observationEndTime: resolvedWindow.closingTime || convertedAt,
+            closingCapturedAt: resolvedWindow.closingTime || convertedAt,
+            pcnReason: finalReason,
+            pcnId: response?.id || response?.pcnId || '',
+            pcnNumber: response?.pcnNumber || '',
+            pcnAmount: Number(response?.amount || 0) > 0 ? Number(response.amount) : Number(workingItem?.payload?.pcnAmount || 0),
+          },
+        });
+        await refreshQueue();
+        setDetailMessage('');
+        setMessage(`Breach converted to PCN ${response?.pcnNumber || ''} and routed for QA escalation.`);
+        setPcnDialogOpen(false);
+        setMonitoringSessionActive(false);
+        setMonitoringSessionStartedAt('');
+        setDemoAlarmAcknowledged(false);
+        return response;
+      } catch (error) {
+        console.error('[warden] convert breach failed', error);
+        const failureMessage = error?.message || 'Failed to convert breach to PCN';
+        setConvertError(failureMessage);
+        setMessage(`PCN submission failed: ${failureMessage}`);
+        throw error;
+      } finally {
+        setConvertLoading(false);
       }
-
-      if (!breachId) {
-        throw new Error('Could not create breach record before final PCN submission. Please retry.');
-      }
-
-      const token = await resolveAuthToken();
-      setMessage('Submitting PCN to backend...');
-
-      const images = [
-        ...(Array.isArray(workingItem?.payload?.images) ? workingItem.payload.images : []),
-        ...(Array.isArray(workingItem?.payload?.imageUrls) ? workingItem.payload.imageUrls : []),
-      ]
-        .filter((value) => typeof value === 'string' && value.length > 0)
-        .filter((value, index, all) => all.indexOf(value) === index);
-      const vehicleDetails = buildVehicleDetailsRecord(
-        submissionChecks.vehicleDetails ||
-        workingItem?.payload?.vehicleDetails ||
-        workingItem?.payload?.savedVehicleLookup ||
-        selectedTrackedVehicleDetails ||
-        null,
-        workingItem?.vrm || selectedTracked?.vrm || selectedVrm
-      );
-      const resolvedWindow = resolveObservationWindow(workingItem?.payload || {});
-      const manualReason = String(pcnReasonInput || '').trim();
-      const payloadReason = getPreferredReason(workingItem?.payload || {}, '');
-      const finalReason =
-        (manualReason && manualReason !== DEFAULT_PCN_REASON && manualReason)
-        || String(selectedReason || '').trim()
-        || payloadReason
-        || manualReason
-        || DEFAULT_PCN_REASON;
-      const response = await fetchJson('/api/breaches/convert-to-pcn', {
-        method: 'POST',
-        token,
-        body: {
-          breachId,
-          reason: finalReason,
-          notes: `Converted from breach ${breachId}`,
-          vrm: workingItem?.vrm || selectedTracked?.vrm,
-          observationStartTime: resolvedWindow.entryTime || null,
-          observationEndTime: resolvedWindow.closingTime || null,
-          timestamp: (
-            resolvedWindow.closingTime ||
-            workingItem?.observationEndTime ||
-            workingItem?.createdAt ||
-            new Date().toISOString()
-          ),
-          siteId: workingItem?.payload?.siteId || '',
-          siteName: workingItem?.siteName || '',
-          evidence: workingItem?.payload?.evidence || {},
-          images,
-          vehicleDetails,
-        },
-      });
-
-      const convertedAt = new Date().toISOString();
-      await updateQueueItem(selectedTrackedId || selectedTracked.id, {
-        status: 'submitted',
-        updatedAt: convertedAt,
-        payload: {
-          ...(workingItem?.payload || selectedTracked.payload),
-          breachLifecycle: 'CONVERTED_TO_PCN',
-          convertedToPcn: true,
-          convertedAt,
-          observationEndTime: resolvedWindow.closingTime || convertedAt,
-          closingCapturedAt: resolvedWindow.closingTime || convertedAt,
-          pcnReason: finalReason,
-          pcnId: response?.id || response?.pcnId || '',
-          pcnNumber: response?.pcnNumber || '',
-          pcnAmount: Number(response?.amount || 0) > 0 ? Number(response.amount) : Number(workingItem?.payload?.pcnAmount || 0),
-        },
-      });
-      await refreshQueue();
-      setDetailMessage('');
-      setMessage(`Breach converted to PCN ${response?.pcnNumber || ''} and routed for QA escalation.`);
-      setPcnDialogOpen(false);
-      setMonitoringSessionActive(false);
-      setMonitoringSessionStartedAt('');
-      setDemoAlarmAcknowledged(false);
-    } catch (error) {
-      console.error('[warden] convert breach failed', error);
-      const failureMessage = error?.message || 'Failed to convert breach to PCN';
-      setConvertError(failureMessage);
-      setMessage(`PCN submission failed: ${failureMessage}`);
-    } finally {
-      setConvertLoading(false);
-    }
+    }, trackedItemId);
   }
 
   async function syncQueue() {
     const items = await listQueueItems();
-    for (const item of items.filter((entry) => getBreachLifecycle(entry).syncable || entry.status === 'syncing')) {
-      await syncQueueItem(item.id);
+    const syncableItems = items.filter((entry) => getBreachLifecycle(entry).syncable || entry.status === 'syncing');
+
+    if (!syncableItems.length) return;
+
+    console.log('[warden] queue sync start', {
+      totalPcns: syncableItems.length,
+      syncConcurrency: PCN_SYNC_CONCURRENCY,
+      uploadConcurrency: IMAGE_UPLOAD_CONCURRENCY,
+    });
+
+    const limitSync = createConcurrencyLimiter(PCN_SYNC_CONCURRENCY);
+    const results = await Promise.allSettled(
+      syncableItems.map((item, index) => limitSync(async () => {
+        const syncLabel = `${index + 1}/${syncableItems.length}`;
+        console.log(`[warden] pcn sync queue start ${syncLabel}`, {
+          itemId: item?.id || null,
+          status: item?.status || null,
+        });
+
+        const result = await syncQueueItem(item.id);
+
+        console.log(`[warden] pcn sync queue complete ${syncLabel}`, {
+          itemId: item?.id || null,
+          ok: Boolean(result?.ok),
+          error: result?.error || null,
+        });
+
+        return result;
+      }))
+    );
+
+    const failedCount = results.filter((result) => result.status === 'rejected' || !result.value?.ok).length;
+    console.log('[warden] queue sync complete', {
+      totalPcns: syncableItems.length,
+      failedCount,
+    });
+    if (failedCount > 0) {
+      setMessage(`Queue sync completed with ${failedCount} failed item${failedCount === 1 ? '' : 's'}.`);
     }
   }
 
   async function handleCancelTracked(id) {
     try {
-      await deleteQueueItem(id);
-      await refreshQueue();
-      if (selectedTrackedId === id) {
-        setSelectedTrackedId('');
+      const controller = syncAbortControllersRef.current.get(id);
+      if (controller) {
+        controller.abort(new DOMException('Sync cancelled by user', 'AbortError'));
       }
-      setMessage('Tracked breach cancelled and removed from queue.');
+      syncAbortControllersRef.current.delete(id);
+      await updateQueueItem(id, {
+        status: 'queued',
+        lastError: 'Sync cancelled by user',
+        updatedAt: new Date().toISOString(),
+      });
+      await refreshQueue();
+      setMessage('Tracked breach sync cancelled. Draft PCN retained in queue.');
     } catch (error) {
       console.error('[warden] cancel tracked breach failed', error);
       setMessage(error?.message || 'Failed to cancel tracked breach');
+    }
+  }
+
+  async function handleCancelQueuedSync(id) {
+    try {
+      const controller = syncAbortControllersRef.current.get(id);
+      if (controller) {
+        controller.abort(new DOMException('Sync cancelled by user', 'AbortError'));
+      }
+      syncAbortControllersRef.current.delete(id);
+      await updateQueueItem(id, {
+        status: 'queued',
+        lastError: 'Sync cancelled by user',
+        updatedAt: new Date().toISOString(),
+      });
+      await refreshQueue();
+      setMessage('Queued sync cancelled. Draft PCN retained in queue.');
+    } catch (error) {
+      console.error('[warden] cancel queued sync failed', error);
+      setMessage(error?.message || 'Failed to cancel queued sync');
     }
   }
 
@@ -5244,6 +5412,14 @@ export default function DashboardPage() {
                             Review & retry
                           </button>
                         ) : null}
+                        <button
+                          type="button"
+                          className="action-btn action-btn--secondary"
+                          style={{ fontSize: 12, padding: '4px 10px', marginTop: 4 }}
+                          onClick={() => handleCancelQueuedSync(item.id)}
+                        >
+                          Cancel sync
+                        </button>
                       </div>
                     </article>
                   );
