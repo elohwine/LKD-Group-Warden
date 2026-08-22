@@ -2800,6 +2800,43 @@ export default function DashboardPage() {
     const limitUpload = createConcurrencyLimiter(IMAGE_UPLOAD_CONCURRENCY);
     const totalUploads = uploadCandidates.length;
 
+    const uploadViaServerFallback = async ({ blob, fileName, siteIdValue, vrmValue }) => {
+      const formData = new FormData();
+      formData.append('file', blob, fileName);
+      formData.append('siteId', siteIdValue || '');
+      formData.append('manualVrm', vrmValue || '');
+
+      let token = await resolveAuthToken();
+      let response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        body: formData,
+      });
+
+      if (response.status === 401) {
+        token = await resolveAuthToken({ forceRefresh: true });
+        response = await fetch(buildApiUrl('/api/warden/uploadevidence'), {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          body: formData,
+        });
+      }
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || `Fallback upload failed (${response.status})`);
+      }
+
+      return {
+        vrm: normalizeVrm(data?.vrm || vrmValue || ''),
+        images: Array.isArray(data?.images) ? data.images : [],
+      };
+    };
+
     const uploadTasks = uploadCandidates.map((file, index) => limitUpload(async () => {
       const blob = file?.blob || file;
       if (!blob) {
@@ -2823,56 +2860,89 @@ export default function DashboardPage() {
         `/api/warden/uploadevidence?mode=signed-upload&folder=${signedFolder}&filename=${encodeURIComponent(fileName)}&contentType=${encodeURIComponent(contentType)}`
       );
 
-      let token = await resolveAuthToken();
-      let response = await fetch(signedEndpoint, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/json',
-        },
-      });
-
-      if (response.status === 401) {
-        token = await resolveAuthToken({ forceRefresh: true });
-        response = await fetch(signedEndpoint, {
+      try {
+        let token = await resolveAuthToken();
+        let response = await fetch(signedEndpoint, {
           method: 'GET',
           headers: {
             Authorization: `Bearer ${token}`,
             Accept: 'application/json',
           },
         });
+
+        if (response.status === 401) {
+          token = await resolveAuthToken({ forceRefresh: true });
+          response = await fetch(signedEndpoint, {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: 'application/json',
+            },
+          });
+        }
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
+          throw new Error(`${prefix}${data?.error || 'Failed to request signed upload URL'}`);
+        }
+
+        const putResponse = await fetch(data?.url, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': contentType,
+          },
+          body: blob,
+        });
+
+        if (!putResponse.ok) {
+          const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
+          throw new Error(`${prefix}Direct upload failed (${putResponse.status})`);
+        }
+
+        console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
+          fileName,
+          path: data?.path || null,
+          status: putResponse.status,
+          mode: 'signed-upload',
+        });
+
+        return {
+          index,
+          vrm: fallbackVrm || '',
+          images: data?.url ? [String(data.url).split('?')[0]] : [],
+        };
+      } catch (signedUploadError) {
+        console.warn(`[warden] signed evidence upload failed, using server fallback ${uploadLabel}`, {
+          fileName,
+          error: signedUploadError?.message || String(signedUploadError),
+        });
+
+        try {
+          const fallbackResult = await uploadViaServerFallback({
+            blob,
+            fileName,
+            siteIdValue: siteId,
+            vrmValue: fallbackVrm,
+          });
+
+          console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
+            fileName,
+            mode: 'server-fallback',
+            uploaded: fallbackResult.images.length,
+          });
+
+          return {
+            index,
+            vrm: fallbackResult.vrm || fallbackVrm || '',
+            images: fallbackResult.images,
+          };
+        } catch (fallbackError) {
+          throw new Error(
+            `Signed upload failed (${signedUploadError?.message || 'unknown'}) and fallback failed (${fallbackError?.message || 'unknown'})`
+          );
+        }
       }
-
-      const data = await response.json();
-      if (!response.ok) {
-        const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
-        throw new Error(`${prefix}${data?.error || 'Failed to request signed upload URL'}`);
-      }
-
-      const putResponse = await fetch(data?.url, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': contentType,
-        },
-        body: blob,
-      });
-
-      if (!putResponse.ok) {
-        const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
-        throw new Error(`${prefix}Direct upload failed (${putResponse.status})`);
-      }
-
-      console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
-        fileName,
-        path: data?.path || null,
-        status: putResponse.status,
-      });
-
-      return {
-        index,
-        vrm: fallbackVrm || '',
-        images: data?.url ? [String(data.url).split('?')[0]] : [],
-      };
     }));
 
     const uploadResults = await Promise.allSettled(uploadTasks);
