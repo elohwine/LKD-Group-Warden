@@ -7645,6 +7645,14 @@ export default function DashboardPage() {
       <nav className="bottom-nav" aria-label="Main navigation">
         <button
           type="button"
+          className={`bottom-nav-btn ${activeTab === 'camera' ? 'bottom-nav-btn--active' : ''}`}
+          onClick={() => setActiveTab('camera')}
+        >
+          <span className="bottom-nav-icon" aria-hidden="true">📷</span>
+          <span className="bottom-nav-label">Camera</span>
+        </button>
+        <button
+          type="button"
           className={`bottom-nav-btn ${activeTab === 'tracked' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => {
             setActiveTab('tracked');
@@ -7674,6 +7682,14 @@ export default function DashboardPage() {
         </button>
         <button
           type="button"
+          className={`bottom-nav-btn ${activeTab === 'mobile' ? 'bottom-nav-btn--active' : ''}`}
+          onClick={() => setActiveTab('mobile')}
+        >
+          <span className="bottom-nav-icon" aria-hidden="true">🚐</span>
+          <span className="bottom-nav-label">Mobile</span>
+        </button>
+        <button
+          type="button"
           className={`bottom-nav-btn ${activeTab === 'archive' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('archive')}
         >
@@ -7682,22 +7698,6 @@ export default function DashboardPage() {
           {archivedBreaches.length > 0 ? (
             <span className="bottom-nav-badge">{archivedBreaches.length}</span>
           ) : null}
-        </button>
-        <button
-          type="button"
-          className={`bottom-nav-btn ${activeTab === 'camera' ? 'bottom-nav-btn--active' : ''}`}
-          onClick={() => setActiveTab('camera')}
-        >
-          <span className="bottom-nav-icon" aria-hidden="true">📷</span>
-          <span className="bottom-nav-label">Camera</span>
-        </button>
-        <button
-          type="button"
-          className={`bottom-nav-btn ${activeTab === 'mobile' ? 'bottom-nav-btn--active' : ''}`}
-          onClick={() => setActiveTab('mobile')}
-        >
-          <span className="bottom-nav-icon" aria-hidden="true">🚐</span>
-          <span className="bottom-nav-label">Mobile</span>
         </button>
       </nav>
 
