@@ -60,6 +60,23 @@ function resolvePreferredReason({ requestReason = '', breachData = {} } = {}) {
   return DEFAULT_PCN_REASON;
 }
 
+function resolveContraventionSnapshot({ request = {}, breachData = {}, fallbackReason = '' } = {}) {
+  const requestCode = String(request?.selectedContraventionCode || request?.contraventionCode || '').trim();
+  const breachCode = String(breachData?.selectedContraventionCode || breachData?.contraventionCode || '').trim();
+  const code = requestCode || breachCode || '';
+
+  const requestReason = String(request?.contraventionReason || '').trim();
+  const breachReason = String(
+    breachData?.contraventionReason
+    || breachData?.reason
+    || breachData?.contravention
+    || ''
+  ).trim();
+
+  const reason = requestReason || breachReason || String(fallbackReason || '').trim() || DEFAULT_PCN_REASON;
+  return { code, reason };
+}
+
 function resolveObservationInstants({ breachData = {}, requestStartRaw = null, requestEndRaw = null, requestTimestamp = null, fallbackNow = new Date() } = {}) {
   const safeBreach = breachData && typeof breachData === 'object' ? breachData : {};
   const cameraRawData = Array.isArray(safeBreach?.cameraRawData) ? safeBreach.cameraRawData : [];
@@ -146,6 +163,9 @@ export default async function handler(req, res) {
       images,
       imageUrls,
       vehicleDetails,
+      selectedContraventionCode,
+      contraventionCode,
+      contraventionReason,
     } = body && typeof body === 'object' ? body : {};
 
     if (!breachId) {
@@ -205,6 +225,11 @@ export default async function handler(req, res) {
     );
 
     const finalReason = resolvePreferredReason({ requestReason: reason, breachData });
+    const contraventionSnapshot = resolveContraventionSnapshot({
+      request: { selectedContraventionCode, contraventionCode, contraventionReason },
+      breachData,
+      fallbackReason: finalReason,
+    });
 
     const pcnPayload = {
       breachId,
@@ -212,6 +237,10 @@ export default async function handler(req, res) {
       vrm: vrmValue,
       amount: amountValue,
       reason: finalReason,
+      contraventionReason: contraventionSnapshot.reason,
+      selectedContraventionCode: contraventionSnapshot.code || null,
+      contraventionCode: contraventionSnapshot.code || null,
+      contravention: contraventionSnapshot.reason,
       notes: notes || '',
       source: 'WARDEN',
       status: 'PENDING',
@@ -269,6 +298,10 @@ export default async function handler(req, res) {
       breachLifecycle: 'CONVERTED_TO_PCN',
       convertedToPcn: true,
       convertedAt: Timestamp.fromDate(now),
+      contraventionReason: contraventionSnapshot.reason,
+      selectedContraventionCode: contraventionSnapshot.code || null,
+      contraventionCode: contraventionSnapshot.code || null,
+      reason: contraventionSnapshot.reason,
       pcnId: pcnRef.id,
       pcnNumber: finalPcnNumber,
       updatedAt: Timestamp.fromDate(now),

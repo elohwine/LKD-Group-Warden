@@ -2397,6 +2397,7 @@ textarea {
 .lc-submitted   { background: rgba(95,174,234,0.2);  color: #9fcff5; }
 .lc-failed      { background: rgba(255,123,123,0.2); color: var(--danger); }
 .lc-converted   { background: rgba(130,80,200,0.2);  color: #c9a0ff; }
+.lc-archived    { background: rgba(148,163,184,0.18); color: #dfe7f1; border: 1px solid rgba(148,163,184,0.35); }
 .lc-unknown     { background: rgba(255,255,255,0.08); color: var(--muted); }
 
 /* ── Detail screen ──────────────────────────────────────────────── */
@@ -3547,6 +3548,32 @@ textarea {
 .action-btn--secondary { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); color: var(--text); }
 .action-btn--issue     { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); color: var(--text); }
 .action-btn--danger    { background: rgba(255,123,123,0.1); border: 1px solid rgba(255,123,123,0.3); color: #ffaaaa; }
+
+.archive-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.archive-toolbar-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.archive-toolbar-actions .action-btn {
+  width: auto;
+  min-width: 124px;
+}
+
+.archive-toolbar-count {
+  display: inline-block;
+  min-width: 32px;
+  text-align: right;
+}
 
 /* PCN convert form */
 .pcn-convert-form {
