@@ -7320,7 +7320,6 @@ export default function DashboardPage() {
           >
             <span className="quick-capture-icon">📷</span>
             <span className="quick-capture-label">Capture vehicle</span>
-            <span className="quick-capture-sub">OCR starts immediately</span>
           </button>
 
           {/* ── Session capture cards ────────────────────────────── */}
