@@ -4234,3 +4234,15 @@ textarea {
 .capture-card-meta  { font-size: 10px; color: var(--text-muted,#8899aa); }
 .capture-card-badges  { display: flex; flex-wrap: wrap; gap: 3px; }
 .capture-card-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 1px; }
+
+/* ── WardenCaptureFeed: compact toolbar ─────────────────────── */
+.wf-toolbar-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px 4px;
+}
+.wf-title-sm { font-size: 11px; font-weight: 600; color: var(--text-muted,#8899aa); text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
+.wf-search-sm { flex: 1; min-width: 0; padding: 4px 8px; font-size: 12px; border-radius: 6px; border: 1px solid var(--border,rgba(255,255,255,.1)); background: var(--surface,rgba(255,255,255,.06)); color: var(--text,#f0f4f8); }
+.wf-refresh-sm { width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--border,rgba(255,255,255,.1)); background: none; color: var(--text-muted,#8899aa); font-size: 14px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.wf-refresh-sm:disabled { opacity: .4; cursor: default; }
+.wf-error-inline { margin: 4px 12px; padding: 5px 10px; background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.25); border-radius: 6px; font-size: 11px; color: #fca5a5; }
+.wf-hint { margin: 8px 12px; font-size: 12px; color: var(--text-muted,#8899aa); }

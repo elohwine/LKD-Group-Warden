@@ -1704,6 +1704,7 @@ export default function DashboardPage() {
     allowDelete: false,
   });
   const qrFileInputRef = useRef(null);
+  const quickCaptureInputRef = useRef(null);
   const authReadyRef = useRef(false);
   const pcnAutoCheckSignatureRef = useRef('');
   const pcnSubmitLimitRef = useRef(pLimit(1));
@@ -3062,8 +3063,58 @@ export default function DashboardPage() {
     setCaptureStepperOpen(true);
   }
 
-  // Quick-capture: creates an isolated card per capture, then auto-reopens for next vehicle.
-  async function handleQuickCaptureComplete({ files = [], phase = 'entry', scan = null, captureMode = 'scan' } = {}) {
+  // Direct file-input capture: camera opens immediately, OCR runs per-card without wizard.
+  async function handleQuickCaptureInput(event) {
+    const file = event.target.files?.[0];
+    event.target.value = ''; // reset so same file can be retaken immediately
+    if (!file) return;
+
+    const capturedAt = await getServerTimestamp();
+    file.capturedAt = capturedAt;
+    // Unique card ID — the ONLY key used to update this card; prevents any cross-capture bleed.
+    const cardId = `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const effectiveSiteId = selectedSiteId;
+    const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
+
+    setCaptureCards((prev) => [{
+      id: cardId,
+      capturedAt,
+      plateText: '',
+      plateConfidence: 0,
+      cutoffImage: '',
+      vehiclePreview: '',
+      files: [file],
+      siteId: effectiveSiteId,
+      siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId || '',
+      scanning: true,
+    }, ...prev]);
+
+    // Preview generation — scoped to cardId, cannot overwrite another card.
+    fileToDataUrl(file).then((url) => {
+      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, vehiclePreview: url } : c));
+    }).catch(() => {});
+
+    // OCR — result is keyed to cardId before any setState call.
+    scanPlateFromImage(file).then((result) => {
+      const plate = normalizeVrm(result?.plateText || '');
+      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? {
+        ...c,
+        scanning: false,
+        plateText: plate,
+        plateConfidence: Number(result?.confidence || 0),
+        cutoffImage: result?.cutoffImage || '',
+      } : c));
+      if (plate && effectiveSiteId) {
+        runCardCarcheck(cardId, plate);
+        runCardPermit(cardId, plate, effectiveSiteId);
+      }
+    }).catch(() => {
+      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, scanning: false } : c));
+    });
+
+    // Re-open camera for next vehicle after a brief pause.
+    window.setTimeout(() => quickCaptureInputRef.current?.click(), 350);
+  }
     const rawFiles = Array.isArray(files) ? files : [];
     if (rawFiles.length === 0) { setCaptureStepperOpen(false); return; }
 
@@ -6310,7 +6361,7 @@ export default function DashboardPage() {
           ) : currentScreen === 'mobile' ? (
             <span>Mobile Cameras</span>
           ) : currentScreen === 'camera' ? (
-            <span>Camera Raw Data</span>
+            <span>Camera</span>
           ) : (
             <span>Active Sessions</span>
           )}
@@ -7308,15 +7359,19 @@ export default function DashboardPage() {
             </select>
           </div>
 
-          {/* ── Quick-capture CTA ────────────────────────────────── */}
+          {/* ── Quick-capture: hidden file input opens camera directly ─── */}
+          <input
+            ref={quickCaptureInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            style={{ display: 'none' }}
+            onChange={handleQuickCaptureInput}
+          />
           <button
             type="button"
             className="quick-capture-cta"
-            onClick={() => {
-              setCaptureIsQuickMode(true);
-              setCaptureStepperPhase('entry');
-              setCaptureStepperOpen(true);
-            }}
+            onClick={() => quickCaptureInputRef.current?.click()}
           >
             <span className="quick-capture-icon">📷</span>
             <span className="quick-capture-label">Capture vehicle</span>
@@ -7480,10 +7535,8 @@ export default function DashboardPage() {
               setMessage(`Draft PCN started for ${vrm} from camera feed.`);
             }}
           />
-          {/* Local capture log — in-progress PCN images not yet relayed to camera service */}
-          <div className="detail-section" style={{ marginTop: 16 }}>
-            <div className="camera-raw-toolbar">
-              <div className="detail-section-label">In-progress captures (not yet synced to camera service)</div>
+        </main>
+      ) : null}
               {cameraRawFeed.length > 0 ? (
                 <div className="camera-raw-view-toggle" role="group" aria-label="Camera raw view mode">
                   <button
