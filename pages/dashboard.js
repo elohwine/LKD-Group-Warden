@@ -1649,7 +1649,7 @@ export default function DashboardPage() {
   const [ticks, setTicks] = useState(0);
   const [selectedContraventionCode, setSelectedContraventionCode] = useState('');
   const [authToken, setAuthToken] = useState('');
-  const [activeTab, setActiveTab] = useState('tracked');
+  const [activeTab, setActiveTab] = useState('camera');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedTrackedId, setSelectedTrackedId] = useState('');
   const [selectedArchiveIds, setSelectedArchiveIds] = useState([]);
@@ -1662,6 +1662,9 @@ export default function DashboardPage() {
   const [stepperOpen, setStepperOpen] = useState(false);
   const [captureStepperOpen, setCaptureStepperOpen] = useState(false);
   const [captureStepperPhase, setCaptureStepperPhase] = useState('entry');
+  const [captureIsQuickMode, setCaptureIsQuickMode] = useState(false);
+  const [captureCards, setCaptureCards] = useState([]);
+  const [captureCardChecks, setCaptureCardChecks] = useState({});
   const [breachStatusFilter, setBreachStatusFilter] = useState('all');
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
@@ -2396,6 +2399,28 @@ export default function DashboardPage() {
     });
   }, [cameraRawFeed, cameraRawVrmQuery, cameraRawSiteFilter]);
 
+  // VRM → draft lifecycle code for session capture card badges.
+  const draftByVrmForCapture = useMemo(() => {
+    const map = {};
+    const priority = ['CONVERTED', 'SUBMITTED', 'READY', 'FAILED', 'DRAFT_OPEN'];
+    for (const item of queueItems) {
+      const v = normalizeVrm(item?.payload?.vrm || item?.vrm || '');
+      if (!v) continue;
+      const archived = Boolean(item?.archived) || String(item?.status || '').toLowerCase() === 'archived';
+      if (archived) continue;
+      const converted = Boolean(item?.payload?.convertedToPcn) || item?.payload?.breachLifecycle === 'CONVERTED_TO_PCN';
+      const status = String(item?.status || '').toLowerCase();
+      let code = 'DRAFT_OPEN';
+      if (converted) code = 'CONVERTED';
+      else if (status === 'submitted' || status === 'synced') code = 'SUBMITTED';
+      else if (status === 'failed') code = 'FAILED';
+      else if (item?.payload?.breachLifecycle === 'READY_FOR_SYNC') code = 'READY';
+      const existing = map[v];
+      if (!existing || priority.indexOf(code) < priority.indexOf(existing)) map[v] = code;
+    }
+    return map;
+  }, [queueItems]);
+
   const primaryCaptureAction = useMemo(() => {
     if (!hasEntryEvidence) {
       return { key: 'capture-entry', label: 'Capture entry evidence' };
@@ -3032,8 +3057,96 @@ export default function DashboardPage() {
 
   function openCaptureDialog(phase) {
     const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+    setCaptureIsQuickMode(false);
     setCaptureStepperPhase(normalizedPhase);
     setCaptureStepperOpen(true);
+  }
+
+  // Quick-capture: creates an isolated card per capture, then auto-reopens for next vehicle.
+  async function handleQuickCaptureComplete({ files = [], phase = 'entry', scan = null, captureMode = 'scan' } = {}) {
+    const rawFiles = Array.isArray(files) ? files : [];
+    if (rawFiles.length === 0) { setCaptureStepperOpen(false); return; }
+
+    const fallbackTs = await getServerTimestamp();
+    const firstFile = rawFiles[0];
+    firstFile.capturedAt = normalizeCapturedAt(firstFile?.capturedAt) || fallbackTs;
+    const capturedAt = firstFile.capturedAt;
+
+    // Stable card ID scoped to this exact capture invocation — prevents any cross-card bleed.
+    const cardId = `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const plateText = normalizeVrm(scan?.plateText || firstFile?.detectedPlateText || '');
+    const plateConfidence = Number(scan?.confidence || firstFile?.detectedPlateConfidence || 0);
+    const cutoffImage = String(scan?.cutoffImage || firstFile?.detectedPlateCutoffImage || '');
+    const effectiveSiteId = selectedSiteId;
+    const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
+
+    const card = {
+      id: cardId,
+      capturedAt,
+      plateText,
+      plateConfidence,
+      cutoffImage,
+      vehiclePreview: '',
+      files: rawFiles,
+      siteId: effectiveSiteId,
+      siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId || '',
+    };
+
+    // Async preview — keyed to cardId so it can only update its own card.
+    const vehicleFile = rawFiles.find((f) => !String(f?.name || '').toLowerCase().includes('plate_cutoff_')) || rawFiles[0];
+    if (vehicleFile) {
+      fileToDataUrl(vehicleFile).then((url) => {
+        setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, vehiclePreview: url } : c));
+      }).catch(() => {});
+    }
+
+    // Functional update ensures no stale-closure overwrite from concurrent captures.
+    setCaptureCards((prev) => [card, ...prev]);
+    setCaptureStepperOpen(false);
+
+    // Brief pause, then re-open capture for the next vehicle.
+    window.setTimeout(() => {
+      setCaptureIsQuickMode(true);
+      setCaptureStepperPhase('entry');
+      setCaptureStepperOpen(true);
+    }, 380);
+  }
+
+  async function runCardCarcheck(cardId, vrm) {
+    if (!vrm) return;
+    setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], carcheckStatus: 'checking' } }));
+    try {
+      const token = await resolveAuthToken();
+      const result = await fetchJson(`/api/carcheck?vrm=${encodeURIComponent(vrm)}`, { token });
+      const make = String(result?.make || result?.vehicle?.make || '').trim();
+      const model = String(result?.model || result?.vehicle?.model || '').trim();
+      const color = String(result?.colour || result?.color || result?.vehicle?.colour || '').trim();
+      setCaptureCardChecks((prev) => ({
+        ...prev,
+        [cardId]: { ...prev[cardId], carcheckStatus: make || model ? 'ok' : 'not_found', carcheckDetails: { make, model, color } },
+      }));
+    } catch (_) {
+      setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], carcheckStatus: 'error' } }));
+    }
+  }
+
+  async function runCardPermit(cardId, vrm, siteId) {
+    if (!vrm || !siteId) return;
+    setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], permitStatus: 'checking' } }));
+    try {
+      const token = await resolveAuthToken();
+      const result = await fetchJson(
+        `/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(siteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`,
+        { token }
+      );
+      const has = Boolean(result?.hasAuthorization);
+      setCaptureCardChecks((prev) => ({
+        ...prev,
+        [cardId]: { ...prev[cardId], permitStatus: has ? 'has_permit' : 'no_permit', permitData: result },
+      }));
+    } catch (_) {
+      setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], permitStatus: 'error' } }));
+    }
   }
 
   function closeImageDetailDialog() {
@@ -7180,7 +7293,149 @@ export default function DashboardPage() {
       {/* ─── CAMERA RAW SCREEN ─────────────────────────────────────── */}
       {currentScreen === 'camera' ? (
         <main className="screen-body">
-          {/* Camera service feed — captures already relayed to breach engine */}
+
+          {/* ── Site selector ────────────────────────────────────── */}
+          <div className="camera-tab-site-bar">
+            <select
+              className="site-filter-select site-filter-select--camera"
+              value={selectedSiteId}
+              onChange={(e) => { setSelectedSiteId(e.target.value); saveStoredSiteId(e.target.value); }}
+            >
+              <option value="">— Select patrol site —</option>
+              {sites.map((s) => (
+                <option key={s.id} value={s.id}>{s.displayName || s.name || s.id}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* ── Quick-capture CTA ────────────────────────────────── */}
+          <button
+            type="button"
+            className="quick-capture-cta"
+            onClick={() => {
+              setCaptureIsQuickMode(true);
+              setCaptureStepperPhase('entry');
+              setCaptureStepperOpen(true);
+            }}
+          >
+            <span className="quick-capture-icon">📷</span>
+            <span className="quick-capture-label">Capture vehicle</span>
+            <span className="quick-capture-sub">OCR starts immediately</span>
+          </button>
+
+          {/* ── Session capture cards ────────────────────────────── */}
+          {captureCards.length > 0 ? (
+            <div className="capture-cards-section">
+              <div className="capture-cards-header">
+                <span>This session — {captureCards.length} capture{captureCards.length !== 1 ? 's' : ''}</span>
+                <button type="button" className="capture-cards-clear" onClick={() => { setCaptureCards([]); setCaptureCardChecks({}); }}>Clear all</button>
+              </div>
+              {captureCards.map((card) => {
+                const cc = captureCardChecks[card.id] || {};
+                const draftCode = draftByVrmForCapture[normalizeVrm(card.plateText)] || null;
+                const hasPcn = draftCode === 'CONVERTED' || draftCode === 'SUBMITTED';
+                return (
+                  <div key={card.id} className={`capture-card ${cc.permitStatus === 'has_permit' ? 'capture-card--permitted' : cc.permitStatus === 'no_permit' ? 'capture-card--actionable' : ''}`}>
+                    <div className="capture-card-left">
+                      {(card.vehiclePreview || card.cutoffImage) ? (
+                        <img
+                          src={card.vehiclePreview || card.cutoffImage}
+                          alt={card.plateText || 'Capture'}
+                          className="capture-card-thumb"
+                          onClick={() => openImageDetailDialog({ src: card.vehiclePreview || card.cutoffImage, label: card.plateText || 'Capture', capturedAt: card.capturedAt })}
+                        />
+                      ) : (
+                        <div className="capture-card-thumb capture-card-thumb--empty">📷</div>
+                      )}
+                    </div>
+                    <div className="capture-card-body">
+                      <div className="capture-card-plate">
+                        {card.plateText
+                          ? <><strong>{card.plateText}</strong>{card.plateConfidence > 0 ? <span className="capture-card-conf">{card.plateConfidence}%</span> : null}</>
+                          : <span className="capture-card-noplate">No plate detected</span>}
+                      </div>
+                      <div className="capture-card-meta">
+                        <span>{formatLocalTimestamp(card.capturedAt)}</span>
+                        {card.siteName ? <span> · {card.siteName}</span> : null}
+                      </div>
+                      {/* Permit badge */}
+                      <div className="capture-card-badges">
+                        {cc.permitStatus === 'checking' && <span className="wf-badge wf-badge--grey">Checking…</span>}
+                        {cc.permitStatus === 'has_permit' && <span className="wf-badge wf-badge--amber">⚠ Permitted</span>}
+                        {cc.permitStatus === 'no_permit' && <span className="wf-badge wf-badge--green">✓ No permit</span>}
+                        {cc.permitStatus === 'error' && <span className="wf-badge wf-badge--grey">Permit error</span>}
+                        {cc.carcheckStatus === 'ok' && cc.carcheckDetails && (
+                          <span className="wf-badge wf-badge--blue">
+                            {[cc.carcheckDetails.make, cc.carcheckDetails.color].filter(Boolean).join(' ') || 'OK'}
+                          </span>
+                        )}
+                        {cc.carcheckStatus === 'not_found' && <span className="wf-badge wf-badge--grey">Not found</span>}
+                        {draftCode && !hasPcn && <span className={`wf-badge wf-badge--draft-${draftCode.toLowerCase().replace('_', '-')}`}>{draftCode.replace('_', ' ')}</span>}
+                        {hasPcn && <span className="wf-badge wf-badge--submitted">PCN issued</span>}
+                      </div>
+                      <div className="capture-card-actions">
+                        <button type="button" className="wf-btn wf-btn--check" disabled={cc.carcheckStatus === 'checking'} onClick={() => runCardCarcheck(card.id, card.plateText)}>
+                          {cc.carcheckStatus === 'checking' ? '…' : 'Carcheck'}
+                        </button>
+                        <button type="button" className="wf-btn wf-btn--check" disabled={cc.permitStatus === 'checking' || !selectedSiteId} onClick={() => runCardPermit(card.id, card.plateText, card.siteId || selectedSiteId)} title={!selectedSiteId ? 'Select a site first' : 'e-Permit check'}>
+                          {cc.permitStatus === 'checking' ? '…' : 'e-Permit'}
+                        </button>
+                        {!hasPcn ? (
+                          <button
+                            type="button"
+                            className={`wf-btn ${cc.permitStatus === 'has_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
+                            title={cc.permitStatus === 'has_permit' ? 'Vehicle has a permit — issue PCN only if another rule was breached' : 'Start Draft PCN'}
+                            onClick={async () => {
+                              if (!card.plateText) { setMessage('No plate text — enter VRM manually after creating draft.'); }
+                              const entryTime = card.capturedAt || new Date().toISOString();
+                              const vehicleDetails = cc.carcheckDetails?.make ? cc.carcheckDetails : null;
+                              const item = createQueueItem({
+                                payload: {
+                                  vrm: card.plateText || '',
+                                  siteId: card.siteId || selectedSiteId,
+                                  siteName: card.siteName || (sites.find((s) => String(s.id) === selectedSiteId)?.name) || '',
+                                  source: 'WARDEN',
+                                  breachLifecycle: 'DRAFT_OPEN',
+                                  status: 'DRAFT_OPEN',
+                                  entryCaptureMode: 'scan',
+                                  observationStartTime: entryTime,
+                                  entryCapturedAt: entryTime,
+                                  detectedEntryVehicleImage: card.vehiclePreview || '',
+                                  startVehicleImage: card.vehiclePreview || '',
+                                  detectedEntryPlateCutoffImage: card.cutoffImage || '',
+                                  detectedEntryPlateText: card.plateText || '',
+                                  detectedEntryPlateConfidence: card.plateConfidence || 0,
+                                  authorization: cc.permitData || null,
+                                  savedVehicleLookup: vehicleDetails,
+                                  vehicleDetails,
+                                  contraventionReason: contraventions[0]?.label || '',
+                                  selectedContraventionCode: contraventions[0]?.code || '',
+                                  cameraRawData: [],
+                                },
+                                files: card.files.map((f) => ({ name: f.name, type: f.type, blob: f, phase: 'entry' })),
+                              });
+                              item.status = 'draft';
+                              await saveQueueItem(item);
+                              await refreshQueue();
+                              setSelectedTrackedId(item.id);
+                              setActiveTab('tracked');
+                              handleReviewTracked(item);
+                            }}
+                          >
+                            + Draft PCN
+                          </button>
+                        ) : (
+                          <span className="wf-btn wf-btn--issued">PCN issued</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+
+          {/* ── Camera service feed (already relayed to breach engine) ── */}
           <WardenCaptureFeed
             getToken={resolveAuthToken}
             selectedSiteId={selectedSiteId}
@@ -7785,7 +8040,7 @@ export default function DashboardPage() {
       <BreachStepper
         open={captureStepperOpen}
         onClose={() => setCaptureStepperOpen(false)}
-        onCaptureComplete={handleStepperCaptureComplete}
+        onCaptureComplete={captureIsQuickMode ? handleQuickCaptureComplete : handleStepperCaptureComplete}
         sites={sites}
         contraventions={contraventions}
         selectedSiteId={selectedSiteId}
