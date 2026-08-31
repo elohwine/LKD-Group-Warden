@@ -15,7 +15,7 @@ import { signOutFromWardenApp, getStoredToken, getValidToken } from '../lib/auth
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
-import { createQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
+import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
 import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { isLikelyCurrentUkVrm, normalizeUkVrmFromOcr, scoreUkVrmCandidate } from '../lib/ukVrmOcr.mjs';
 import { getServerTimestamp, syncWithServerTime } from '../lib/timeSync';
@@ -23,11 +23,17 @@ import { getBillableMinutes } from '../lib/duration';
 import { buildVehicleDetailsRecord } from '../lib/vehicleDetails';
 import { isVehicleCameraCandidate } from '../lib/vehicleCameras';
 import { buildMobileCameraAssignmentPayload } from '../lib/mobileCameraAssignment';
+import {
+  decideEvidenceSource,
+  recoverUploadableEvidenceFilesFromCameraRaw,
+  resolveCameraRawImageSrc,
+} from '../lib/pcnEvidenceSync';
 import AppShell from '../components/AppShell';
 import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
 import BreachStepper from '../components/BreachStepper';
 import PcnPreviewDialog from '../components/PcnPreviewDialog';
+import WardenCaptureFeed from '../components/WardenCaptureFeed';
 import { buildDemoSites, isDemoModeEnabled } from '../lib/demoMode';
 
 function formatElapsed(startIso, endIso = '') {
@@ -99,12 +105,182 @@ function isRetryableEvidenceUploadError(message) {
     || text.includes('server error (0)');
 }
 
+function isUploadableBlob(value) {
+  if (!value) return false;
+  if (typeof Blob !== 'undefined' && value instanceof Blob) return true;
+  return typeof value.arrayBuffer === 'function' && Number.isFinite(Number(value.size));
+}
+
 const PCN_SYNC_CONCURRENCY = 1;
 const IMAGE_UPLOAD_CONCURRENCY = 1;
 const EVIDENCE_UPLOAD_TIMEOUT_MS = 120000;
 const EVIDENCE_UPLOAD_MAX_RETRIES = 2;
 const EVIDENCE_UPLOAD_COMPLETING_STALL_MS = 120000;
 const EVIDENCE_UPLOAD_PROGRESS_STALL_MS = 120000;
+const WARDEN_SYNC_TRACE_TOGGLE_KEY = 'warden-sync-trace-enabled';
+const WARDEN_SYNC_TRACE_LOG_KEY = 'warden-sync-trace-log';
+const WARDEN_SYNC_TRACE_MAX_ENTRIES = 250;
+
+function detectImageSrcKind(value) {
+  const candidate = String(value || '').trim();
+  if (!candidate) return 'empty';
+  if (/^https?:\/\//i.test(candidate)) return 'http';
+  if (/^data:/i.test(candidate)) return 'data';
+  if (/^blob:/i.test(candidate)) return 'blob';
+  if (/^file:/i.test(candidate)) return 'file';
+  if (/^content:/i.test(candidate)) return 'content';
+  if (/^capacitor:/i.test(candidate)) return 'capacitor';
+  return 'other';
+}
+
+function summarizeCameraRawRecordsForTrace(records, phase) {
+  const safeRecords = Array.isArray(records) ? records : [];
+  const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
+  const filtered = safeRecords.filter((record) => (record?.phase === 'closing' ? 'closing' : 'entry') === normalizedPhase);
+
+  const kindCounts = filtered.reduce((acc, record) => {
+    const src = resolveCameraRawImageSrc(record);
+    const kind = detectImageSrcKind(src);
+    acc[kind] = Number(acc[kind] || 0) + 1;
+    return acc;
+  }, {});
+
+  const sample = filtered.slice(0, 5).map((record) => {
+    const src = String(resolveCameraRawImageSrc(record) || '');
+    return {
+      id: String(record?.id || '').trim() || null,
+      fileName: String(record?.fileName || '').trim() || null,
+      kind: detectImageSrcKind(src),
+      srcPreview: src.slice(0, 120),
+      mimeType: String(record?.mimeType || '').trim() || null,
+    };
+  });
+
+  return {
+    phase: normalizedPhase,
+    total: filtered.length,
+    sourceKinds: kindCounts,
+    sample,
+  };
+}
+
+function isSyncTraceEnabled() {
+  if (typeof window === 'undefined') return false;
+  try {
+    const storedToggle = window.localStorage?.getItem(WARDEN_SYNC_TRACE_TOGGLE_KEY);
+    if (storedToggle === '1') return true;
+    if (storedToggle === '0') return false;
+
+    const query = new URLSearchParams(window.location.search || '');
+    if (query.get('syncTrace') === '1') {
+      window.localStorage?.setItem(WARDEN_SYNC_TRACE_TOGGLE_KEY, '1');
+      return true;
+    }
+
+    const isNativePlatform = typeof window.Capacitor !== 'undefined'
+      && (typeof window.Capacitor.isNativePlatform !== 'function' || window.Capacitor.isNativePlatform());
+    return Boolean(isNativePlatform);
+  } catch (_) {
+    return false;
+  }
+}
+
+function appendSyncTraceEntry(entry) {
+  if (typeof window === 'undefined') return;
+  try {
+    const existingRaw = window.localStorage?.getItem(WARDEN_SYNC_TRACE_LOG_KEY);
+    let parsed = [];
+    if (existingRaw) {
+      const maybeParsed = JSON.parse(existingRaw);
+      if (Array.isArray(maybeParsed)) parsed = maybeParsed;
+    }
+    const existing = parsed;
+    const next = [...existing, entry];
+    if (next.length > WARDEN_SYNC_TRACE_MAX_ENTRIES) {
+      next.splice(0, next.length - WARDEN_SYNC_TRACE_MAX_ENTRIES);
+    }
+    window.localStorage?.setItem(WARDEN_SYNC_TRACE_LOG_KEY, JSON.stringify(next));
+  } catch (_) {
+    // Ignore storage failures in private browsing / quota edge cases.
+  }
+}
+
+function createSyncTracer(itemId, options = {}) {
+  const enabled = isSyncTraceEnabled();
+  const traceId = `sync_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const onEvent = typeof options?.onEvent === 'function' ? options.onEvent : null;
+
+  const trace = (event, payload = {}) => {
+    if (!enabled) return;
+    const entry = {
+      ts: new Date().toISOString(),
+      traceId,
+      itemId,
+      event,
+      payload,
+    };
+    console.log('[warden-sync-trace]', entry);
+    appendSyncTraceEntry(entry);
+    if (onEvent) {
+      try {
+        onEvent(entry);
+      } catch (_) {
+        // Never let UI tracing break sync execution.
+      }
+    }
+  };
+
+  return { enabled, traceId, trace };
+}
+
+function formatSyncTraceEventLabel(event, payload = {}) {
+  switch (String(event || '')) {
+    case 'sync_start':
+      return 'Sync started';
+    case 'camera_raw_snapshot':
+      return `Camera raw snapshot (${payload.phase || 'entry'}): ${Number(payload.total || 0)} record(s)`;
+    case 'camera_raw_recover_phase_start':
+      return `Recovering ${payload.phase || 'entry'} local evidence...`;
+    case 'camera_raw_recover_attempt':
+      return `Trying local ${payload.phase || 'entry'} source (${payload.srcKind || 'unknown'})`;
+    case 'camera_raw_recover_success':
+      return `Recovered ${payload.phase || 'entry'} file ${payload.fileName || ''} (${Number(payload.sizeBytes || 0)} bytes)`;
+    case 'camera_raw_recover_failed':
+      return `Could not recover ${payload.phase || 'entry'} local file ${payload.fileName || ''}`;
+    case 'evidence_source_decision':
+      return payload.shouldUploadLocalEvidence
+        ? 'Using local evidence files for upload'
+        : 'Using stored payload evidence fallback';
+    case 'stage_update':
+      return String(payload.message || 'Sync stage updated');
+    case 'upload_batch_start':
+      return `Uploading ${payload.phase || 'evidence'} batch (${Number(payload.totalUploads || 0)} file(s))`;
+    case 'upload_file_start':
+      return `Uploading ${payload.fileName || 'file'}...`;
+    case 'upload_signed_url_ready':
+      return `Signed URL ready for ${payload.fileName || 'file'}`;
+    case 'upload_file_success':
+      return `Uploaded ${payload.fileName || 'file'} (${payload.mode || 'signed-upload'})`;
+    case 'upload_file_failed':
+      return `Upload failed for ${payload.fileName || 'file'}`;
+    case 'upload_batch_done':
+      return `Upload batch complete (${Number(payload.successCount || 0)} ok / ${Number(payload.failedCount || 0)} failed)`;
+    case 'entry_upload_failed_using_payload':
+      return 'Opening image upload failed; falling back to stored opening evidence';
+    case 'closing_upload_failed_using_payload':
+      return 'Closing image upload failed; falling back to stored closing evidence';
+    case 'submission_payload_ready':
+      return `Submission payload ready (${Number(payload.imageCount || 0)} image URL(s))`;
+    case 'sync_success':
+      return `Sync completed successfully (${payload.breachId || 'no breach id'})`;
+    case 'sync_cancelled':
+      return 'Sync cancelled by user';
+    case 'sync_failed':
+      return `Sync failed: ${payload.errorMessage || 'unknown error'}`;
+    default:
+      return String(event || 'sync_event');
+  }
+}
 
 function uploadEvidenceBlobWithXhr({ url, blob, contentType, fileName, uploadLabel, onProgress }) {
   const xhr = new XMLHttpRequest();
@@ -902,25 +1078,6 @@ function buildCameraRawRecords(files, previews, { phase, capturedAt, source = 'W
   });
 }
 
-function resolveCameraRawImageSrc(record) {
-  const candidates = [
-    record?.localPreviewUrl,
-    record?.uploadedUrl,
-    record?.previewUrl,
-    record?.imageUrl,
-    record?.url,
-    record?.fileUrl,
-    record?.publicUrl,
-  ];
-
-  for (const value of candidates) {
-    const candidate = String(value || '').trim();
-    if (candidate) return candidate;
-  }
-
-  return '';
-}
-
 function mergeCameraRawRecords(existing, incoming, phase) {
   const safeExisting = Array.isArray(existing) ? existing : [];
   const safeIncoming = Array.isArray(incoming) ? incoming : [];
@@ -989,6 +1146,29 @@ function reorderEvidenceByMainIndex(files, mainIndex) {
   const [selected] = reordered.splice(index, 1);
   if (!selected) return safeFiles;
   return [selected, ...reordered];
+}
+
+function dedupeEvidenceFiles(files) {
+  const safeFiles = Array.isArray(files) ? files : [];
+  const seen = new Set();
+  const deduped = [];
+
+  for (const file of safeFiles) {
+    if (!file) continue;
+    const blob = file?.blob || file;
+    const phase = String(file?.phase || '').toLowerCase();
+    const name = String(file?.name || blob?.name || '').trim().toLowerCase();
+    const type = String(file?.type || blob?.type || '').trim().toLowerCase();
+    const size = Number(blob?.size || file?.size || 0);
+    const capturedAt = String(file?.capturedAt || blob?.capturedAt || '').trim();
+    const key = `${phase}|${name}|${type}|${size}|${capturedAt}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(file);
+  }
+
+  return deduped;
 }
 
 async function backfillCameraRawPreviewUrls(records, files) {
@@ -1062,11 +1242,45 @@ function sanitizeCameraRawRecordsForSubmission(records) {
       localPreviewUrl,
       previewUrl,
       imageUrl,
+      url,
+      fileUrl,
+      publicUrl,
       ...rest
     } = record;
 
-    return rest;
-  });
+    const uploadedUrl = [
+      record?.uploadedUrl,
+      publicUrl,
+      fileUrl,
+      url,
+      imageUrl,
+      previewUrl,
+      localPreviewUrl,
+    ]
+      .map((value) => String(value || '').trim())
+      .find((value) => /^https?:\/\//i.test(value)) || '';
+
+    const plateCutoffImage = /^https?:\/\//i.test(String(record?.plateCutoffImage || '').trim())
+      ? String(record.plateCutoffImage).trim()
+      : '';
+
+    return {
+      id: String(rest?.id || ''),
+      phase: rest?.phase === 'closing' ? 'closing' : 'entry',
+      imageRole: String(rest?.imageRole || ''),
+      source: String(rest?.source || 'WARDEN_CAPTURE'),
+      capturedAt: normalizeCapturedAt(rest?.capturedAt) || '',
+      capturedAtUk: String(rest?.capturedAtUk || ''),
+      fileName: String(rest?.fileName || ''),
+      mimeType: String(rest?.mimeType || ''),
+      sizeBytes: Number(rest?.sizeBytes || 0),
+      plateText: normalizeVrm(rest?.plateText || ''),
+      plateConfidence: Number(rest?.plateConfidence || 0),
+      plateCutoffImage,
+      uploadedUrl,
+      targetSystem: String(rest?.targetSystem || (uploadedUrl ? 'LOS' : '')),
+    };
+  }).filter((record) => record && (record.uploadedUrl || record.plateCutoffImage));
 }
 
 function isHttpUrl(value) {
@@ -1207,10 +1421,46 @@ function getEvidencePhaseCounts(files) {
   return { entryCount, closingCount };
 }
 
+function toLocalDayKey(value) {
+  const date = new Date(value || '');
+  if (!Number.isFinite(date.getTime())) return '';
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function shouldArchiveClosedAfterMidnight(item, now = new Date()) {
+  const status = String(item?.status || '').toLowerCase();
+  const lifecycle = String(item?.payload?.breachLifecycle || '').toLowerCase();
+  const converted = Boolean(item?.payload?.convertedToPcn) || lifecycle === 'converted_to_pcn';
+  const submitted = ['submitted', 'synced'].includes(status) || lifecycle === 'submitted' || converted;
+  const archived = Boolean(item?.archived) || status === 'archived';
+
+  if (archived || !submitted) return false;
+
+  const referenceTime =
+    item?.payload?.convertedAt ||
+    item?.payload?.submittedAt ||
+    item?.updatedAt ||
+    item?.createdAt ||
+    null;
+
+  const itemDay = toLocalDayKey(referenceTime);
+  const todayDay = toLocalDayKey(now);
+  if (!itemDay || !todayDay) return false;
+  return itemDay < todayDay;
+}
+
 function getBreachLifecycle(item) {
   const status = String(item?.status || '').toLowerCase();
   const converted = Boolean(item?.payload?.convertedToPcn) || item?.payload?.breachLifecycle === 'CONVERTED_TO_PCN';
+  const archived = Boolean(item?.archived) || status === 'archived';
   const { entryCount, closingCount } = getEvidencePhaseCounts(item?.files);
+
+  if (archived) {
+    return { code: 'ARCHIVED', label: 'Archived', syncable: false };
+  }
 
   if (converted) {
     return { code: 'CONVERTED', label: 'Converted to PCN', syncable: false };
@@ -1402,6 +1652,7 @@ export default function DashboardPage() {
   const [activeTab, setActiveTab] = useState('tracked');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedTrackedId, setSelectedTrackedId] = useState('');
+  const [selectedArchiveIds, setSelectedArchiveIds] = useState([]);
   const [darkMode, setDarkMode] = useState(true);
   const [autoSubmitOnClosingCapture, setAutoSubmitOnClosingCapture] = useState(false);
   const [carcheckDialogOpen, setCarcheckDialogOpen] = useState(false);
@@ -1415,6 +1666,15 @@ export default function DashboardPage() {
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
   const [submissionProgressText, setSubmissionProgressText] = useState('');
+  const [syncProgressDialogOpen, setSyncProgressDialogOpen] = useState(false);
+  const [syncProgressLogs, setSyncProgressLogs] = useState([]);
+  const [syncProgressCopyNotice, setSyncProgressCopyNotice] = useState('');
+  const [syncProgressMeta, setSyncProgressMeta] = useState({
+    traceId: '',
+    itemId: '',
+    status: 'idle',
+    startedAt: '',
+  });
   const [pcnReasonInput, setPcnReasonInput] = useState('No valid permit or payment found');
   const [monitoringSessionActive, setMonitoringSessionActive] = useState(false);
   const [monitoringSessionStartedAt, setMonitoringSessionStartedAt] = useState('');
@@ -1448,6 +1708,113 @@ export default function DashboardPage() {
   const syncInFlightCountRef = useRef(0);
   const syncAbortControllersRef = useRef(new Map());
 
+  function appendSyncProgressLog(message, level = 'info') {
+    const safeMessage = String(message || '').trim();
+    if (!safeMessage) return;
+
+    const entry = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      at: new Date().toISOString(),
+      level,
+      message: safeMessage,
+    };
+
+    setSyncProgressLogs((current) => {
+      const next = [...(Array.isArray(current) ? current : []), entry];
+      if (next.length > 300) return next.slice(next.length - 300);
+      return next;
+    });
+  }
+
+  function pushSyncTraceEntryToUi(entry) {
+    if (!entry || typeof entry !== 'object') return;
+    const label = formatSyncTraceEventLabel(entry.event, entry.payload || {});
+    const lowerEvent = String(entry.event || '').toLowerCase();
+    const level = lowerEvent.includes('failed') || lowerEvent.includes('error')
+      ? 'error'
+      : lowerEvent.includes('success') || lowerEvent.includes('done')
+        ? 'success'
+        : 'info';
+    appendSyncProgressLog(label, level);
+  }
+
+  function resetSyncProgressLogs() {
+    setSyncProgressLogs([]);
+    setSyncProgressCopyNotice('');
+    setSyncProgressMeta({
+      traceId: '',
+      itemId: '',
+      status: 'idle',
+      startedAt: '',
+    });
+  }
+
+  function buildSyncProgressExportText() {
+    const lines = [];
+    lines.push('LDK Warden sync log export');
+    lines.push(`Status: ${syncProgressMeta.status || 'idle'}`);
+    if (syncProgressMeta.traceId) lines.push(`Trace: ${syncProgressMeta.traceId}`);
+    if (syncProgressMeta.itemId) lines.push(`Queue item: ${syncProgressMeta.itemId}`);
+    lines.push(`Exported at: ${new Date().toISOString()}`);
+    lines.push('');
+
+    const entries = Array.isArray(syncProgressLogs) ? syncProgressLogs : [];
+    if (entries.length === 0) {
+      lines.push('No log entries captured yet.');
+      return lines.join('\n');
+    }
+
+    entries.forEach((entry) => {
+      const at = entry?.at ? new Date(entry.at).toISOString() : '';
+      const level = String(entry?.level || 'info').toUpperCase();
+      const message = String(entry?.message || '').trim();
+      lines.push(`[${at}] [${level}] ${message}`);
+    });
+
+    return lines.join('\n');
+  }
+
+  async function copySyncProgressLogsToClipboard() {
+    const payload = buildSyncProgressExportText();
+    let copied = false;
+
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(payload);
+        copied = true;
+      }
+    } catch (_) {
+      copied = false;
+    }
+
+    if (!copied) {
+      try {
+        const textArea = document.createElement('textarea');
+        textArea.value = payload;
+        textArea.setAttribute('readonly', '');
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        textArea.style.pointerEvents = 'none';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        copied = document.execCommand('copy');
+        document.body.removeChild(textArea);
+      } catch (_) {
+        copied = false;
+      }
+    }
+
+    if (copied) {
+      setSyncProgressCopyNotice('Logs copied to clipboard.');
+      appendSyncProgressLog('Sync logs copied to clipboard.', 'success');
+      return;
+    }
+
+    setSyncProgressCopyNotice('Unable to copy logs on this device.');
+    appendSyncProgressLog('Failed to copy sync logs to clipboard.', 'error');
+  }
+
   function isRetriableSyncError(errorMessage) {
     const message = String(errorMessage || '').toLowerCase();
     if (!message) return false;
@@ -1464,6 +1831,26 @@ export default function DashboardPage() {
       message.includes('503') ||
       message.includes('504') ||
       message.includes('429')
+    );
+  }
+
+  function isAuthSyncError(errorLike) {
+    const status = Number(errorLike?.status || 0);
+    if (status === 401 || status === 403) return true;
+
+    const message = String(
+      errorLike?.error || errorLike?.message || errorLike || ''
+    ).toLowerCase();
+    if (!message) return false;
+
+    return (
+      message.includes('invalid or expired token') ||
+      message.includes('expired token') ||
+      message.includes('invalid token') ||
+      message.includes('unauthorized') ||
+      message.includes('forbidden') ||
+      message.includes('auth_missing') ||
+      message.includes('id-token')
     );
   }
 
@@ -1617,58 +2004,94 @@ export default function DashboardPage() {
   const canRunLookups = Boolean(selectedSiteId && selectedVrm);
   const canFinalizeBreach = Boolean(selectedSiteId && hasEntryEvidence && hasClosingEvidence && !busy);
   const trackedBreaches = useMemo(() => {
-    return queueItems.map((item) => {
-      const lifecycle = getBreachLifecycle(item);
-      const { entryCount, closingCount } = getEvidencePhaseCounts(item.files);
-      const observationStartTime = item?.payload?.observationStartTime || item?.payload?.entryCapturedAt || '';
-      const observationEndTime =
-        item?.payload?.observationEndTime ||
-        item?.payload?.closingCapturedAt ||
-        item?.payload?.convertedAt ||
-        '';
-      const hasExitEvidence =
-        closingCount > 0 ||
-        Boolean(item?.payload?.closingCapturedAt) ||
-        lifecycle.code === 'CONVERTED';
-      const isOpen = lifecycle.code === 'DRAFT_OPEN' && !hasExitEvidence;
-      const requiredMinutes = normalizeObservationMinutes(
-        item?.payload?.expectedObservationMinutes ||
-        item?.payload?.requiredObservationMinutes ||
-        item?.payload?.observationMinutes ||
-        0
-      );
-      const startMs = new Date(observationStartTime).getTime();
-      const elapsedMinutes = observationStartTime
-        ? Math.max(0, diffMinutes(observationStartTime, hasExitEvidence ? observationEndTime : new Date().toISOString()))
-        : 0;
-      const remainingSeconds = observationStartTime && requiredMinutes > 0 && isOpen && Number.isFinite(startMs) && startMs > 0
-        ? Math.max(0, Math.ceil((requiredMinutes * 60) - ((Date.now() - startMs) / 1000)))
-        : 0;
-      const isPastRequired = requiredMinutes > 0 ? remainingSeconds <= 0 : false;
-      return {
-        id: item.id,
-        createdAt: item.createdAt,
-        status: item.status,
-        lifecycle,
-        attempts: item.attempts || 0,
-        lastError: item.lastError || '',
-        vrm: item.payload?.vrm || 'Pending VRM',
-        siteName: item.payload?.siteName || 'Site not set',
-        reason: item.payload?.contraventionReason || 'No reason supplied',
-        observationStartTime,
-        observationEndTime,
-        isOpen,
-        elapsedMinutes,
-        requiredMinutes,
-        remainingSeconds,
-        isPastRequired,
-        payload: item.payload || {},
-        files: Array.isArray(item.files) ? item.files : [],
-        entryCount,
-        closingCount,
-      };
-    });
+    return queueItems
+      .filter((item) => {
+        const archived = Boolean(item?.archived) || String(item?.status || '').toLowerCase() === 'archived';
+        return !archived;
+      })
+      .map((item) => {
+        const lifecycle = getBreachLifecycle(item);
+        const { entryCount, closingCount } = getEvidencePhaseCounts(item.files);
+        const observationStartTime = item?.payload?.observationStartTime || item?.payload?.entryCapturedAt || '';
+        const observationEndTime =
+          item?.payload?.observationEndTime ||
+          item?.payload?.closingCapturedAt ||
+          item?.payload?.convertedAt ||
+          '';
+        const hasExitEvidence =
+          closingCount > 0 ||
+          Boolean(item?.payload?.closingCapturedAt) ||
+          lifecycle.code === 'CONVERTED';
+        const isOpen = lifecycle.code === 'DRAFT_OPEN' && !hasExitEvidence;
+        const requiredMinutes = normalizeObservationMinutes(
+          item?.payload?.expectedObservationMinutes ||
+          item?.payload?.requiredObservationMinutes ||
+          item?.payload?.observationMinutes ||
+          0
+        );
+        const startMs = new Date(observationStartTime).getTime();
+        const elapsedMinutes = observationStartTime
+          ? Math.max(0, diffMinutes(observationStartTime, hasExitEvidence ? observationEndTime : new Date().toISOString()))
+          : 0;
+        const remainingSeconds = observationStartTime && requiredMinutes > 0 && isOpen && Number.isFinite(startMs) && startMs > 0
+          ? Math.max(0, Math.ceil((requiredMinutes * 60) - ((Date.now() - startMs) / 1000)))
+          : 0;
+        const isPastRequired = requiredMinutes > 0 ? remainingSeconds <= 0 : false;
+        return {
+          id: item.id,
+          createdAt: item.createdAt,
+          status: item.status,
+          lifecycle,
+          attempts: item.attempts || 0,
+          lastError: item.lastError || '',
+          vrm: item.payload?.vrm || 'Pending VRM',
+          siteName: item.payload?.siteName || 'Site not set',
+          reason: item.payload?.contraventionReason || 'No reason supplied',
+          observationStartTime,
+          observationEndTime,
+          isOpen,
+          elapsedMinutes,
+          requiredMinutes,
+          remainingSeconds,
+          isPastRequired,
+          payload: item.payload || {},
+          files: Array.isArray(item.files) ? item.files : [],
+          entryCount,
+          closingCount,
+        };
+      });
   }, [queueItems, ticks]);
+
+  const archivedBreaches = useMemo(() => {
+    return queueItems
+      .filter((item) => {
+        const archived = Boolean(item?.archived) || String(item?.status || '').toLowerCase() === 'archived';
+        return archived;
+      })
+      .map((item) => {
+        const lifecycle = getBreachLifecycle(item);
+        return {
+          id: item.id,
+          createdAt: item.createdAt,
+          status: item.status,
+          lifecycle,
+          vrm: item.payload?.vrm || 'Pending VRM',
+          siteName: item.payload?.siteName || 'Site not set',
+          reason: item.payload?.contraventionReason || 'No reason supplied',
+          payload: item.payload || {},
+          files: Array.isArray(item.files) ? item.files : [],
+        };
+      });
+  }, [queueItems, ticks]);
+
+  useEffect(() => {
+    setSelectedArchiveIds((current) => {
+      if (!current.length) return current;
+      const existingIds = new Set(archivedBreaches.map((item) => item.id));
+      const next = current.filter((id) => existingIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [archivedBreaches]);
 
   const syncCandidates = useMemo(
     () => trackedBreaches.filter((item) => item.lifecycle.syncable || item.status === 'syncing'),
@@ -1676,10 +2099,33 @@ export default function DashboardPage() {
   );
 
   const selectedTracked = useMemo(
-    () => trackedBreaches.find((entry) => entry.id === selectedTrackedId) || null,
-    [trackedBreaches, selectedTrackedId]
+    () => trackedBreaches.find((entry) => entry.id === selectedTrackedId)
+      || archivedBreaches.find((entry) => entry.id === selectedTrackedId)
+      || queueItems.find((entry) => entry.id === selectedTrackedId)
+      || null,
+    [trackedBreaches, archivedBreaches, queueItems, selectedTrackedId]
   );
-  const selectedLifecycleCode = selectedTracked?.lifecycle?.code || '';
+  const resolvedSelectedContraventionReason = useMemo(() => {
+    const code = String(
+      selectedContraventionCode
+      || selectedTracked?.payload?.selectedContraventionCode
+      || selectedTracked?.payload?.contraventionCode
+      || ''
+    ).trim();
+    const matched = contraventions.find((item) => String(item?.code || '').trim() === code) || null;
+    return String(
+      matched?.label
+      || selectedReason
+      || selectedTracked?.reason
+      || selectedTracked?.payload?.contraventionReason
+      || ''
+    ).trim();
+  }, [contraventions, selectedContraventionCode, selectedTracked, selectedReason]);
+  const selectedTrackedLifecycle = useMemo(
+    () => (selectedTracked ? (selectedTracked.lifecycle || getBreachLifecycle(selectedTracked)) : null),
+    [selectedTracked]
+  );
+  const selectedLifecycleCode = selectedTrackedLifecycle?.code || '';
   const selectedConvertedToPcn = selectedLifecycleCode === 'CONVERTED';
   const demoObservationExpired = isDemoModeEnabled() && trackedBreaches.some((item) => item.isOpen && item.requiredMinutes > 0 && item.remainingSeconds <= 0);
   const canProceedWithPcnActions = !demoObservationExpired || demoAlarmAcknowledged;
@@ -2159,6 +2605,26 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
+    if (!authReadyRef.current) return;
+    if (ticks <= 0 || ticks % 60 !== 0) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await refreshQueue();
+      } catch (error) {
+        if (!cancelled) {
+          console.error('[warden] periodic queue refresh failed', error);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [ticks]);
+
+  useEffect(() => {
     const refreshTick = () => setTicks((value) => value + 1);
     const handleVisibility = () => {
       if (!document.hidden) {
@@ -2517,20 +2983,33 @@ export default function DashboardPage() {
   async function refreshQueue() {
     const items = await listQueueItems();
     const nextItems = [];
+    const now = new Date();
 
     for (const item of items) {
-      const records = Array.isArray(item?.payload?.cameraRawData) ? item.payload.cameraRawData : [];
+      let workingItem = item;
+
+      if (shouldArchiveClosedAfterMidnight(workingItem, now)) {
+        const archivedItem = await updateQueueItem(workingItem.id, {
+          archived: true,
+          updatedAt: new Date().toISOString(),
+        });
+        if (archivedItem) {
+          workingItem = archivedItem;
+        }
+      }
+
+      const records = Array.isArray(workingItem?.payload?.cameraRawData) ? workingItem.payload.cameraRawData : [];
       if (records.length === 0) {
-        nextItems.push(item);
+        nextItems.push(workingItem);
         continue;
       }
 
-      const { records: repairedRecords, changed } = await backfillCameraRawPreviewUrls(records, item?.files);
+      const { records: repairedRecords, changed } = await backfillCameraRawPreviewUrls(records, workingItem?.files);
       if (changed) {
         const repairedItem = {
-          ...item,
+          ...workingItem,
           payload: {
-            ...(item?.payload || {}),
+            ...(workingItem?.payload || {}),
             cameraRawData: repairedRecords,
           },
           updatedAt: new Date().toISOString(),
@@ -2953,8 +3432,18 @@ export default function DashboardPage() {
     const limitUpload = pLimit(IMAGE_UPLOAD_CONCURRENCY);
     const totalUploads = uploadCandidates.length;
     const onProgress = typeof options?.onProgress === 'function' ? options.onProgress : null;
+    const syncTrace = typeof options?.syncTrace === 'function' ? options.syncTrace : null;
     const phaseLabel = String(options?.phase || 'evidence');
     let completedUploads = 0;
+
+    if (syncTrace) {
+      syncTrace('upload_batch_start', {
+        phase: phaseLabel,
+        totalUploads,
+        siteId: siteId || null,
+        manualVrm: fallbackVrm || null,
+      });
+    }
 
     const emitProgress = (payload) => {
       if (!onProgress) return;
@@ -3020,6 +3509,15 @@ export default function DashboardPage() {
       const uploadLabel = `${index + 1}/${totalUploads}`;
       const fileName = file?.name || blob?.name || `evidence_${Date.now()}_${index}.jpg`;
       emitProgress({ status: 'uploading', current: index + 1, fileName });
+      if (syncTrace) {
+        syncTrace('upload_file_start', {
+          phase: phaseLabel,
+          index,
+          fileName,
+          sizeBytes: Number(blob?.size || 0),
+          contentType: blob?.type || 'image/jpeg',
+        });
+      }
       console.log(`[warden] evidence upload queue start ${uploadLabel}`, {
         fileName: fileName || null,
         size: Number(blob?.size || 0),
@@ -3064,6 +3562,16 @@ export default function DashboardPage() {
             throw new Error(`${prefix}${data?.error || 'Failed to request signed upload URL'}`);
           }
 
+          if (syncTrace) {
+            syncTrace('upload_signed_url_ready', {
+              phase: phaseLabel,
+              index,
+              fileName,
+              path: data?.path || null,
+              contentType,
+            });
+          }
+
           const putResult = await uploadEvidenceBlobWithXhr({
             url: data?.url,
             blob,
@@ -3088,6 +3596,15 @@ export default function DashboardPage() {
 
           completedUploads += 1;
           emitProgress({ status: 'uploaded', current: index + 1, fileName });
+          if (syncTrace) {
+            syncTrace('upload_file_success', {
+              phase: phaseLabel,
+              index,
+              fileName,
+              mode: 'signed-upload',
+              url: putResult?.url || null,
+            });
+          }
 
           return {
             index,
@@ -3137,6 +3654,15 @@ export default function DashboardPage() {
 
         completedUploads += 1;
         emitProgress({ status: 'uploaded', current: index + 1, fileName });
+        if (syncTrace) {
+          syncTrace('upload_file_success', {
+            phase: phaseLabel,
+            index,
+            fileName,
+            mode: 'server-fallback',
+            uploadedCount: fallbackResult.images.length,
+          });
+        }
 
         return {
           index,
@@ -3144,6 +3670,15 @@ export default function DashboardPage() {
           images: fallbackResult.images,
         };
       } catch (fallbackError) {
+        if (syncTrace) {
+          syncTrace('upload_file_failed', {
+            phase: phaseLabel,
+            index,
+            fileName,
+            signedUploadError: signedUploadError?.message || String(signedUploadError || ''),
+            fallbackError: fallbackError?.message || String(fallbackError || ''),
+          });
+        }
         emitProgress({
           status: 'failed',
           current: index + 1,
@@ -3177,6 +3712,15 @@ export default function DashboardPage() {
       .find((value) => Boolean(value)) || fallbackVrm;
 
     const uploadedImages = fulfilled.flatMap((result) => (Array.isArray(result?.images) ? result.images : []));
+
+    if (syncTrace) {
+      syncTrace('upload_batch_done', {
+        phase: phaseLabel,
+        successCount: fulfilled.length,
+        failedCount: rejected.length,
+        uploadedImageCount: uploadedImages.length,
+      });
+    }
 
     emitProgress({
       status: 'done',
@@ -3748,6 +4292,17 @@ export default function DashboardPage() {
       selectedTracked?.payload?.contraventionCode ||
       ''
     ).trim();
+    const resolvedContravention = contraventions.find((item) => String(item?.code || '').trim() === resolvedContraventionCode) || null;
+    const resolvedContraventionReason = String(
+      resolvedContravention?.label
+      || selectedTracked?.payload?.contraventionReason
+      || selectedReason
+      || ''
+    ).trim();
+    if (!resolvedContraventionCode || !resolvedContraventionReason) {
+      setMessage('Select a valid contravention before submitting.');
+      return;
+    }
     const requiredObservationMinutes = resolveObservationMinutesFromCode(resolvedContraventionCode, selectedObservationMinutes);
     const now = new Date();
     const locationSnapshot = location || (await getCurrentLocation());
@@ -3778,7 +4333,7 @@ export default function DashboardPage() {
       source: 'WARDEN',
       wardenId: profile?.uid,
       actorId: profile?.uid,
-      contraventionReason: selectedReason,
+      contraventionReason: resolvedContraventionReason,
       status: 'QUEUED_FOR_QC',
       location: locationSnapshot || null,
       observationStartTime: entryTime,
@@ -3795,6 +4350,8 @@ export default function DashboardPage() {
       vehicleDetails: savedVehicleLookup,
       selectedContraventionCode: resolvedContraventionCode,
       contraventionCode: resolvedContraventionCode,
+      contravention: resolvedContraventionReason,
+      reason: resolvedContraventionReason,
       mainEntryImageIndex,
       mainClosingImageIndex,
       detectedEntryPlateText: entryDetection.plateText,
@@ -3907,7 +4464,7 @@ export default function DashboardPage() {
       wardenId: profile?.uid,
       actorId: profile?.uid,
       entryCaptureMode,
-      contraventionReason: selectedReason,
+      contraventionReason: resolvedSelectedContraventionReason,
       status: 'DRAFT_OPEN',
       breachLifecycle: 'DRAFT_OPEN',
       location: location || null,
@@ -3921,6 +4478,9 @@ export default function DashboardPage() {
       savedVehicleLookup,
       vehicleDetails: savedVehicleLookup,
       selectedContraventionCode,
+      contraventionCode: selectedContraventionCode,
+      contravention: resolvedSelectedContraventionReason,
+      reason: resolvedSelectedContraventionReason,
       mainEntryImageIndex,
       mainClosingImageIndex,
       detectedEntryPlateText: entryDetection.plateText,
@@ -4078,11 +4638,34 @@ export default function DashboardPage() {
     }
   }
 
-  async function syncQueueItemInternal(itemId, { openPcnDialogAfterSuccess = false, forceBreachCapture = false } = {}) {
+  async function syncQueueItemInternal(itemId, {
+    openPcnDialogAfterSuccess = false,
+    forceBreachCapture = false,
+    forceRefreshTokenAtStart = false,
+  } = {}) {
     const queuedItem = (await listQueueItems()).find((item) => item.id === itemId);
     if (!queuedItem) {
       return { ok: false, error: 'Draft Parking Charge not found for sync' };
     }
+
+    const { trace: syncTrace, traceId, enabled: traceEnabled } = createSyncTracer(itemId, {
+      onEvent: pushSyncTraceEntryToUi,
+    });
+    setSyncProgressDialogOpen(true);
+    setSyncProgressLogs([]);
+    setSyncProgressMeta({
+      traceId,
+      itemId,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    });
+    syncTrace('sync_start', {
+      status: String(queuedItem?.status || ''),
+      attempts: Number(queuedItem?.attempts || 0),
+      createdAt: String(queuedItem?.createdAt || ''),
+      updatedAt: String(queuedItem?.updatedAt || ''),
+      traceEnabled,
+    });
 
     const syncAbortController = new AbortController();
     syncAbortControllersRef.current.set(itemId, syncAbortController);
@@ -4103,7 +4686,7 @@ export default function DashboardPage() {
       await updateQueueItem(itemId, { status: 'syncing', attempts: queuedItem.attempts + 1, updatedAt: new Date().toISOString(), lastError: null });
       await refreshQueue();
 
-      const token = await resolveAuthToken();
+      const token = await resolveAuthToken({ forceRefresh: forceRefreshTokenAtStart });
       const queuedSiteId = String(queuedItem?.payload?.siteId || selectedSiteId || '').trim();
       if (!queuedSiteId) {
         throw new Error('Assign a patrol site before syncing this Parking Charge.');
@@ -4114,8 +4697,26 @@ export default function DashboardPage() {
       ).trim();
 
       const storedFiles = Array.isArray(queuedItem.files) ? queuedItem.files : [];
-      let entryEvidenceFiles = storedFiles.filter((file) => file.phase === 'entry');
-      let closingEvidenceFiles = storedFiles.filter((file) => file.phase === 'closing');
+      const cameraRawRecords = Array.isArray(queuedItem?.payload?.cameraRawData)
+        ? queuedItem.payload.cameraRawData
+        : [];
+      syncTrace('camera_raw_snapshot', summarizeCameraRawRecordsForTrace(cameraRawRecords, 'entry'));
+      syncTrace('camera_raw_snapshot', summarizeCameraRawRecordsForTrace(cameraRawRecords, 'closing'));
+      const recoveredEntryCameraFiles = await recoverUploadableEvidenceFilesFromCameraRaw(cameraRawRecords, 'entry', { trace: syncTrace });
+      const recoveredClosingCameraFiles = await recoverUploadableEvidenceFilesFromCameraRaw(cameraRawRecords, 'closing', { trace: syncTrace });
+      const storedEntryEvidenceFiles = storedFiles.filter((file) => file.phase === 'entry');
+      const storedClosingEvidenceFiles = storedFiles.filter((file) => file.phase === 'closing');
+
+      // Prefer queued files first; only add recovered camera-raw files to fill missing phases.
+      let entryEvidenceFiles = storedEntryEvidenceFiles.length > 0
+        ? [...storedEntryEvidenceFiles]
+        : [...recoveredEntryCameraFiles];
+      let closingEvidenceFiles = storedClosingEvidenceFiles.length > 0
+        ? [...storedClosingEvidenceFiles]
+        : [...recoveredClosingCameraFiles];
+
+      entryEvidenceFiles = dedupeEvidenceFiles(entryEvidenceFiles);
+      closingEvidenceFiles = dedupeEvidenceFiles(closingEvidenceFiles);
       const mainEntryIndex = Number.isFinite(Number(queuedItem?.payload?.mainEntryImageIndex))
         ? Number(queuedItem.payload.mainEntryImageIndex)
         : 0;
@@ -4128,8 +4729,31 @@ export default function DashboardPage() {
         closingEvidenceFiles = storedFiles.slice(1);
       }
 
-      entryEvidenceFiles = reorderEvidenceByMainIndex(entryEvidenceFiles, mainEntryIndex);
-      closingEvidenceFiles = reorderEvidenceByMainIndex(closingEvidenceFiles, mainClosingIndex);
+      entryEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(entryEvidenceFiles, mainEntryIndex));
+      closingEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(closingEvidenceFiles, mainClosingIndex));
+
+      let entryUploadableFiles = entryEvidenceFiles.filter((file) => isUploadableBlob(file?.blob || file));
+      let closingUploadableFiles = closingEvidenceFiles.filter((file) => isUploadableBlob(file?.blob || file));
+
+      syncTrace('evidence_file_counts_initial', {
+        storedFiles: storedFiles.length,
+        recoveredEntry: recoveredEntryCameraFiles.length,
+        recoveredClosing: recoveredClosingCameraFiles.length,
+        entryEvidenceFiles: entryEvidenceFiles.length,
+        closingEvidenceFiles: closingEvidenceFiles.length,
+        entryUploadableFiles: entryUploadableFiles.length,
+        closingUploadableFiles: closingUploadableFiles.length,
+      });
+
+      if (entryUploadableFiles.length !== entryEvidenceFiles.length || closingUploadableFiles.length !== closingEvidenceFiles.length) {
+        console.warn('[warden] legacy evidence includes non-uploadable local blobs; will fallback to stored URLs when needed', {
+          itemId,
+          entryFiles: entryEvidenceFiles.length,
+          entryUploadable: entryUploadableFiles.length,
+          closingFiles: closingEvidenceFiles.length,
+          closingUploadable: closingUploadableFiles.length,
+        });
+      }
 
       // If queue persistence is stale, use current in-memory captures for the selected session.
       if ((entryEvidenceFiles.length === 0 || closingEvidenceFiles.length === 0) && itemId === selectedTrackedId) {
@@ -4154,8 +4778,8 @@ export default function DashboardPage() {
         if (entryEvidenceFiles.length > 0 && closingEvidenceFiles.length > 0) {
           const existingFiles = Array.isArray(queuedItem.files) ? queuedItem.files : [];
           const preservedFiles = existingFiles.filter((file) => file?.phase !== 'entry' && file?.phase !== 'closing');
-          entryEvidenceFiles = reorderEvidenceByMainIndex(entryEvidenceFiles, mainEntryIndex);
-          closingEvidenceFiles = reorderEvidenceByMainIndex(closingEvidenceFiles, mainClosingIndex);
+          entryEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(entryEvidenceFiles, mainEntryIndex));
+          closingEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(closingEvidenceFiles, mainClosingIndex));
           await updateQueueItem(itemId, {
             files: [...preservedFiles, ...entryEvidenceFiles, ...closingEvidenceFiles],
             updatedAt: new Date().toISOString(),
@@ -4163,17 +4787,41 @@ export default function DashboardPage() {
         }
       }
 
-      const hasLocalPairedEvidence = entryEvidenceFiles.length > 0 && closingEvidenceFiles.length > 0;
+      entryEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(entryEvidenceFiles, mainEntryIndex));
+      closingEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(closingEvidenceFiles, mainClosingIndex));
+      entryUploadableFiles = entryEvidenceFiles.filter((file) => isUploadableBlob(file?.blob || file));
+      closingUploadableFiles = closingEvidenceFiles.filter((file) => isUploadableBlob(file?.blob || file));
+
+      if (entryUploadableFiles.length === 0 || closingUploadableFiles.length === 0) {
+        const recoveredEntryFiles = await recoverUploadableEvidenceFilesFromCameraRaw(cameraRawRecords, 'entry', { trace: syncTrace });
+        const recoveredClosingFiles = await recoverUploadableEvidenceFilesFromCameraRaw(cameraRawRecords, 'closing', { trace: syncTrace });
+
+        if (entryUploadableFiles.length === 0 && recoveredEntryFiles.length > 0) {
+          entryEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(recoveredEntryFiles, mainEntryIndex));
+          entryUploadableFiles = entryEvidenceFiles.filter((file) => isUploadableBlob(file?.blob || file));
+        }
+
+        if (closingUploadableFiles.length === 0 && recoveredClosingFiles.length > 0) {
+          closingEvidenceFiles = dedupeEvidenceFiles(reorderEvidenceByMainIndex(recoveredClosingFiles, mainClosingIndex));
+          closingUploadableFiles = closingEvidenceFiles.filter((file) => isUploadableBlob(file?.blob || file));
+        }
+
+        if (entryUploadableFiles.length > 0 && closingUploadableFiles.length > 0) {
+          const existingFiles = Array.isArray(queuedItem.files) ? queuedItem.files : [];
+          const preservedFiles = existingFiles.filter((file) => file?.phase !== 'entry' && file?.phase !== 'closing');
+          await updateQueueItem(itemId, {
+            files: [...preservedFiles, ...entryEvidenceFiles, ...closingEvidenceFiles],
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      }
+
       const existingPayloadImages = [
         ...(Array.isArray(queuedItem?.payload?.images) ? queuedItem.payload.images : []),
         ...(Array.isArray(queuedItem?.payload?.imageUrls) ? queuedItem.payload.imageUrls : []),
       ]
         .filter((url) => typeof url === 'string' && /^https?:\/\//i.test(url))
         .filter((url, index, all) => all.indexOf(url) === index);
-
-      const cameraRawRecords = Array.isArray(queuedItem?.payload?.cameraRawData)
-        ? queuedItem.payload.cameraRawData
-        : [];
 
       const pickFirstHttpUrl = (...candidates) => {
         for (const value of candidates) {
@@ -4223,27 +4871,82 @@ export default function DashboardPage() {
         payloadClosingImages.push(existingPayloadImages[1]);
       }
 
+      const deepPayloadImages = collectImageUrlsFromValue(queuedItem?.payload || {});
+      if (!payloadEntryImages.length && deepPayloadImages.length > 0) {
+        payloadEntryImages.push(deepPayloadImages[0]);
+      }
+      if (!payloadClosingImages.length && deepPayloadImages.length > 1) {
+        payloadClosingImages.push(deepPayloadImages[deepPayloadImages.length - 1]);
+      }
+
       const payloadEntryImage = payloadEntryImages[0] || '';
       const payloadClosingImage = payloadClosingImages[0] || '';
       const hasPayloadPairedEvidence = payloadEntryImages.length > 0 && payloadClosingImages.length > 0;
+      const itemAgeMs = Date.now() - new Date(queuedItem?.createdAt || queuedItem?.updatedAt || Date.now()).getTime();
+      const legacyItem = Number.isFinite(itemAgeMs) && itemAgeMs > (5 * 60 * 1000);
+      const previouslyFailedItem = String(queuedItem?.status || '').toLowerCase() === 'failed' || Number(queuedItem?.attempts || 0) > 0;
+      const hasDeepPayloadPair = deepPayloadImages.length >= 2;
+      const evidenceDecision = decideEvidenceSource({
+        entryUploadableFiles,
+        closingUploadableFiles,
+        payloadEntryImages,
+        payloadClosingImages,
+        hasDeepPayloadPair,
+        legacyItem,
+        previouslyFailedItem,
+      });
+      const hasRealLocalEvidencePair = evidenceDecision.hasRealLocalEvidencePair;
+      const shouldPreferStoredPayloadEvidence = evidenceDecision.shouldPreferStoredPayloadEvidence;
+      const shouldUploadLocalEvidence = evidenceDecision.shouldUploadLocalEvidence;
 
-      if (!hasLocalPairedEvidence && !hasPayloadPairedEvidence) {
+      syncTrace('evidence_source_decision', {
+        ...evidenceDecision,
+        payloadEntryCount: payloadEntryImages.length,
+        payloadClosingCount: payloadClosingImages.length,
+        deepPayloadCount: deepPayloadImages.length,
+        legacyItem,
+        previouslyFailedItem,
+      });
+
+      if (shouldPreferStoredPayloadEvidence) {
+        console.warn('[warden] using stored payload evidence for sync (legacy or stale local blobs)', {
+          itemId,
+          legacyItem,
+          previouslyFailedItem,
+          payloadEntryCount: payloadEntryImages.length,
+          payloadClosingCount: payloadClosingImages.length,
+          deepPayloadCount: deepPayloadImages.length,
+          entryUploadable: entryUploadableFiles.length,
+          closingUploadable: closingUploadableFiles.length,
+        });
+      }
+
+      if (!shouldUploadLocalEvidence && !hasPayloadPairedEvidence) {
         throw new Error('Paired opening and closing evidence is required before sync');
       }
 
       const queueVrmLabel = normalizeVrm(queuedItem?.payload?.vrm || queuedItem?.vrm || '') || 'session';
 
-      if (hasLocalPairedEvidence) {
-        setMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (0/${entryEvidenceFiles.length})...`);
+      if (shouldUploadLocalEvidence) {
+        syncTrace('stage_update', {
+          step: '1/4',
+          message: `Step 1/4: Uploading opening images (${entryUploadableFiles.length})`,
+        });
+        setMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (0/${entryUploadableFiles.length})...`);
       } else {
+        syncTrace('stage_update', {
+          step: '1/4',
+          message: 'Step 1/4: Using stored opening evidence',
+        });
         setMessage(`Sync ${queueVrmLabel} Step 1/4: Using stored opening evidence...`);
       }
 
       let entryEvidence;
-      if (hasLocalPairedEvidence) {
+      if (shouldUploadLocalEvidence) {
         try {
-          entryEvidence = await uploadEvidenceFiles(entryEvidenceFiles, queuedItem.payload.vrm, queuedSiteId, {
+          entryEvidence = await uploadEvidenceFiles(entryUploadableFiles, queuedItem.payload.vrm, queuedSiteId, {
             phase: 'entry',
+            syncTrace,
             onProgress: ({ status, completed, total }) => {
               if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
               setMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (${Math.min(completed, total)}/${total})...`);
@@ -4255,10 +4958,14 @@ export default function DashboardPage() {
             error: error?.message || String(error),
             storedCount: payloadEntryImages.length,
           });
+          syncTrace('entry_upload_failed_using_payload', {
+            error: error?.message || String(error),
+            payloadEntryCount: payloadEntryImages.length,
+          });
           entryEvidence = {
             vrm: queuedItem.payload.vrm,
             images: payloadEntryImages,
-            failedCount: entryEvidenceFiles.length,
+            failedCount: entryUploadableFiles.length,
             errors: [String(error?.message || 'Opening evidence upload failed')],
             fromStoredPayload: true,
           };
@@ -4289,17 +4996,26 @@ export default function DashboardPage() {
         });
       }
 
-      if (hasLocalPairedEvidence) {
-        setMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (0/${closingEvidenceFiles.length})...`);
+      if (shouldUploadLocalEvidence) {
+        syncTrace('stage_update', {
+          step: '2/4',
+          message: `Step 2/4: Uploading closing images (${closingUploadableFiles.length})`,
+        });
+        setMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (0/${closingUploadableFiles.length})...`);
       } else {
+        syncTrace('stage_update', {
+          step: '2/4',
+          message: 'Step 2/4: Using stored closing evidence',
+        });
         setMessage(`Sync ${queueVrmLabel} Step 2/4: Using stored closing evidence...`);
       }
 
       let closingEvidence;
-      if (hasLocalPairedEvidence) {
+      if (shouldUploadLocalEvidence) {
         try {
-          closingEvidence = await uploadEvidenceFiles(closingEvidenceFiles, queuedItem.payload.vrm, queuedSiteId, {
+          closingEvidence = await uploadEvidenceFiles(closingUploadableFiles, queuedItem.payload.vrm, queuedSiteId, {
             phase: 'closing',
+            syncTrace,
             onProgress: ({ status, completed, total }) => {
               if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
               setMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (${Math.min(completed, total)}/${total})...`);
@@ -4311,10 +5027,14 @@ export default function DashboardPage() {
             error: error?.message || String(error),
             storedCount: payloadClosingImages.length,
           });
+          syncTrace('closing_upload_failed_using_payload', {
+            error: error?.message || String(error),
+            payloadClosingCount: payloadClosingImages.length,
+          });
           closingEvidence = {
             vrm: queuedItem.payload.vrm,
             images: payloadClosingImages,
-            failedCount: closingEvidenceFiles.length,
+            failedCount: closingUploadableFiles.length,
             errors: [String(error?.message || 'Closing evidence upload failed')],
             fromStoredPayload: true,
           };
@@ -4350,6 +5070,10 @@ export default function DashboardPage() {
       }
 
       const vrm = normalizeVrm(closingEvidence.vrm || entryEvidence.vrm || queuedItem.payload.vrm);
+      syncTrace('stage_update', {
+        step: '3/4',
+        message: 'Step 3/4: Validating permit and carcheck',
+      });
       setMessage(`Sync ${queueVrmLabel} Step 3/4: Validating permit and carcheck...`);
       const submissionChecks = await ensurePcnSubmissionChecks({
         vrm,
@@ -4407,12 +5131,17 @@ export default function DashboardPage() {
         entryPlateImageUrl,
         closingPlateImageUrl,
       ]);
-      const allEvidenceImages = uniqueHttpUrls([
-        ...allImages,
-        ...payloadEntryImages,
-        ...payloadClosingImages,
-        ...supplementalEvidenceUrls,
-      ]);
+      const allEvidenceImages = shouldUploadLocalEvidence
+        ? uniqueHttpUrls([
+          ...allImages,
+          ...supplementalEvidenceUrls,
+        ])
+        : uniqueHttpUrls([
+          ...allImages,
+          ...payloadEntryImages,
+          ...payloadClosingImages,
+          ...supplementalEvidenceUrls,
+        ]);
       const entryFrame = buildEvidenceFrame(entryEvidence.images?.[0], entryTime, entryPlateImageUrl);
       const closingFrame = buildEvidenceFrame(closingEvidence.images?.[0], closingTime, closingPlateImageUrl);
       const vehicleDetails = buildVehicleDetailsRecord(
@@ -4513,19 +5242,91 @@ export default function DashboardPage() {
         cameraRawData: cameraRawDataForSubmission,
       };
 
+      const payloadBytes = (() => {
+        try {
+          return JSON.stringify(breachPayload).length;
+        } catch (_) {
+          return -1;
+        }
+      })();
+      console.log('[warden] wardencapture payload summary', {
+        itemId,
+        imageCount: allEvidenceImages.length,
+        cameraRawCount: Array.isArray(cameraRawDataForSubmission) ? cameraRawDataForSubmission.length : 0,
+        payloadBytes,
+      });
+      syncTrace('submission_payload_ready', {
+        imageCount: allEvidenceImages.length,
+        entryUploadedCount: Array.isArray(entryEvidence?.images) ? entryEvidence.images.length : 0,
+        closingUploadedCount: Array.isArray(closingEvidence?.images) ? closingEvidence.images.length : 0,
+        payloadBytes,
+      });
+
+      // Relay entry + closing observations to camera service breach engine (fire-and-forget).
+      // Failures are intentionally swallowed so a camera-service outage never blocks PCN generation.
+      const relayCaptureEvent = (direction, timestamp, vehicleImg, plateImg) => {
+        if (!vrm || !queuedSiteId) return;
+        fetchJson('/api/warden/relay-to-camera-service', {
+          method: 'POST',
+          token,
+          body: {
+            vrm,
+            timestamp,
+            direction,
+            vehicleImage: vehicleImg || null,
+            plateImage: plateImg || null,
+            siteId: queuedSiteId,
+            siteName: queuedSiteName,
+            // wardenEmail/wardenName let the camera service name this warden's camera meaningfully.
+            wardenEmail: profile?.email || '',
+            wardenName: profile?.displayName || profile?.name || (profile?.email || '').split('@')[0] || '',
+          },
+        }).catch((relayErr) => {
+          console.warn(`[warden] Camera service relay (${direction}) skipped:`, relayErr?.message);
+        });
+      };
+      relayCaptureEvent(
+        'entry',
+        entryTime,
+        entryFrame?.imageUrl || breachPayload?.detectedEntryVehicleImage || null,
+        entryPlateImageUrl || null,
+      );
+      relayCaptureEvent(
+        'exit',
+        closingTime,
+        closingFrame?.imageUrl || breachPayload?.detectedClosingVehicleImage || null,
+        closingPlateImageUrl || null,
+      );
+
       setMessage(`Sync ${queueVrmLabel} Step 4/4: Submitting breach to backend...`);
+      syncTrace('stage_update', {
+        step: '4/4',
+        message: 'Step 4/4: Submitting breach to backend',
+      });
 
       const breachResult = await fetchJson('/api/breaches/wardencapture', {
         method: 'POST',
         token,
-        timeoutMs: 90000,
+        timeoutMs: 180000,
         body: breachPayload,
         signal: syncAbortController.signal,
       });
 
       const breachId = breachResult?.id || breachResult?.breachId || queuedItem?.payload?.breachId || '';
+      syncTrace('sync_success', {
+        breachId: breachId || null,
+        vrm,
+        traceId,
+      });
+      setSyncProgressMeta((current) => ({
+        ...current,
+        traceId,
+        itemId,
+        status: 'success',
+      }));
       await updateQueueItem(itemId, {
         status: 'submitted',
+        archived: false,
         lastError: null,
         updatedAt: new Date().toISOString(),
         payload: {
@@ -4534,6 +5335,7 @@ export default function DashboardPage() {
           breachId,
           breachLifecycle: 'SUBMITTED',
           convertedToPcn: false,
+          submittedAt: new Date().toISOString(),
         },
       });
 
@@ -4568,9 +5370,19 @@ export default function DashboardPage() {
     } catch (error) {
       const errorName = String(error?.name || '').toLowerCase();
       const errorMessage = String(error?.message || 'Sync failed');
+      const errorStatus = Number(error?.status || 0) || null;
       const cancelled = errorName === 'aborterror' || isSyncCancelledError(errorMessage);
 
       if (cancelled) {
+        syncTrace('sync_cancelled', {
+          reason: errorMessage,
+        });
+        setSyncProgressMeta((current) => ({
+          ...current,
+          traceId,
+          itemId,
+          status: 'cancelled',
+        }));
         syncAbortControllersRef.current.delete(itemId);
         await updateQueueItem(itemId, {
           status: 'queued',
@@ -4582,13 +5394,23 @@ export default function DashboardPage() {
       }
 
       console.error('[warden] sync failed', error);
+      syncTrace('sync_failed', {
+        errorName,
+        errorMessage,
+      });
+      setSyncProgressMeta((current) => ({
+        ...current,
+        traceId,
+        itemId,
+        status: 'failed',
+      }));
       await updateQueueItem(itemId, {
         status: 'failed',
         lastError: errorMessage,
         updatedAt: new Date().toISOString()
       });
-      setMessage(errorMessage);
-      return { ok: false, error: errorMessage };
+      setMessage(traceEnabled ? `${errorMessage} (trace: ${traceId})` : errorMessage);
+      return { ok: false, error: errorMessage, status: errorStatus };
     } finally {
       syncAbortControllersRef.current.delete(itemId);
       await refreshQueue();
@@ -4599,12 +5421,31 @@ export default function DashboardPage() {
     return enqueueSyncTask(async () => {
       const maxAttempts = 3;
       let lastResult = { ok: false, error: 'Sync failed' };
+      let forceRefreshTokenAtStart = Boolean(options?.forceAuthRefreshAtStart);
+      let authRetryUsed = false;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        const result = await syncQueueItemInternal(itemId, options);
+        const result = await syncQueueItemInternal(itemId, {
+          ...options,
+          forceRefreshTokenAtStart,
+        });
         if (result?.ok) return result;
 
         lastResult = result || lastResult;
+
+        if (!authRetryUsed && isAuthSyncError(lastResult)) {
+          authRetryUsed = true;
+          forceRefreshTokenAtStart = true;
+          await updateQueueItem(itemId, {
+            status: 'queued',
+            lastError: `${lastResult?.error || 'Authentication failed'} (refreshing token and retrying...)`,
+            updatedAt: new Date().toISOString(),
+          });
+          await refreshQueue();
+          setMessage('Session token expired. Refreshing auth and retrying sync...');
+          continue;
+        }
+
         const shouldRetry = attempt < maxAttempts && isRetriableSyncError(lastResult?.error);
         if (!shouldRetry) {
           return lastResult;
@@ -4712,6 +5553,17 @@ export default function DashboardPage() {
           || payloadReason
           || manualReason
           || DEFAULT_PCN_REASON;
+        const finalContraventionCode = String(
+          workingItem?.payload?.selectedContraventionCode
+          || workingItem?.payload?.contraventionCode
+          || selectedContraventionCode
+          || ''
+        ).trim();
+        const finalContraventionReason = String(
+          workingItem?.payload?.contraventionReason
+          || resolvedSelectedContraventionReason
+          || finalReason
+        ).trim();
         const response = await fetchJson('/api/breaches/convert-to-pcn', {
           method: 'POST',
           token,
@@ -4730,6 +5582,9 @@ export default function DashboardPage() {
               workingItem?.createdAt ||
               new Date().toISOString()
             ),
+            selectedContraventionCode: finalContraventionCode,
+            contraventionCode: finalContraventionCode,
+            contraventionReason: finalContraventionReason,
             siteId: workingItem?.payload?.siteId || '',
             siteName: workingItem?.siteName || '',
             evidence: workingItem?.payload?.evidence || {},
@@ -4741,11 +5596,13 @@ export default function DashboardPage() {
         const convertedAt = new Date().toISOString();
         await updateQueueItem(selectedTrackedId || selectedTracked.id, {
           status: 'submitted',
+          archived: false,
           updatedAt: convertedAt,
           payload: {
             ...(workingItem?.payload || selectedTracked.payload),
             breachLifecycle: 'CONVERTED_TO_PCN',
             convertedToPcn: true,
+            submittedAt: (workingItem?.payload || selectedTracked.payload)?.submittedAt || convertedAt,
             convertedAt,
             observationEndTime: resolvedWindow.closingTime || convertedAt,
             closingCapturedAt: resolvedWindow.closingTime || convertedAt,
@@ -4815,6 +5672,141 @@ export default function DashboardPage() {
     });
     if (failedCount > 0) {
       setMessage(`Queue sync completed with ${failedCount} failed item${failedCount === 1 ? '' : 's'}.`);
+    }
+  }
+
+  async function handleArchiveTracked(id) {
+    try {
+      const controller = syncAbortControllersRef.current.get(id);
+      if (controller) {
+        controller.abort(new DOMException('Archive by user', 'AbortError'));
+      }
+      syncAbortControllersRef.current.delete(id);
+      await updateQueueItem(id, {
+        archived: true,
+        status: 'archived',
+        lastError: 'Archived by warden',
+        updatedAt: new Date().toISOString(),
+      });
+      if (selectedTrackedId === id) {
+        setSelectedTrackedId('');
+        setDetailMessage('');
+      }
+      await refreshQueue();
+      setActiveTab('archive');
+      setMessage('Draft PCN archived. You can review it in the archive screen.');
+    } catch (error) {
+      console.error('[warden] archive tracked breach failed', error);
+      setMessage(error?.message || 'Failed to archive tracked breach');
+    }
+  }
+
+  async function handleRestoreArchived(id) {
+    try {
+      const item = queueItems.find((entry) => entry.id === id) || null;
+      const basePayload = item?.payload || {};
+
+      await updateQueueItem(id, {
+        archived: false,
+        status: 'draft',
+        lastError: null,
+        updatedAt: new Date().toISOString(),
+        payload: {
+          ...basePayload,
+          breachLifecycle: 'DRAFT_OPEN',
+          convertedToPcn: false,
+          convertedAt: null,
+          pcnId: '',
+          pcnNumber: '',
+        },
+      });
+      await refreshQueue();
+      setActiveTab('tracked');
+      setMessage('Archived item restored and returned to active sessions.');
+    } catch (error) {
+      console.error('[warden] restore archived item failed', error);
+      setMessage(error?.message || 'Failed to restore archived item');
+    }
+  }
+
+  async function handleDeleteArchived(id) {
+    try {
+      if (!id) {
+        throw new Error('Missing archived item id');
+      }
+
+      const item = queueItems.find((entry) => entry.id === id) || null;
+      const label = item?.vrm || item?.payload?.vrm || 'this archived item';
+      const confirmed = typeof window === 'undefined'
+        ? true
+        : window.confirm(`Permanently delete ${label} from archive? This cannot be undone.`);
+      if (!confirmed) {
+        return;
+      }
+
+      const removed = await deleteQueueItem(id);
+      if (removed === null || removed === undefined) {
+        throw new Error('Archived item could not be deleted');
+      }
+
+      if (selectedTrackedId === id) {
+        setSelectedTrackedId('');
+        setDetailMessage('');
+      }
+
+      await refreshQueue();
+      setActiveTab('archive');
+      setMessage('Archived item deleted permanently.');
+    } catch (error) {
+      console.error('[warden] delete archived item failed', error);
+      setMessage(error?.message || 'Failed to delete archived item');
+    }
+  }
+
+  function toggleArchiveSelection(id) {
+    if (!id) return;
+    setSelectedArchiveIds((current) => (
+      current.includes(id)
+        ? current.filter((entryId) => entryId !== id)
+        : [...current, id]
+    ));
+  }
+
+  function markAllArchivedForDelete() {
+    setSelectedArchiveIds(archivedBreaches.map((item) => item.id));
+  }
+
+  function clearArchivedSelection() {
+    setSelectedArchiveIds([]);
+  }
+
+  async function handleDeleteSelectedArchived() {
+    if (!selectedArchiveIds.length) {
+      setMessage('Select archived items to delete.');
+      return;
+    }
+
+    const selectedItems = archivedBreaches.filter((item) => selectedArchiveIds.includes(item.id));
+    const confirmed = typeof window === 'undefined'
+      ? true
+      : window.confirm(`Permanently delete ${selectedItems.length} archived item${selectedItems.length === 1 ? '' : 's'}? This cannot be undone.`);
+    if (!confirmed) return;
+
+    try {
+      await Promise.all(selectedItems.map((item) => deleteQueueItem(item.id)));
+
+      if (selectedTrackedId && selectedArchiveIds.includes(selectedTrackedId)) {
+        setSelectedTrackedId('');
+        setDetailMessage('');
+      }
+
+      setSelectedArchiveIds([]);
+      await refreshQueue();
+      setActiveTab('archive');
+      setMessage(`Deleted ${selectedItems.length} archived item${selectedItems.length === 1 ? '' : 's'} permanently.`);
+    } catch (error) {
+      console.error('[warden] bulk delete archived items failed', error);
+      setMessage(error?.message || 'Failed to delete selected archived items');
     }
   }
 
@@ -5200,6 +6192,8 @@ export default function DashboardPage() {
             <span className="app-header-vrm">{selectedTracked.vrm}</span>
           ) : currentScreen === 'queue' ? (
             <span>Sync Queue</span>
+          ) : currentScreen === 'archive' ? (
+            <span>Archive</span>
           ) : currentScreen === 'mobile' ? (
             <span>Mobile Cameras</span>
           ) : currentScreen === 'camera' ? (
@@ -5388,8 +6382,8 @@ export default function DashboardPage() {
             <div className="detail-plate-hero">{selectedTracked.vrm}</div>
             <div className="detail-hero-meta">
               <span className="detail-site">{selectedTracked.siteName}</span>
-              <span className={`lc-badge lc-${selectedTracked.lifecycle.code.toLowerCase().replace(/_/g, '-')}`}>
-                {selectedTracked.lifecycle.label}
+              <span className={`lc-badge lc-${String(selectedTrackedLifecycle?.code || 'unknown').toLowerCase().replace(/_/g, '-')}`}>
+                {selectedTrackedLifecycle?.label || 'Unknown'}
               </span>
             </div>
             <div className="detail-contravention">{selectedTracked.reason}</div>
@@ -5820,13 +6814,33 @@ export default function DashboardPage() {
 
           {/* Danger zone */}
           <div className="detail-danger">
-            <button
-              type="button"
-              className="action-btn action-btn--danger"
-              onClick={() => handleCancelTracked(selectedTracked.id)}
-            >
-              🗑 Delete session
-            </button>
+            {Boolean(selectedTracked?.archived || String(selectedTracked?.status || '').toLowerCase() === 'archived') ? (
+              <>
+                <button
+                  type="button"
+                  className="action-btn action-btn--secondary"
+                  onClick={() => handleRestoreArchived(selectedTracked.id)}
+                >
+                  ↩ Restore from archive
+                </button>
+                <button
+                  type="button"
+                  className="action-btn action-btn--danger"
+                  style={{ marginTop: 8 }}
+                  onClick={() => handleDeleteArchived(selectedTracked.id)}
+                >
+                  🗑 Delete from archive
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="action-btn action-btn--danger"
+                onClick={() => handleArchiveTracked(selectedTracked.id)}
+              >
+                🗄 Archive session
+              </button>
+            )}
           </div>
 
         </main>
@@ -5839,17 +6853,27 @@ export default function DashboardPage() {
           <div className="detail-section">
             <div className="detail-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span>Pending sync</span>
-              {syncCandidates.length > 0 ? (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
                   type="button"
                   className="action-btn action-btn--secondary"
                   style={{ fontSize: 12, padding: '5px 12px' }}
-                  onClick={syncQueue}
-                  disabled={syncing}
+                  onClick={() => setSyncProgressDialogOpen(true)}
                 >
-                  {syncing ? 'Syncing…' : `Sync all (${syncCandidates.length})`}
+                  Sync logs
                 </button>
-              ) : null}
+                {syncCandidates.length > 0 ? (
+                  <button
+                    type="button"
+                    className="action-btn action-btn--secondary"
+                    style={{ fontSize: 12, padding: '5px 12px' }}
+                    onClick={syncQueue}
+                    disabled={syncing}
+                  >
+                    {syncing ? 'Syncing…' : `Sync all (${syncCandidates.length})`}
+                  </button>
+                ) : null}
+              </div>
             </div>
 
             {syncCandidates.length === 0 ? (
@@ -5891,6 +6915,14 @@ export default function DashboardPage() {
                         >
                           Cancel sync
                         </button>
+                        <button
+                          type="button"
+                          className="action-btn action-btn--secondary"
+                          style={{ fontSize: 12, padding: '4px 10px', marginTop: 4 }}
+                          onClick={() => handleArchiveTracked(item.id)}
+                        >
+                          Archive
+                        </button>
                       </div>
                     </article>
                   );
@@ -5922,6 +6954,103 @@ export default function DashboardPage() {
             </div>
           ) : null}
 
+        </main>
+      ) : null}
+
+      {/* ─── ARCHIVE SCREEN ────────────────────────────────────────── */}
+      {currentScreen === 'archive' ? (
+        <main className="screen-body">
+          <div className="detail-section">
+            <div className="detail-section-label archive-toolbar">
+              <span>Archived PCNs</span>
+              {archivedBreaches.length > 0 ? (
+                <div className="archive-toolbar-actions">
+                  <button
+                    type="button"
+                    className="action-btn action-btn--secondary"
+                    style={{ fontSize: 12, padding: '5px 10px' }}
+                    onClick={markAllArchivedForDelete}
+                  >
+                    Mark all to delete
+                  </button>
+                  <button
+                    type="button"
+                    className="action-btn action-btn--secondary"
+                    style={{ fontSize: 12, padding: '5px 10px' }}
+                    onClick={clearArchivedSelection}
+                    disabled={selectedArchiveIds.length === 0}
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    className="action-btn action-btn--danger"
+                    style={{ fontSize: 12, padding: '5px 10px' }}
+                    onClick={handleDeleteSelectedArchived}
+                    disabled={selectedArchiveIds.length === 0}
+                  >
+                    Delete selected <span className="archive-toolbar-count">({selectedArchiveIds.length})</span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            {archivedBreaches.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">🗄</div>
+                <p className="empty-title">No archived PCNs</p>
+                <p className="empty-hint">Submitted and archived charges will appear here.</p>
+              </div>
+            ) : (
+              <div className="sessions-list">
+                {archivedBreaches.map((item) => (
+                  <article key={item.id} className="session-card" onClick={() => handleReviewTracked(item)} role="button" tabIndex={0} onKeyDown={(event) => event.key === 'Enter' && handleReviewTracked(item)}>
+                    <div className="sc-left">
+                      <label style={{ display: 'inline-flex', gap: 8, alignItems: 'center', marginBottom: 6 }} onClick={(event) => event.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={selectedArchiveIds.includes(item.id)}
+                          onChange={() => toggleArchiveSelection(item.id)}
+                          aria-label={`Select ${item.vrm} for deletion`}
+                        />
+                        <span style={{ fontSize: 12, opacity: 0.85 }}>Select for delete</span>
+                      </label>
+                      <div className="sc-plate">{item.vrm}</div>
+                      <div className="sc-site">{item.siteName}</div>
+                      <div className="sc-reason">{item.reason}</div>
+                      <div className="sc-meta">
+                        <span className="lc-badge lc-archived">Archived</span>
+                      </div>
+                    </div>
+                    <div className="sc-right">
+                      <button
+                        type="button"
+                        className="action-btn action-btn--secondary"
+                        style={{ fontSize: 12, padding: '6px 10px' }}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleRestoreArchived(item.id);
+                        }}
+                      >
+                        Restore
+                      </button>
+                      <button
+                        type="button"
+                        className="action-btn action-btn--danger"
+                        style={{ fontSize: 12, padding: '6px 10px', marginTop: 6 }}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleDeleteArchived(item.id);
+                        }}
+                      >
+                        Delete
+                      </button>
+                      <span className="sc-chevron" aria-hidden>›</span>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
         </main>
       ) : null}
 
@@ -6051,9 +7180,56 @@ export default function DashboardPage() {
       {/* ─── CAMERA RAW SCREEN ─────────────────────────────────────── */}
       {currentScreen === 'camera' ? (
         <main className="screen-body">
-          <div className="detail-section">
+          {/* Camera service feed — captures already relayed to breach engine */}
+          <WardenCaptureFeed
+            getToken={resolveAuthToken}
+            selectedSiteId={selectedSiteId}
+            sites={sites}
+            queueItems={queueItems}
+            contraventions={contraventions}
+            onStartDraft={async ({ vrm, vehicleImage, plateImage, timestamp, siteId, carcheckDetails, permitData }) => {
+              const entryTime = timestamp || new Date().toISOString();
+              const effectiveSiteId = siteId || selectedSiteId || '';
+              const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
+              const vehicleDetails = carcheckDetails
+                ? { make: carcheckDetails.make, model: carcheckDetails.model, color: carcheckDetails.color, yearOfManufacture: carcheckDetails.yearOfManufacture }
+                : null;
+              const item = createQueueItem({
+                payload: {
+                  vrm,
+                  siteId: effectiveSiteId,
+                  siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId,
+                  source: 'WARDEN',
+                  breachLifecycle: 'DRAFT_OPEN',
+                  status: 'DRAFT_OPEN',
+                  entryCaptureMode: 'manual',
+                  observationStartTime: entryTime,
+                  entryCapturedAt: entryTime,
+                  detectedEntryVehicleImage: vehicleImage || '',
+                  startVehicleImage: vehicleImage || '',
+                  detectedEntryPlateCutoffImage: plateImage || '',
+                  authorization: permitData || null,
+                  savedVehicleLookup: vehicleDetails || null,
+                  vehicleDetails: vehicleDetails || null,
+                  contraventionReason: contraventions[0]?.label || '',
+                  selectedContraventionCode: contraventions[0]?.code || '',
+                  cameraRawData: [],
+                },
+                files: [],
+              });
+              item.status = 'draft';
+              await saveQueueItem(item);
+              await refreshQueue();
+              setSelectedTrackedId(item.id);
+              setActiveTab('tracked');
+              handleReviewTracked(item);
+              setMessage(`Draft PCN started for ${vrm} from camera feed.`);
+            }}
+          />
+          {/* Local capture log — in-progress PCN images not yet relayed to camera service */}
+          <div className="detail-section" style={{ marginTop: 16 }}>
             <div className="camera-raw-toolbar">
-              <div className="detail-section-label">Camera raw data feed</div>
+              <div className="detail-section-label">In-progress captures (not yet synced to camera service)</div>
               {cameraRawFeed.length > 0 ? (
                 <div className="camera-raw-view-toggle" role="group" aria-label="Camera raw view mode">
                   <button
@@ -6244,6 +7420,17 @@ export default function DashboardPage() {
         </button>
         <button
           type="button"
+          className={`bottom-nav-btn ${activeTab === 'archive' ? 'bottom-nav-btn--active' : ''}`}
+          onClick={() => setActiveTab('archive')}
+        >
+          <span className="bottom-nav-icon" aria-hidden="true">🗄</span>
+          <span className="bottom-nav-label">Archive</span>
+          {archivedBreaches.length > 0 ? (
+            <span className="bottom-nav-badge">{archivedBreaches.length}</span>
+          ) : null}
+        </button>
+        <button
+          type="button"
           className={`bottom-nav-btn ${activeTab === 'camera' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('camera')}
         >
@@ -6259,6 +7446,104 @@ export default function DashboardPage() {
           <span className="bottom-nav-label">Mobile</span>
         </button>
       </nav>
+
+      {syncProgressDialogOpen ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Sync progress log"
+          onClick={() => setSyncProgressDialogOpen(false)}
+        >
+          <div
+            className="carcheck-sheet"
+            style={{ width: 'min(680px, 96vw)' }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-kicker">Live sync progress</div>
+                <div className="carcheck-sheet-title">Upload and submit trace</div>
+                <div className="pcn-sheet-subtitle">
+                  Status: {syncProgressMeta.status || 'idle'}
+                  {syncProgressMeta.traceId ? ` · Trace ${syncProgressMeta.traceId}` : ''}
+                </div>
+              </div>
+              <button type="button" className="ghost-button stepper-close" onClick={() => setSyncProgressDialogOpen(false)}>
+                ✕
+              </button>
+            </div>
+
+            <div className="carcheck-sheet-body" style={{ display: 'grid', gap: 10 }}>
+              <div className="notice notice-info" style={{ margin: 0 }}>
+                This stream shows each sync stage, upload activity, fallback decisions, and the final blocker/error.
+              </div>
+              {syncProgressCopyNotice ? (
+                <div className="notice notice-info" style={{ margin: 0 }}>
+                  {syncProgressCopyNotice}
+                </div>
+              ) : null}
+
+              <div
+                style={{
+                  maxHeight: '48vh',
+                  overflowY: 'auto',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 10,
+                  padding: 10,
+                  background: 'rgba(0,0,0,0.28)',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: 12,
+                  lineHeight: 1.45,
+                }}
+              >
+                {syncProgressLogs.length === 0 ? (
+                  <div style={{ opacity: 0.75 }}>No sync logs yet. Start or retry a submission to stream logs here.</div>
+                ) : syncProgressLogs.map((entry) => {
+                  const level = String(entry?.level || 'info');
+                  const tone = level === 'error'
+                    ? '#ff8f8f'
+                    : level === 'success'
+                      ? '#8df0b8'
+                      : '#d7e4ff';
+                  const at = entry?.at ? new Date(entry.at).toLocaleTimeString() : '--:--:--';
+
+                  return (
+                    <div key={entry.id} style={{ display: 'grid', gridTemplateColumns: '78px 1fr', gap: 8, marginBottom: 6 }}>
+                      <span style={{ opacity: 0.75 }}>[{at}]</span>
+                      <span style={{ color: tone }}>{entry.message}</span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="action-btn action-btn--secondary"
+                  onClick={copySyncProgressLogsToClipboard}
+                >
+                  Copy logs
+                </button>
+                <button
+                  type="button"
+                  className="action-btn action-btn--secondary"
+                  onClick={resetSyncProgressLogs}
+                >
+                  Clear logs
+                </button>
+                <button
+                  type="button"
+                  className="action-btn action-btn--primary"
+                  onClick={() => setSyncProgressDialogOpen(false)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {imageDetailDialog.open ? (
         <div
@@ -6760,7 +8045,7 @@ export default function DashboardPage() {
         data={{
           vrm: selectedVrm || selectedTracked?.vrm || selectedTracked?.payload?.vrm || '',
           siteName: selectedSite?.name || selectedSite?.displayName || selectedTracked?.siteName || selectedSiteId,
-          contraventionReason: selectedReason || selectedTracked?.reason || selectedTracked?.payload?.contraventionReason || '',
+          contraventionReason: resolvedSelectedContraventionReason || selectedTracked?.payload?.contraventionReason || '',
           observationStartTime: pcnPreview.entryTime || '',
           observationEndTime: pcnPreview.closingTime || '',
           observationStartLabel: pcnPreview.observationCapture?.capturedAtUk || '',

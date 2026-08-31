@@ -46,6 +46,9 @@ const mockRequest = (overrides = {}) => {
       timestamp: '2026-07-08T10:12:00.000Z',
       siteId: 'site-1',
       siteName: 'Main Site',
+      selectedContraventionCode: '01',
+      contraventionCode: '01',
+      contraventionReason: 'Parked in restricted bay',
       images: ['https://example.com/a.jpg', 'https://example.com/b.jpg'],
       evidence: {
         entry: { imageUrl: 'https://example.com/a.jpg' },
@@ -86,6 +89,9 @@ describe('POST /api/breaches/convert-to-pcn', () => {
         vrm: 'AB12CDE',
         siteId: 'site-1',
         siteName: 'Main Site',
+        selectedContraventionCode: '01',
+        contraventionCode: '01',
+        contraventionReason: 'Parked in restricted bay',
         observationStartTime: '2026-07-08T10:00:00.000Z',
         observationEndTime: '2026-07-08T10:12:00.000Z',
       }),
@@ -190,6 +196,9 @@ describe('POST /api/breaches/convert-to-pcn', () => {
     expect(pcnWritePayload.contraventionTime).toBe('11:12');
     expect(pcnWritePayload.entryTime).toBe('2026-07-08T10:00:00.000Z');
     expect(pcnWritePayload.closedAt).toBe('2026-07-08T10:12:00.000Z');
+    expect(pcnWritePayload.selectedContraventionCode).toBe('01');
+    expect(pcnWritePayload.contraventionCode).toBe('01');
+    expect(pcnWritePayload.contraventionReason).toBe('Parked in restricted bay');
   });
 
   it('uses conversion timestamp as fallback when breach has no explicit timing', async () => {
