@@ -1,0 +1,14 @@
+[
+	{
+		"pkg": "@capacitor-community/camera-preview",
+		"classpath": "com.ahm.capacitor.camera.preview.CameraPreview"
+	},
+	{
+		"pkg": "@capacitor/filesystem",
+		"classpath": "com.capacitorjs.plugins.filesystem.FilesystemPlugin"
+	},
+	{
+		"pkg": "@capacitor/status-bar",
+		"classpath": "com.capacitorjs.plugins.statusbar.StatusBarPlugin"
+	}
+]

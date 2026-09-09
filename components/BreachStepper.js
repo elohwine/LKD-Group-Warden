@@ -187,6 +187,9 @@ async function resolveCameraCaptureTimestamp(file, fallbackIso) {
 async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
     if (!file || !(file.type || '').startsWith('image/')) return file;
 
+    // Keep plate cutouts unmodified so timestamp overlays never obstruct VRM pixels.
+    if (String(phase || '').toLowerCase() === 'plate') return file;
+
     try {
         const image = await loadImageElement(file);
         const canvas = document.createElement('canvas');
@@ -197,11 +200,8 @@ async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
 
         ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
 
-        const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
         const stampText = formatEvidenceLocalTimestamp(capturedAt);
-        let baseFont = 3 * (isPlateCutout
-            ? Math.max(10, Math.min(14, Math.floor(canvas.width / 90)))
-            : Math.max(11, Math.min(16, Math.floor(canvas.width / 88))));
+        let baseFont = 3 * Math.max(11, Math.min(16, Math.floor(canvas.width / 88)));
         const marginX = Math.max(6, Math.floor(canvas.width * 0.012));
         const marginY = Math.max(6, Math.floor(canvas.height * 0.014));
         const maxBoxWidth = Math.max(40, canvas.width - (marginX * 2));
@@ -409,19 +409,23 @@ export default function BreachStepper({
     onClose,
     onComplete,
     onCaptureComplete,
+    onPermitCheck,
     sites = [],
     contraventions = [],
     selectedSiteId: defaultSiteId = '',
     onPlateScan,
     mode = 'full',
     capturePhase = 'entry',
+    allowManualCaptureMode = true,
+    autoStartScan = false,
+    requireOcrArtifacts = true,
 }) {
     const captureOnly = mode === 'capture-only';
     const evidencePhase = capturePhase === 'closing' ? 'closing' : 'entry';
     const evidenceLabel = evidencePhase === 'closing' ? 'Closing' : 'Entry';
-    const supportsManualCaptureMode = true;
+    const supportsManualCaptureMode = allowManualCaptureMode !== false;
     const [step, setStep] = useState(0);
-    const [captureMode, setCaptureMode] = useState(supportsManualCaptureMode ? 'scan' : 'manual');
+    const [captureMode, setCaptureMode] = useState('scan');
     const [skipCapture, setSkipCapture] = useState(false);
     const [vrm, setVrm] = useState('');
     const [capturedVrm, setCapturedVrm] = useState('');
@@ -438,6 +442,7 @@ export default function BreachStepper({
     const [torchEnabled, setTorchEnabled] = useState(false);
     const [autoNightTorchEnabled, setAutoNightTorchEnabled] = useState(true);
     const [note, setNote] = useState('');
+    const [permitCheck, setPermitCheck] = useState({ status: 'idle', hasPermit: false, message: '', matchConfidence: null });
     const cameraInputRef = useRef(null);
     const galleryInputRef = useRef(null);
     const liveVideoRef = useRef(null);
@@ -451,12 +456,15 @@ export default function BreachStepper({
     const liveNoPlateFramesRef = useRef(0);
     const liveScanStartedAtRef = useRef(0);
     const liveLastFrameRef = useRef(null);
+    const autoStartArmedRef = useRef(false);
     const nativePreviewActiveRef = useRef(false);
     const mlkitReadyRef = useRef(false);
+    const permitCheckRequestRef = useRef(0);
+    const permitCheckKeyRef = useRef('');
 
     const normalizeVrm = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     const stableCapturedVrm = normalizeVrm(vrm || capturedVrm || scanState.text);
-    const requiresOcrArtifacts = supportsManualCaptureMode && captureMode !== 'manual';
+    const requiresOcrArtifacts = captureOnly ? requireOcrArtifacts : (supportsManualCaptureMode && captureMode !== 'manual');
 
     const selectedContravention = useMemo(
         () => contraventions.find((c) => c.code === contraventionCode) || contraventions[0] || {},
@@ -508,7 +516,7 @@ export default function BreachStepper({
 
     function reset() {
         setStep(0);
-        setCaptureMode(supportsManualCaptureMode ? 'scan' : 'manual');
+        setCaptureMode('scan');
         setSkipCapture(false);
         setVrm('');
         setCapturedVrm('');
@@ -524,6 +532,8 @@ export default function BreachStepper({
         setTorchEnabled(false);
         setAutoNightTorchEnabled(true);
         setNote('');
+        setPermitCheck({ status: 'idle', hasPermit: false, message: '', matchConfidence: null });
+        permitCheckKeyRef.current = '';
     }
 
     async function applyLiveTorchState(enabled) {
@@ -622,8 +632,83 @@ export default function BreachStepper({
 
     useEffect(() => {
         if (!open) return;
-        setCaptureMode(supportsManualCaptureMode ? 'scan' : 'manual');
+        setCaptureMode('scan');
     }, [open, supportsManualCaptureMode]);
+
+    useEffect(() => {
+        if (!open) {
+            autoStartArmedRef.current = true;
+            return;
+        }
+        if (!captureOnly || !autoStartScan) return;
+        if (!autoStartArmedRef.current) return;
+        autoStartArmedRef.current = false;
+
+        const timer = window.setTimeout(() => {
+            startLiveCamera();
+        }, 40);
+
+        return () => window.clearTimeout(timer);
+    }, [open, captureOnly, autoStartScan]);
+
+    useEffect(() => {
+        if (!open || captureOnly || (step !== 1 && step !== 2)) return;
+
+        const targetVrm = normalizeVrm(vrm);
+        const targetSiteId = String(defaultSiteId || '').trim();
+
+        if (!targetVrm || !targetSiteId) {
+            setPermitCheck({ status: 'missing', hasPermit: false, message: 'Set VRM and patrol site to run e-permit check.', matchConfidence: null });
+            return;
+        }
+
+        const lookupKey = `${targetVrm}|${targetSiteId}`;
+        if (permitCheckKeyRef.current === lookupKey) return;
+        permitCheckKeyRef.current = lookupKey;
+
+        const requestId = permitCheckRequestRef.current + 1;
+        permitCheckRequestRef.current = requestId;
+        setPermitCheck({ status: 'checking', hasPermit: false, message: 'Checking e-permit status...', matchConfidence: null });
+
+        Promise.resolve(onPermitCheck?.(targetVrm, targetSiteId))
+            .then((result) => {
+                if (permitCheckRequestRef.current !== requestId) return;
+                const hasPermit = Boolean(result?.hasAuthorization || result?.hasPermit || result?.permit || result?.validPermit);
+                if (hasPermit) {
+                    setPermitCheck({
+                        status: 'matched',
+                        hasPermit: true,
+                        message: 'Permit/payment matched. Do not create a parking charge unless another rule is breached.',
+                        matchConfidence: {
+                            bestVrm: String(result?.matchConfidence?.bestVrm || '').trim(),
+                            scorePercent: Number(result?.matchConfidence?.scorePercent || 0),
+                            comparedCount: Number(result?.matchConfidence?.comparedCount || 0),
+                        },
+                    });
+                    return;
+                }
+
+                setPermitCheck({
+                    status: 'not_matched',
+                    hasPermit: false,
+                    message: 'No valid permit/payment found for this VRM at this site.',
+                    matchConfidence: {
+                        bestVrm: String(result?.matchConfidence?.bestVrm || '').trim(),
+                        scorePercent: Number(result?.matchConfidence?.scorePercent || 0),
+                        comparedCount: Number(result?.matchConfidence?.comparedCount || 0),
+                    },
+                });
+            })
+            .catch(() => {
+                if (permitCheckRequestRef.current !== requestId) return;
+                setPermitCheck({
+                    status: 'error',
+                    hasPermit: false,
+                    message: 'E-permit check failed. Edit VRM or go back and continue again to retry.',
+                    matchConfidence: null,
+                });
+            });
+    }, [open, captureOnly, step, vrm, defaultSiteId]);
 
     useEffect(() => {
         if (!liveCameraActive || liveEngine !== 'native-preview' || typeof document === 'undefined') return undefined;
@@ -797,6 +882,8 @@ export default function BreachStepper({
             }
         }
 
+        const mergedFiles = [...files, ...nextFiles];
+        const mergedPreviews = [...previews, ...nextPreviews];
         setFiles((prev) => [...prev, ...nextFiles]);
         setPreviews((prev) => [...prev, ...nextPreviews]);
         if (nextFiles.length > 0) {
@@ -819,6 +906,26 @@ export default function BreachStepper({
                 confidence: 0,
             });
             return false;
+        }
+
+        // Camera-tab quick OCR flow should jump directly to the parent VRM/permit
+        // confirmation dialog without the extra "Use entry evidence" action screen.
+        if (captureOnly && autoStartScan) {
+            onCaptureComplete?.({
+                phase: evidencePhase,
+                files: mergedFiles,
+                previews: mergedPreviews,
+                captureMode,
+                scan: {
+                    plateText: normalizeVrm(result?.plateText || stableCapturedVrm),
+                    confidence: Number(result?.confidence || scanState.confidence || 0),
+                    cutoffImage: String(result?.cutoffImage || mergedFiles?.[0]?.detectedPlateCutoffImage || ''),
+                    bbox: result?.bbox || mergedFiles?.[0]?.detectedPlateBbox || null,
+                },
+            });
+            onClose?.();
+            reset();
+            return true;
         }
 
         if (step === 0 && !captureOnly) {
@@ -853,8 +960,8 @@ export default function BreachStepper({
                 const fallbackFrame = frameFile || liveLastFrameRef.current;
                 if (!fallbackFrame) {
                     stopLiveCamera();
-                    setScanState({ loading: false, text: 'No plate detected. Enter VRM manually.', confidence: 0 });
-                    setStep(1);
+                    if (!captureOnly) setStep(1);
+                    setScanState({ loading: false, text: captureOnly ? '' : 'No plate detected. Enter VRM manually.', confidence: 0 });
                     return;
                 }
                 stopLiveCamera();
@@ -863,7 +970,7 @@ export default function BreachStepper({
                     skipOcr: false,
                 });
                 if (!appendedWithPair) {
-                    setScanState({ loading: false, text: 'No plate detected. Enter VRM manually.', confidence: 0 });
+                    setScanState({ loading: false, text: captureOnly ? '' : 'No plate detected. Enter VRM manually.', confidence: 0 });
                 }
             };
 
@@ -1094,7 +1201,7 @@ export default function BreachStepper({
                 return;
             } catch (_) {
                 nativePreviewActiveRef.current = false;
-                setScanState({ loading: false, text: 'Native camera preview failed. Enter VRM manually.', confidence: 0 });
+                setScanState({ loading: false, text: captureOnly ? '' : (supportsManualCaptureMode ? 'Native camera preview failed. Enter VRM manually.' : 'Native camera preview failed. Try scan again.'), confidence: 0 });
                 return;
             }
         }
@@ -1165,6 +1272,17 @@ export default function BreachStepper({
     }
 
     function handleConfirm() {
+        if (!permitChecked) {
+            setScanState({
+                loading: false,
+                text: permitChecking
+                    ? 'E-permit check in progress. Please wait before creating a draft.'
+                    : 'Complete e-permit check first before creating a draft.',
+                confidence: 0,
+            });
+            return;
+        }
+
         if (!vrm || (!skipCapture && (files.length === 0 || !hasRequiredCaptureArtifacts(files)))) {
             setScanState({
                 loading: false,
@@ -1197,18 +1315,14 @@ export default function BreachStepper({
     }
 
     function handleCaptureOnlyComplete() {
-        const hasCaptureArtifacts = hasRequiredCaptureArtifacts(files);
-
-        if (!files.length || !hasCaptureArtifacts) {
+        if (!files.length) {
+            setScanState({ loading: false, text: 'Capture at least 1 image to continue.', confidence: 0 });
+            return;
+        }
+        if (requiresOcrArtifacts && !hasRequiredCaptureArtifacts(files)) {
             setScanState({
                 loading: false,
-                text: evidencePhase === 'closing'
-                    ? (requiresOcrArtifacts
-                        ? 'Capture needs full vehicle, plate cutout, and VRM text.'
-                        : 'Capture at least 1 closing evidence image.')
-                    : (requiresOcrArtifacts
-                        ? 'Capture needs full vehicle, plate cutout, and VRM text.'
-                        : 'Capture at least 1 entry evidence image.'),
+                text: evidencePhase === 'closing' ? 'Capture needs full vehicle, plate cutout, and VRM text.' : 'Capture needs full vehicle, plate cutout, and VRM text.',
                 confidence: 0,
             });
             return;
@@ -1273,6 +1387,33 @@ export default function BreachStepper({
     const canAdvanceFromCapture = Boolean(files.length > 0);
     const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && hasContraventionChoice && (skipCapture || (files.length > 0 && hasCapturePair)));
     const canConfirm = Boolean(normalizeVrm(vrm) && hasContraventionChoice && (skipCapture || (files.length > 0 && hasCapturePair)));
+    const permitBlocksCreation = permitCheck.status === 'matched' && permitCheck.hasPermit;
+    const permitChecked = permitCheck.status === 'matched' || permitCheck.status === 'not_matched';
+    const permitChecking = permitCheck.status === 'checking';
+    const canProceedToConfirm = canAdvanceFromVrm && permitChecked;
+    const canCreatePcn = canConfirm && permitChecked && !permitChecking;
+    const permitIndicatorClass = [
+        'stepper-permit-indicator',
+        permitCheck.status === 'matched'
+            ? 'stepper-permit-indicator--ok'
+            : (permitCheck.status === 'not_matched'
+                ? 'stepper-permit-indicator--none'
+                : (permitCheck.status === 'checking'
+                    ? 'stepper-permit-indicator--checking'
+                    : ((permitCheck.status === 'error' || permitCheck.status === 'missing')
+                        ? 'stepper-permit-indicator--error'
+                        : ''))),
+    ].filter(Boolean).join(' ');
+    const permitIndicatorTitle = permitCheck.status === 'matched'
+        ? 'Permit matched: review contravention'
+        : (permitCheck.status === 'not_matched'
+            ? 'No permit matched'
+            : (permitCheck.status === 'checking' ? 'Checking permit' : 'Permit check status'));
+    const permitIndicatorMessage = permitCheck.message || 'Permit check runs automatically once VRM and site are available.';
+    const permitMatchScore = Number(permitCheck?.matchConfidence?.scorePercent || 0);
+    const permitMatchVrm = String(permitCheck?.matchConfidence?.bestVrm || '').trim();
+    const normalizedVrmValue = normalizeVrm(vrm);
+    const canUseDetectedVrm = Boolean(stableCapturedVrm && stableCapturedVrm !== normalizedVrmValue);
 
     if (!open) return null;
 
@@ -1482,7 +1623,8 @@ export default function BreachStepper({
                             </strong>
                         </div>
 
-                        {previews.length > 0 ? (
+                        {/* Hide image preview grid in quick-capture mode — VRM confirmation shows preview instead */}
+                        {!captureOnly && previews.length > 0 ? (
                             <div className="stepper-preview-grid">
                                 {previews.map((p, i) => (
                                     <div key={i} className="stepper-preview-tile">
@@ -1523,7 +1665,7 @@ export default function BreachStepper({
                             </div>
                         )}
 
-                        {scanState.loading ? <div className="text-muted">Scanning image for VRM...</div> : null}
+                        {scanState.loading && !(captureOnly && autoStartScan) ? <div className="text-muted">Scanning image for VRM...</div> : null}
                         {!scanState.loading && files.length > 0 && !hasCapturePair && evidencePhase !== 'closing' && requiresOcrArtifacts ? (
                             <div className="text-muted" style={{ color: '#ffbf47' }}>
                                 Full vehicle captured. Plate cutout missing - recapture plate to continue.
@@ -1560,18 +1702,18 @@ export default function BreachStepper({
                                         Skip image capture
                                     </button>
                                 ) : null}
-                                {canAdvanceFromCapture ? (
+                                {canAdvanceFromCapture && (!captureOnly || !autoStartScan) ? (
                                     <button
                                         type="button"
                                         className="primary-button"
-                                        disabled={!hasCapturePair}
+                                        disabled={requiresOcrArtifacts ? !hasCapturePair : files.length === 0}
                                         onClick={captureOnly ? handleCaptureOnlyComplete : () => setStep(1)}
                                     >
-                                        {hasCapturePair
+                                        {(requiresOcrArtifacts ? hasCapturePair : files.length > 0)
                                             ? (captureOnly ? `Use ${evidenceLabel.toLowerCase()} evidence` : 'Next — Vehicle details →')
                                             : (evidencePhase === 'closing'
-                                                ? (requiresOcrArtifacts ? 'Need plate cutout to continue' : 'Need closing evidence image')
-                                                : (requiresOcrArtifacts ? 'Need plate cutout to continue' : 'Need entry evidence image'))}
+                                                ? (requiresOcrArtifacts ? 'Need plate cutout to continue' : 'Capture at least 1 image')
+                                                : (requiresOcrArtifacts ? 'Need plate cutout to continue' : 'Capture at least 1 image'))}
                                     </button>
                                 ) : null}
                             </div>
@@ -1590,9 +1732,43 @@ export default function BreachStepper({
                                 value={vrm}
                                 onChange={(e) => setVrm(normalizeVrm(e.target.value))}
                                 placeholder="AB12CDE"
+                                inputMode="text"
+                                autoCapitalize="characters"
+                                spellCheck={false}
+                                maxLength={8}
                                 autoFocus
                             />
+                            <div className="stepper-vrm-actions">
+                                <button
+                                    type="button"
+                                    className="ghost-button stepper-vrm-action"
+                                    onClick={() => setVrm('')}
+                                    disabled={!normalizedVrmValue}
+                                >
+                                    Clear
+                                </button>
+                                <button
+                                    type="button"
+                                    className="ghost-button stepper-vrm-action"
+                                    onClick={() => setVrm(stableCapturedVrm)}
+                                    disabled={!canUseDetectedVrm}
+                                >
+                                    Use OCR: {stableCapturedVrm || 'N/A'}
+                                </button>
+                            </div>
                         </label>
+
+                        <div className={permitIndicatorClass}>
+                            <div className="stepper-permit-indicator-title">{permitIndicatorTitle}</div>
+                            <div className="stepper-permit-indicator-message">{permitIndicatorMessage}</div>
+                            {permitMatchScore > 0 && permitMatchVrm ? (
+                                <div className="auth-match-pill" role="status" aria-label="Closest exemption match confidence">
+                                    <span className="auth-match-pill-label">Closest exemption match</span>
+                                    <span className="auth-match-pill-vrm">{permitMatchVrm}</span>
+                                    <span className="auth-match-pill-score">{permitMatchScore}%</span>
+                                </div>
+                            ) : null}
+                        </div>
 
                         <label className="stepper-field">
                             <span className="stepper-field-label">Contravention</span>
@@ -1624,11 +1800,19 @@ export default function BreachStepper({
                                     type="button"
                                     className="primary-button"
                                     onClick={() => setStep(2)}
-                                    disabled={!canAdvanceFromVrm}
+                                    disabled={!canProceedToConfirm}
                                 >
-                                    {canAdvanceFromVrm
-                                        ? 'Next — Confirm →'
-                                        : (hasContraventionChoice ? 'Enter VRM to continue' : 'Select site contravention to continue')}
+                                    {permitChecking
+                                        ? 'Checking e-permit...'
+                                        : permitBlocksCreation
+                                            ? 'Permit matched - proceed only if contravention applies'
+                                            : canProceedToConfirm
+                                                ? 'Next — Confirm →'
+                                                : (!hasContraventionChoice
+                                                    ? 'Select site contravention to continue'
+                                                    : (permitCheck.status === 'error'
+                                                        ? 'E-permit check failed - edit VRM to retry'
+                                                        : 'Waiting for e-permit check...'))}
                                 </button>
                             </div>
                         </div>
@@ -1640,10 +1824,30 @@ export default function BreachStepper({
                     <div className="stepper-step">
                         <p className="stepper-step-label">Step 3 — Confirm Parking Charge</p>
 
-                        <div className="stepper-summary-card">
-                            <div className="stepper-summary-row">
+                        <div className="stepper-summary-card stepper-summary-card--final">
+                            <div className="stepper-summary-intro">Review these details before creating the draft parking charge.</div>
+                            <div className="stepper-summary-row stepper-summary-row--vrm">
                                 <span className="stepper-summary-label">VRM</span>
-                                <span className="stepper-summary-val" style={{ fontFamily: 'monospace', fontWeight: 800 }}>{stableCapturedVrm || normalizeVrm(vrm)}</span>
+                                <div className="stepper-summary-vrm-edit">
+                                    <input
+                                        className="stepper-vrm-input stepper-vrm-input--summary"
+                                        value={vrm}
+                                        onChange={(e) => setVrm(normalizeVrm(e.target.value))}
+                                        placeholder="AB12CDE"
+                                        inputMode="text"
+                                        autoCapitalize="characters"
+                                        spellCheck={false}
+                                        maxLength={8}
+                                    />
+                                    <button
+                                        type="button"
+                                        className="ghost-button stepper-vrm-action"
+                                        onClick={() => setVrm(stableCapturedVrm)}
+                                        disabled={!canUseDetectedVrm}
+                                    >
+                                        Reset OCR
+                                    </button>
+                                </div>
                             </div>
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Site</span>
@@ -1660,6 +1864,28 @@ export default function BreachStepper({
                             <div className="stepper-summary-row">
                                 <span className="stepper-summary-label">Entry evidence</span>
                                 <span className="stepper-summary-val">{files.length} image{files.length !== 1 ? 's' : ''}</span>
+                            </div>
+                            <div className={permitIndicatorClass}>
+                                <div className="stepper-permit-indicator-title">{permitIndicatorTitle}</div>
+                                <div className="stepper-permit-indicator-message">{permitIndicatorMessage}</div>
+                                {permitMatchScore > 0 && permitMatchVrm ? (
+                                    <div className="auth-match-pill" role="status" aria-label="Closest exemption match confidence">
+                                        <span className="auth-match-pill-label">Closest exemption match</span>
+                                        <span className="auth-match-pill-vrm">{permitMatchVrm}</span>
+                                        <span className="auth-match-pill-score">{permitMatchScore}%</span>
+                                    </div>
+                                ) : null}
+                                {permitBlocksCreation ? (
+                                    <div className="stepper-permit-indicator-actions">
+                                        <button
+                                            type="button"
+                                            className="ghost-button stepper-cancel-draft-btn"
+                                            onClick={handleClose}
+                                        >
+                                            Cancel draft
+                                        </button>
+                                    </div>
+                                ) : null}
                             </div>
                             {previews.length > 0 ? (
                                 <div className="stepper-preview-grid stepper-preview-grid--compact">
@@ -1691,10 +1917,12 @@ export default function BreachStepper({
                             <button
                                 type="button"
                                 className="primary-button stepper-confirm-btn"
-                                disabled={!canConfirm}
+                                disabled={!canCreatePcn}
                                 onClick={handleConfirm}
                             >
-                                {'Create Parking Charge'}
+                                {permitChecking
+                                    ? 'Checking permit...'
+                                    : (permitBlocksCreation ? 'Create Parking Charge (Permit matched)' : 'Create Parking Charge')}
                             </button>
                         </div>
                     </div>

@@ -1,0 +1,9 @@
+{
+  "name": "LDK Warden",
+  "short_name": "LDK Warden",
+  "start_url": "/login",
+  "display": "standalone",
+  "background_color": "#08111d",
+  "theme_color": "#0d1b2a",
+  "icons": []
+}

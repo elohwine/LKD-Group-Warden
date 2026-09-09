@@ -1,0 +1,29 @@
+{
+	"appId": "com.ldk.warden.mobile",
+	"appName": "LDK Warden",
+	"webDir": "out",
+	"bundledWebRuntime": false,
+	"server": {
+		"allowNavigation": [
+			"ldkgroup.co.uk",
+			"ldk-group-ltd-website-react-p2ea.onrender.com",
+			"ldk-group-camera-service.onrender.com"
+		]
+	},
+	"plugins": {
+		"CapacitorHttp": {
+			"enabled": true
+		},
+		"SplashScreen": {
+			"launchShowDuration": 0,
+			"backgroundColor": "#08111d",
+			"androidSplashResourceName": "splash",
+			"androidScaleType": "CENTER_CROP",
+			"showSpinner": false
+		},
+		"StatusBar": {
+			"overlaysWebView": false,
+			"style": "DARK"
+		}
+	}
+}

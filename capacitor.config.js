@@ -5,28 +5,34 @@ let allowNavigation = [];
 
 const allowNavigationSet = new Set();
 
-if (backendBase) {
+const addAllowedHost = (rawUrl) => {
+  if (!rawUrl) return;
   try {
-    allowNavigationSet.add(new URL(backendBase).host);
+    const parsed = new URL(rawUrl);
+    allowNavigationSet.add(parsed.host);
+
+    if (parsed.hostname === 'ldkgroup.co.uk') {
+      allowNavigationSet.add('www.ldkgroup.co.uk');
+    }
+
+    if (parsed.hostname === 'www.ldkgroup.co.uk') {
+      allowNavigationSet.add('ldkgroup.co.uk');
+    }
   } catch (_) {
     // Ignore invalid URL and keep existing allowNavigation entries.
   }
+};
+
+if (backendBase) {
+  addAllowedHost(backendBase);
 }
 
 if (secondaryBackendBase) {
-  try {
-    allowNavigationSet.add(new URL(secondaryBackendBase).host);
-  } catch (_) {
-    // Ignore invalid URL and keep existing allowNavigation entries.
-  }
+  addAllowedHost(secondaryBackendBase);
 }
 
 if (cameraServiceBase) {
-  try {
-    allowNavigationSet.add(new URL(cameraServiceBase).host);
-  } catch (_) {
-    // Ignore invalid URL and keep existing allowNavigation entries.
-  }
+  addAllowedHost(cameraServiceBase);
 }
 
 allowNavigation = Array.from(allowNavigationSet);

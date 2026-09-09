@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import pLimit from 'p-limit';
 import { useRouter } from 'next/router';
-import { fetchCameraServiceJson, fetchJson } from '../lib/api';
+import { buildCameraServiceUrl, fetchCameraServiceJson, fetchJson } from '../lib/api';
 import {
   clearSession,
   getStoredMobileCameraId,
@@ -23,6 +23,8 @@ import { getBillableMinutes } from '../lib/duration';
 import { buildVehicleDetailsRecord } from '../lib/vehicleDetails';
 import { isVehicleCameraCandidate } from '../lib/vehicleCameras';
 import { buildMobileCameraAssignmentPayload } from '../lib/mobileCameraAssignment';
+import { clearQuickCaptureCards, loadQuickCaptureCards, saveQuickCaptureCards } from '../lib/quickCaptureStore';
+import { loadCameraFeedImagePreviews, saveCameraFeedImagePreview } from '../lib/cameraFeedImageCache';
 import {
   decideEvidenceSource,
   recoverUploadableEvidenceFilesFromCameraRaw,
@@ -33,8 +35,142 @@ import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
 import BreachStepper from '../components/BreachStepper';
 import PcnPreviewDialog from '../components/PcnPreviewDialog';
-import WardenCaptureFeed from '../components/WardenCaptureFeed';
 import { buildDemoSites, isDemoModeEnabled } from '../lib/demoMode';
+
+function IconBase({ className = '', size = 20, children }) {
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function IconCamera({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z" />
+      <circle cx="12" cy="13" r="3.25" />
+    </IconBase>
+  );
+}
+
+function IconSessions({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <rect x="6" y="4" width="12" height="16" rx="2" />
+      <path d="M9 9h6" />
+      <path d="M9 13h6" />
+      <path d="M9 17h4" />
+    </IconBase>
+  );
+}
+
+function IconQueue({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M12 16V8" />
+      <path d="m8 12 4-4 4 4" />
+      <path d="M5 18h14" />
+    </IconBase>
+  );
+}
+
+function IconMobile({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <rect x="8" y="3" width="8" height="18" rx="2" />
+      <circle cx="12" cy="17" r="1" />
+    </IconBase>
+  );
+}
+
+function IconArchive({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M3 7h18" />
+      <rect x="4" y="7" width="16" height="13" rx="2" />
+      <path d="M9 11h6" />
+    </IconBase>
+  );
+}
+
+function IconClipboard({ className = '', size = 18 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <rect x="7" y="5" width="10" height="16" rx="2" />
+      <path d="M10 3h4" />
+      <path d="M9 9h6" />
+      <path d="M9 13h6" />
+    </IconBase>
+  );
+}
+
+function IconTrash({ className = '', size = 18 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 10v7" />
+      <path d="M14 10v7" />
+    </IconBase>
+  );
+}
+
+function IconCheckCircle({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="m8.5 12 2.3 2.3L15.5 9.6" />
+    </IconBase>
+  );
+}
+
+function IconPlus({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </IconBase>
+  );
+}
+
+function IconSettings({ className = '', size = 18 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 2v2" />
+      <path d="M12 20v2" />
+      <path d="M4.93 4.93l1.41 1.41" />
+      <path d="M17.66 17.66l1.41 1.41" />
+      <path d="M2 12h2" />
+      <path d="M20 12h2" />
+      <path d="M4.93 19.07l1.41-1.41" />
+      <path d="M17.66 6.34l1.41-1.41" />
+    </IconBase>
+  );
+}
+
+function IconRefresh({ className = '', size = 16 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+      <path d="M21 3v6h-6" />
+    </IconBase>
+  );
+}
 
 function formatElapsed(startIso, endIso = '') {
   const startMs = new Date(startIso || '').getTime();
@@ -120,6 +256,9 @@ const EVIDENCE_UPLOAD_PROGRESS_STALL_MS = 120000;
 const WARDEN_SYNC_TRACE_TOGGLE_KEY = 'warden-sync-trace-enabled';
 const WARDEN_SYNC_TRACE_LOG_KEY = 'warden-sync-trace-log';
 const WARDEN_SYNC_TRACE_MAX_ENTRIES = 250;
+const WARDEN_QUICK_CAPTURE_MAX = 120;
+const WARDEN_CAMERA_FEED_VIEW_MODE_KEY = 'warden-camera-feed-view-mode';
+const CAMERA_FEED_PREVIEW_FAILED = '__CAMERA_FEED_PREVIEW_FAILED__';
 
 function detectImageSrcKind(value) {
   const candidate = String(value || '').trim();
@@ -282,7 +421,7 @@ function formatSyncTraceEventLabel(event, payload = {}) {
   }
 }
 
-function uploadEvidenceBlobWithXhr({ url, blob, contentType, fileName, uploadLabel, onProgress }) {
+function uploadEvidenceBlobWithXhr({ url, downloadUrl, blob, contentType, fileName, uploadLabel, onProgress, uploadHeaders }) {
   const xhr = new XMLHttpRequest();
 
   const promise = new Promise((resolve, reject) => {
@@ -357,14 +496,12 @@ function uploadEvidenceBlobWithXhr({ url, blob, contentType, fileName, uploadLab
         settle(() => {
           if (xhr.status >= 200 && xhr.status < 300) {
             resolve({
-              url: String(url || '').split('?')[0],
+              url: String(downloadUrl || '').trim() || String(url || '').trim(),
               fileName,
             });
             return;
           }
-
-          const errText = xhr.responseText?.slice(0, 200) || 'No response';
-          reject(new Error(`Upload failed (${xhr.status}): ${errText}`));
+          reject(new Error(`Upload failed (${xhr.status})`));
         });
       }
     });
@@ -374,7 +511,7 @@ function uploadEvidenceBlobWithXhr({ url, blob, contentType, fileName, uploadLab
       settle(() => {
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve({
-            url: String(url || '').split('?')[0],
+            url: String(downloadUrl || '').trim() || String(url || '').trim(),
             fileName,
           });
           return;
@@ -402,6 +539,14 @@ function uploadEvidenceBlobWithXhr({ url, blob, contentType, fileName, uploadLab
       xhr.timeout = 300000;
       xhr.open('PUT', url);
       xhr.setRequestHeader('Content-Type', contentType || 'image/jpeg');
+      if (uploadHeaders && typeof uploadHeaders === 'object') {
+        Object.entries(uploadHeaders).forEach(([key, value]) => {
+          const headerName = String(key || '').trim();
+          const headerValue = String(value || '').trim();
+          if (!headerName || !headerValue) return;
+          xhr.setRequestHeader(headerName, headerValue);
+        });
+      }
       xhr.send(blob);
     } catch (error) {
       settle(() => reject(error));
@@ -496,6 +641,9 @@ function formatCaptureTimestamp(capturedAt) {
 async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
   if (!file || !(file.type || '').startsWith('image/')) return file;
 
+  // Keep plate cutouts unmodified so timestamp overlays never obstruct VRM pixels.
+  if (String(phase || '').toLowerCase() === 'plate') return file;
+
   try {
     const image = await loadImageElement(file);
     const canvas = document.createElement('canvas');
@@ -506,11 +654,8 @@ async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
 
     ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
 
-    const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
     const stampText = formatCaptureTimestamp(capturedAt);
-    let baseFont = 3 * (isPlateCutout
-      ? Math.max(10, Math.min(14, Math.floor(canvas.width / 90)))
-      : Math.max(11, Math.min(16, Math.floor(canvas.width / 88))));
+    let baseFont = 3 * Math.max(11, Math.min(16, Math.floor(canvas.width / 88)));
     const marginX = Math.max(6, Math.floor(canvas.width * 0.012));
     const marginY = Math.max(6, Math.floor(canvas.height * 0.014));
     const maxBoxWidth = Math.max(40, canvas.width - (marginX * 2));
@@ -577,6 +722,28 @@ async function toPreviewSrcList(files) {
     })
   );
   return resolved.filter(Boolean);
+}
+
+async function blobToDataUrl(blob) {
+  if (!blob) return '';
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('blob_preview_read_failed'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function fetchImagePreviewDataUrl(url, authToken = '') {
+  const target = String(url || '').trim();
+  if (!/^https?:\/\//i.test(target)) return '';
+
+  const proxyUrl = buildApiUrl(`/api/warden/proxy-image?url=${encodeURIComponent(target)}`);
+  const headers = authToken ? { Authorization: `Bearer ${authToken}` } : undefined;
+  const response = await fetchWithTimeout(proxyUrl, { method: 'GET', cache: 'no-store', headers }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+  if (!response.ok) throw new Error(`image_fetch_${response.status}`);
+  const blob = await response.blob();
+  return blobToDataUrl(blob);
 }
 
 function normalizeCapturedAt(value) {
@@ -971,6 +1138,96 @@ function dataUrlToFile(dataUrl, filename) {
   }
 }
 
+function coerceQuickCaptureFile(fileLike, index, capturedAtFallback = '') {
+  if (!fileLike) return null;
+
+  const capturedAt = normalizeCapturedAt(fileLike?.capturedAt) || normalizeCapturedAt(capturedAtFallback) || new Date().toISOString();
+  const fileName = String(fileLike?.name || `capture_${index + 1}.jpg`).trim() || `capture_${index + 1}.jpg`;
+  const fileType = String(fileLike?.type || 'image/jpeg').trim() || 'image/jpeg';
+
+  if (typeof File !== 'undefined' && fileLike instanceof File) {
+    fileLike.capturedAt = capturedAt;
+    return fileLike;
+  }
+
+  if (typeof Blob !== 'undefined' && fileLike instanceof Blob) {
+    const wrapped = new File([fileLike], fileName, { type: fileType, lastModified: Date.now() });
+    wrapped.capturedAt = capturedAt;
+    return wrapped;
+  }
+
+  return null;
+}
+
+function sanitizeQuickCaptureCard(rawCard) {
+  const card = rawCard && typeof rawCard === 'object' ? rawCard : {};
+  const files = (Array.isArray(card?.files) ? card.files : [])
+    .map((file, index) => coerceQuickCaptureFile(file, index, card?.capturedAt))
+    .filter(Boolean);
+
+  return {
+    id: String(card?.id || `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
+    capturedAt: normalizeCapturedAt(card?.capturedAt) || new Date().toISOString(),
+    plateText: normalizeVrm(card?.plateText || ''),
+    plateConfidence: Number(card?.plateConfidence || 0),
+    cutoffImage: String(card?.cutoffImage || '').trim(),
+    vehiclePreview: String(card?.vehiclePreview || '').trim(),
+    siteId: String(card?.siteId || '').trim(),
+    siteName: String(card?.siteName || '').trim(),
+    syncStatus: String(card?.syncStatus || 'queued').trim() || 'queued',
+    syncProgress: Math.max(0, Math.min(100, Number(card?.syncProgress || 0))),
+    syncError: String(card?.syncError || '').trim(),
+    remoteImageUrls: Array.isArray(card?.remoteImageUrls)
+      ? card.remoteImageUrls.filter((value) => /^https?:\/\//i.test(String(value || '').trim()))
+      : [],
+    cameraRawData: Array.isArray(card?.cameraRawData)
+      ? card.cameraRawData.map((record) => ({
+        id: String(record?.id || '').trim(),
+        phase: record?.phase === 'closing' ? 'closing' : 'entry',
+        imageRole: String(record?.imageRole || '').trim(),
+        source: String(record?.source || '').trim(),
+        capturedAt: normalizeCapturedAt(record?.capturedAt) || '',
+        capturedAtUk: String(record?.capturedAtUk || '').trim(),
+        fileName: String(record?.fileName || '').trim(),
+        mimeType: String(record?.mimeType || '').trim(),
+        sizeBytes: Number(record?.sizeBytes || 0),
+        localPreviewUrl: String(record?.localPreviewUrl || '').trim(),
+        plateText: normalizeVrm(record?.plateText || ''),
+        plateCutoffImage: String(record?.plateCutoffImage || '').trim(),
+        plateConfidence: Number(record?.plateConfidence || 0),
+        uploadedUrl: String(record?.uploadedUrl || '').trim(),
+      }))
+      : [],
+    files,
+  };
+}
+
+function rebuildQuickCaptureFilesFromCard(card) {
+  const safeCard = card && typeof card === 'object' ? card : {};
+  const capturedAt = normalizeCapturedAt(safeCard?.capturedAt) || new Date().toISOString();
+  const rebuilt = [];
+
+  const vehiclePreview = String(safeCard?.vehiclePreview || '').trim();
+  if (/^data:image\//i.test(vehiclePreview)) {
+    const vehicleFile = dataUrlToFile(vehiclePreview, `capture_${Date.now()}.jpg`);
+    if (vehicleFile) {
+      vehicleFile.capturedAt = capturedAt;
+      rebuilt.push(vehicleFile);
+    }
+  }
+
+  const cutoffPreview = String(safeCard?.cutoffImage || '').trim();
+  if (/^data:image\//i.test(cutoffPreview)) {
+    const cutoffFile = dataUrlToFile(cutoffPreview, `plate_cutoff_${Date.now()}.jpg`);
+    if (cutoffFile) {
+      cutoffFile.capturedAt = capturedAt;
+      rebuilt.push(cutoffFile);
+    }
+  }
+
+  return rebuilt;
+}
+
 async function scanPlateFromImage(file) {
   if (!file || !(file.type || '').startsWith('image/')) return null;
 
@@ -1028,6 +1285,94 @@ function buildEvidenceFrame(imageUrl, timestamp, plateImageUrl = '') {
     timestamp: capturedAt,
     capturedAt,
     capturedAtUk: capturedAt ? formatCaptureTimestamp(capturedAt) : '',
+  };
+}
+
+function normalizeRemoteImageUrl(value) {
+  const candidate = String(value || '').trim();
+  if (!candidate) return '';
+  // Camera service payloads can occasionally return HTML-escaped query delimiters.
+  const decoded = candidate.replace(/&amp;/g, '&');
+  if (/^https?:\/\//i.test(decoded)) return decoded;
+  if (/^\/\//.test(decoded)) return `https:${decoded}`;
+  if (decoded.startsWith('/')) {
+    try {
+      return buildCameraServiceUrl(decoded);
+    } catch (_) {
+      return '';
+    }
+  }
+  return '';
+}
+
+function scoreRemoteImageUrl(url) {
+  const candidate = String(url || '').trim();
+  if (!candidate) return -999;
+
+  let score = 0;
+  if (/\/api\/images\//i.test(candidate)) score += 120;
+  if (/firebasestorage\.googleapis\.com/i.test(candidate)) score += 90;
+  if (/alt=media/i.test(candidate)) score += 20;
+  if (/[?&]token=/i.test(candidate)) score += 30;
+  if (/ldkgroup\.co\.uk\//i.test(candidate)) score += 40;
+
+  // These URLs are commonly private object paths and fail without signed query args.
+  const isUnsignedGcsObject = /storage\.googleapis\.com\/[^/]+\/warden_evidence\//i.test(candidate)
+    && !(/[?&](x-goog-signature|x-goog-algorithm|googleaccessid|token)=/i.test(candidate));
+  if (isUnsignedGcsObject) score -= 140;
+
+  return score;
+}
+
+function pickPreferredRemoteImageUrl(urls = []) {
+  const normalized = (Array.isArray(urls) ? urls : [])
+    .map((value) => normalizeRemoteImageUrl(value))
+    .filter(Boolean)
+    .filter((value, index, all) => all.indexOf(value) === index);
+  if (normalized.length === 0) return '';
+
+  const ranked = normalized
+    .map((value) => ({ value, score: scoreRemoteImageUrl(value) }))
+    .sort((left, right) => right.score - left.score);
+
+  return ranked[0]?.value || normalized[0] || '';
+}
+
+function pickAlarmImageUrl(alarm, candidates = []) {
+  const safeAlarm = alarm && typeof alarm === 'object' ? alarm : {};
+  for (const candidate of candidates) {
+    const parts = String(candidate || '').split('.').filter(Boolean);
+    let current = safeAlarm;
+    for (const part of parts) {
+      if (!current || typeof current !== 'object') {
+        current = null;
+        break;
+      }
+      current = current[part];
+    }
+
+    if (typeof current !== 'string') continue;
+    const normalized = normalizeRemoteImageUrl(current);
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
+function pickFallbackAlarmImageUrls(alarm) {
+  const discovered = collectImageUrlsFromValue([alarm?.images, alarm?.raw, alarm]);
+  const normalized = discovered
+    .map((value) => normalizeRemoteImageUrl(value))
+    .filter(Boolean);
+
+  const unique = normalized.filter((value, index, all) => all.indexOf(value) === index);
+  const plateHint = unique.find((url) => /plate|cutoff|anpr|ocr/i.test(url)) || '';
+  const vehicleHint = unique.find((url) => !/plate|cutoff|anpr|ocr/i.test(url)) || '';
+
+  return {
+    vehicleHint,
+    plateHint,
+    first: pickPreferredRemoteImageUrl(unique),
+    all: unique,
   };
 }
 
@@ -1653,6 +1998,12 @@ export default function DashboardPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedTrackedId, setSelectedTrackedId] = useState('');
   const [selectedArchiveIds, setSelectedArchiveIds] = useState([]);
+  const [selectedQueueIds, setSelectedQueueIds] = useState([]);
+  const [selectedCaptureCardIds, setSelectedCaptureCardIds] = useState([]);
+  const [captureBulkSyncing, setCaptureBulkSyncing] = useState(false);
+  const [captureConfirmDialog, setCaptureConfirmDialog] = useState(null);
+  const [captureConfirmVrm, setCaptureConfirmVrm] = useState('');
+  const [capturePermitCheck, setCapturePermitCheck] = useState({ status: 'idle', hasPermit: false, checking: false, matchConfidence: null });
   const [darkMode, setDarkMode] = useState(true);
   const [autoSubmitOnClosingCapture, setAutoSubmitOnClosingCapture] = useState(false);
   const [carcheckDialogOpen, setCarcheckDialogOpen] = useState(false);
@@ -1665,6 +2016,13 @@ export default function DashboardPage() {
   const [captureIsQuickMode, setCaptureIsQuickMode] = useState(false);
   const [captureCards, setCaptureCards] = useState([]);
   const [captureCardChecks, setCaptureCardChecks] = useState({});
+  const [cameraFeedRows, setCameraFeedRows] = useState([]);
+  const [cameraFeedLoading, setCameraFeedLoading] = useState(false);
+  const [cameraFeedError, setCameraFeedError] = useState('');
+  const [dashboardBootstrapped, setDashboardBootstrapped] = useState(false);
+  const [cameraFeedPreviewCache, setCameraFeedPreviewCache] = useState({});
+  const [cameraFeedVrmFilter, setCameraFeedVrmFilter] = useState('');
+  const [cameraFeedViewMode, setCameraFeedViewMode] = useState('table');
   const [breachStatusFilter, setBreachStatusFilter] = useState('all');
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
@@ -1682,9 +2040,6 @@ export default function DashboardPage() {
   const [monitoringSessionActive, setMonitoringSessionActive] = useState(false);
   const [monitoringSessionStartedAt, setMonitoringSessionStartedAt] = useState('');
   const [demoAlarmAcknowledged, setDemoAlarmAcknowledged] = useState(false);
-  const [cameraRawViewMode, setCameraRawViewMode] = useState('grid');
-  const [cameraRawVrmQuery, setCameraRawVrmQuery] = useState('');
-  const [cameraRawSiteFilter, setCameraRawSiteFilter] = useState('all');
   const [imageDetailDialog, setImageDetailDialog] = useState({
     open: false,
     fullscreen: true,
@@ -1704,13 +2059,89 @@ export default function DashboardPage() {
     allowDelete: false,
   });
   const qrFileInputRef = useRef(null);
-  const quickCaptureInputRef = useRef(null);
   const authReadyRef = useRef(false);
   const pcnAutoCheckSignatureRef = useRef('');
   const pcnSubmitLimitRef = useRef(pLimit(1));
   const convertPipelineLimitRef = useRef(pLimit(1));
   const syncInFlightCountRef = useRef(0);
   const syncAbortControllersRef = useRef(new Map());
+  const cameraFeedChecksRef = useRef(new Set());
+  const cameraFeedPreviewCacheRef = useRef({});
+  const cameraFeedPreviewFetchInFlightRef = useRef(new Set());
+  const capturePermitRequestRef = useRef(0);
+  const quickCaptureSyncInFlightRef = useRef(new Set());
+  const captureCardsRestoredRef = useRef(false);
+
+  function resolveCameraFeedImageSrc(url) {
+    const target = String(url || '').trim();
+    if (!target) return '';
+    const cached = cameraFeedPreviewCache[target];
+    if (typeof cached === 'string' && cached && cached !== CAMERA_FEED_PREVIEW_FAILED) return cached;
+    if (cached === CAMERA_FEED_PREVIEW_FAILED) return '';
+    if (/^data:image\//i.test(target) || /^blob:/i.test(target)) return target;
+    if (/^https?:\/\//i.test(target)) return target;
+    return '';
+  }
+
+  function getCameraFeedImageLoadState(url) {
+    const target = String(url || '').trim();
+    if (!target) return 'none';
+    if (/^data:image\//i.test(target) || /^blob:/i.test(target)) return 'ready';
+    if (!/^https?:\/\//i.test(target)) return 'none';
+
+    const cached = cameraFeedPreviewCache[target];
+    if (typeof cached === 'string' && cached && cached !== CAMERA_FEED_PREVIEW_FAILED) return 'ready';
+    if (cached === CAMERA_FEED_PREVIEW_FAILED) return 'failed';
+    // Render the direct URL immediately while background preview caching runs.
+    return 'ready';
+  }
+
+  async function ensureCameraFeedPreview(url, providedToken = '', options = {}) {
+    const target = String(url || '').trim();
+    if (!/^https?:\/\//i.test(target)) return '';
+    const forceRetry = Boolean(options?.forceRetry);
+
+    const cached = cameraFeedPreviewCacheRef.current[target];
+    if (typeof cached === 'string' && cached && cached !== CAMERA_FEED_PREVIEW_FAILED) return cached;
+    if (!forceRetry && cached === CAMERA_FEED_PREVIEW_FAILED) return '';
+    if (cameraFeedPreviewFetchInFlightRef.current.has(target)) return '';
+
+    cameraFeedPreviewFetchInFlightRef.current.add(target);
+    try {
+      let authToken = String(providedToken || '').trim();
+      if (!authToken) {
+        try {
+          authToken = await resolveAuthToken();
+        } catch (_) {
+          authToken = '';
+        }
+      }
+
+      let preview = '';
+      try {
+        preview = await fetchImagePreviewDataUrl(target, authToken);
+      } catch (error) {
+        const statusMatch = /image_fetch_(\d+)/i.exec(String(error?.message || ''));
+        const statusCode = Number(statusMatch?.[1] || 0);
+        if (statusCode === 401) {
+          authToken = await resolveAuthToken({ forceRefresh: true });
+          preview = await fetchImagePreviewDataUrl(target, authToken);
+        }
+      }
+      if (!preview) return '';
+
+      cameraFeedPreviewCacheRef.current = { ...cameraFeedPreviewCacheRef.current, [target]: preview };
+      setCameraFeedPreviewCache((current) => ({ ...current, [target]: preview }));
+      saveCameraFeedImagePreview(target, preview).catch(() => null);
+      return preview;
+    } catch (_) {
+      cameraFeedPreviewCacheRef.current = { ...cameraFeedPreviewCacheRef.current, [target]: CAMERA_FEED_PREVIEW_FAILED };
+      setCameraFeedPreviewCache((current) => ({ ...current, [target]: CAMERA_FEED_PREVIEW_FAILED }));
+      return '';
+    } finally {
+      cameraFeedPreviewFetchInFlightRef.current.delete(target);
+    }
+  }
 
   function appendSyncProgressLog(message, level = 'info') {
     const safeMessage = String(message || '').trim();
@@ -1903,6 +2334,13 @@ export default function DashboardPage() {
     if (!nextToken) throw new Error('auth_missing');
     if (nextToken !== authToken) setAuthToken(nextToken);
     return nextToken;
+  }
+
+  function resolveActorIdentity() {
+    const stored = loadSession() || {};
+    const uid = String(profile?.uid || profile?.id || stored?.uid || '').trim();
+    const email = String(profile?.email || stored?.email || '').trim();
+    return { uid, email };
   }
 
   function isAuthBootstrapError(error) {
@@ -2102,6 +2540,15 @@ export default function DashboardPage() {
     [trackedBreaches]
   );
 
+  useEffect(() => {
+    setSelectedQueueIds((current) => {
+      if (!current.length) return current;
+      const existingIds = new Set(syncCandidates.map((item) => item.id));
+      const next = current.filter((id) => existingIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [syncCandidates]);
+
   const selectedTracked = useMemo(
     () => trackedBreaches.find((entry) => entry.id === selectedTrackedId)
       || archivedBreaches.find((entry) => entry.id === selectedTrackedId)
@@ -2137,6 +2584,265 @@ export default function DashboardPage() {
     canFinalizeBreach ||
     (selectedLifecycleCode === 'SUBMITTED' && Boolean(selectedTracked?.payload?.breachId))
   );
+  const cameraFeedFilterQuery = useMemo(
+    () => normalizeVrm(cameraFeedVrmFilter || ''),
+    [cameraFeedVrmFilter]
+  );
+
+  const filteredCameraFeedRows = useMemo(() => {
+    if (!cameraFeedFilterQuery) return cameraFeedRows;
+    return cameraFeedRows.filter((row) => normalizeVrm(row?.vrm || '').includes(cameraFeedFilterQuery));
+  }, [cameraFeedRows, cameraFeedFilterQuery]);
+
+  const cameraTabCaptureCards = useMemo(() => {
+    return (Array.isArray(captureCards) ? captureCards : [])
+      .filter((card) => String(card?.syncStatus || 'queued') !== 'synced');
+  }, [captureCards]);
+
+  const cameraDisplayRows = useMemo(() => {
+    const localRows = (Array.isArray(cameraTabCaptureCards) ? cameraTabCaptureCards : [])
+      .filter((card) => {
+        if (!cameraFeedFilterQuery) return true;
+        return normalizeVrm(card?.plateText || '').includes(cameraFeedFilterQuery);
+      })
+      .map((card) => {
+        const cardId = String(card?.id || '').trim();
+        const status = String(card?.syncStatus || 'queued');
+        return {
+          id: `local-${cardId}`,
+          localCardId: cardId,
+          isLocalCapture: true,
+          syncStatus: status,
+          vrm: String(card?.plateText || '').trim() || 'No VRM',
+          confidence: Number(card?.plateConfidence || 0),
+          siteName: String(card?.siteName || selectedSite?.name || selectedSiteId || '').trim() || 'Site not set',
+          cameraName: 'Warden App',
+          readTimestamp: card?.capturedAt || '',
+          imageUrl: String(card?.vehiclePreview || card?.cutoffImage || '').trim(),
+          vehicleImageUrl: String(card?.vehiclePreview || card?.cutoffImage || '').trim(),
+          plateImageUrl: String(card?.cutoffImage || card?.vehiclePreview || '').trim(),
+          permitStatus: '',
+          carcheckStatus: '',
+          syncError: String(card?.syncError || '').trim(),
+        };
+      });
+
+    return [...localRows, ...filteredCameraFeedRows.map((row) => ({ ...row, isLocalCapture: false }))];
+  }, [cameraTabCaptureCards, cameraFeedFilterQuery, filteredCameraFeedRows, selectedSite, selectedSiteId]);
+
+  async function runCameraFeedPermitCheck(rowId, vrm) {
+    if (!rowId || !vrm || !selectedSiteId) return;
+    const permitKey = `permit-${rowId}`;
+    if (cameraFeedChecksRef.current.has(permitKey)) return;
+    cameraFeedChecksRef.current.add(permitKey);
+
+    setCameraFeedRows((current) => current.map((row) => (
+      row.id === rowId
+        ? { ...row, permitStatus: 'checking' }
+        : row
+    )));
+
+    try {
+      const token = await resolveAuthToken();
+      const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, { token });
+      const hasAuthorization = Boolean(result?.hasAuthorization);
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, permitStatus: hasAuthorization ? 'has_permit' : 'no_permit', permitData: result }
+          : row
+      )));
+    } catch (error) {
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, permitStatus: 'error', permitError: String(error?.message || 'Permit check failed') }
+          : row
+      )));
+    } finally {
+      cameraFeedChecksRef.current.delete(permitKey);
+    }
+  }
+
+  async function runCameraFeedCarcheck(rowId, vrm) {
+    if (!rowId || !vrm) return;
+    const carcheckKey = `carcheck-${rowId}`;
+    if (cameraFeedChecksRef.current.has(carcheckKey)) return;
+    cameraFeedChecksRef.current.add(carcheckKey);
+
+    setCameraFeedRows((current) => current.map((row) => (
+      row.id === rowId
+        ? { ...row, carcheckStatus: 'checking' }
+        : row
+    )));
+
+    try {
+      const token = await resolveAuthToken();
+      const result = await fetchJson(`/api/carcheck?vrm=${encodeURIComponent(vrm)}`, { token });
+      const make = String(result?.make || '').trim();
+      const model = String(result?.model || '').trim();
+      const color = String(result?.colour || result?.color || '').trim();
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, carcheckStatus: make || model ? 'ok' : 'not_found', carcheckDetails: { make, model, color } }
+          : row
+      )));
+    } catch (error) {
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, carcheckStatus: 'error', carcheckError: String(error?.message || 'Carcheck failed') }
+          : row
+      )));
+    } finally {
+      cameraFeedChecksRef.current.delete(carcheckKey);
+    }
+  }
+
+  async function refreshCameraFeedRows() {
+    if (!selectedSiteId) {
+      setCameraFeedRows([]);
+      setCameraFeedError('');
+      return;
+    }
+
+    setCameraFeedLoading(true);
+    setCameraFeedError('');
+    try {
+      const token = await resolveAuthToken();
+      const params = new URLSearchParams({ limit: '100', cameraType: 'Warden App', order: 'desc' });
+      const selectedSiteName = String(selectedSite?.name || selectedSite?.displayName || '').trim();
+      params.set('site', selectedSiteName || selectedSiteId);
+      const data = await fetchCameraServiceJson(`/api/frontend/alarms?${params.toString()}`, { token });
+      const alarms = Array.isArray(data?.alarms) ? data.alarms : [];
+
+      const rows = alarms.map((alarm, index) => {
+        const fallbackImages = pickFallbackAlarmImageUrls(alarm);
+        const explicitVehicleImage = pickAlarmImageUrl(alarm, [
+          'images.vehicle',
+          'images.overview',
+          'images.OverviewImage',
+          'images.all.0',
+          'OverviewImage',
+          'overviewImage',
+          'vehicleImage',
+          'raw.OverviewImage',
+          'raw.overviewImage',
+        ]);
+        const explicitPlateImage = pickAlarmImageUrl(alarm, [
+          'images.plate',
+          'images.PlateImage',
+          'PlateImage',
+          'plateImage',
+          'raw.PlateImage',
+          'raw.plateImage',
+        ]);
+
+        const vehicleImage = pickPreferredRemoteImageUrl([
+          explicitVehicleImage,
+          fallbackImages.vehicleHint,
+          fallbackImages.first,
+          ...(Array.isArray(fallbackImages.all) ? fallbackImages.all : []),
+        ]);
+        const plateImage = pickPreferredRemoteImageUrl([
+          explicitPlateImage,
+          fallbackImages.plateHint,
+          ...(Array.isArray(fallbackImages.all) ? fallbackImages.all.filter((url) => /plate|cutoff|anpr|ocr/i.test(url)) : []),
+          vehicleImage,
+        ]);
+        const primaryImage = vehicleImage || plateImage;
+        
+        // Normalize timestamp from camera service to ensure UTC is preserved.
+        // If timezone is missing, treat as UTC to keep behavior deterministic across hosts.
+        // This follows the same pattern as PCN timestamp handling.
+        const rawReadTime = alarm?.timestamp || alarm?.metadata?.timestamp || '';
+        const normalizedReadTime = rawReadTime.trim() 
+          ? (/[zZ]|[+-]\d{2}:?\d{2}$/.test(rawReadTime) ? rawReadTime : `${rawReadTime}Z`)
+          : '';
+        
+        return {
+          id: String(alarm?.id || `camera-feed-${index}`),
+          vrm: normalizeVrm(alarm?.vrm || alarm?.licensePlate || ''),
+          confidence: Number(alarm?.confidence || alarm?.metadata?.confidenceLevel || 0),
+          direction: String(alarm?.direction || '').toLowerCase(),
+          roi: String(alarm?.roi || '').trim(),
+          siteName: String(alarm?.site || alarm?.metadata?.siteName || selectedSite?.name || selectedSiteId || '').trim(),
+          cameraName: String(alarm?.cameraName || alarm?.metadata?.cameraName || '').trim(),
+          cameraType: String(alarm?.cameraType || alarm?.metadata?.cameraType || '').trim(),
+          readTimestamp: normalizedReadTime,
+          receivedTimestamp: alarm?.raw?.['Received Timestamp'] || alarm?.metadata?.receivedAt || '',
+          imageUrl: primaryImage,
+          plateImageUrl: plateImage,
+          vehicleImageUrl: vehicleImage || primaryImage,
+          permitStatus: '',
+          carcheckStatus: '',
+          permitData: null,
+          carcheckDetails: null,
+        };
+      });
+
+      const rowImageUrls = Array.from(new Set(rows.flatMap((row) => [
+        String(row?.vehicleImageUrl || '').trim(),
+        String(row?.plateImageUrl || '').trim(),
+        String(row?.imageUrl || '').trim(),
+      ]).filter((url) => /^https?:\/\//i.test(url))));
+
+      if (rowImageUrls.length > 0) {
+        try {
+          const persistedPreviews = await loadCameraFeedImagePreviews(rowImageUrls);
+          if (persistedPreviews && Object.keys(persistedPreviews).length > 0) {
+            cameraFeedPreviewCacheRef.current = {
+              ...cameraFeedPreviewCacheRef.current,
+              ...persistedPreviews,
+            };
+            setCameraFeedPreviewCache((current) => ({
+              ...current,
+              ...persistedPreviews,
+            }));
+          }
+        } catch (_) {
+          // Ignore local preview cache read failures.
+        }
+      }
+
+      setCameraFeedRows(rows);
+    } catch (error) {
+      setCameraFeedError(String(error?.message || 'Failed to load camera feed'));
+    } finally {
+      setCameraFeedLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!Array.isArray(cameraFeedRows) || cameraFeedRows.length === 0) return;
+
+    const allUrls = cameraFeedRows.flatMap((row) => [
+      String(row?.vehicleImageUrl || '').trim(),
+      String(row?.plateImageUrl || '').trim(),
+      String(row?.imageUrl || '').trim(),
+    ]).filter((url) => /^https?:\/\//i.test(url));
+
+    const uniqueUrls = Array.from(new Set(allUrls));
+    const pending = uniqueUrls.filter((url) => {
+      const cached = cameraFeedPreviewCacheRef.current[url];
+      return !(typeof cached === 'string' && cached);
+    });
+    if (pending.length === 0) return;
+
+    const limit = pLimit(4);
+
+    (async () => {
+      let authToken = '';
+      try {
+        authToken = await resolveAuthToken();
+      } catch (_) {
+        authToken = '';
+      }
+
+      await Promise.allSettled(
+        pending.map((url) => limit(async () => {
+          await ensureCameraFeedPreview(url, authToken);
+        }))
+      );
+    })();
+  }, [cameraFeedRows]);
 
   useEffect(() => {
     if (!demoObservationExpired) {
@@ -2350,78 +3056,6 @@ export default function DashboardPage() {
     const isClosedLifecycle = lifecycleCode === 'SUBMITTED' || lifecycleCode === 'CONVERTED';
     return Boolean(isClosedLifecycle && detailMessageLooksLikeCheckStatus);
   }, [selectedTracked, detailMessageLooksLikeCheckStatus]);
-  const cameraRawFeed = useMemo(() => {
-    const feed = [];
-
-    queueItems.forEach((item) => {
-      const records = Array.isArray(item?.payload?.cameraRawData) ? item.payload.cameraRawData : [];
-      records.forEach((record, index) => {
-        feed.push({
-          ...record,
-          vrm: item?.payload?.vrm || item?.vrm || 'Unknown',
-          siteName: item?.payload?.siteName || 'Site',
-          queueItemId: item?.id,
-          recordKey: `${item?.id || 'queue'}-${record?.id || `${record?.phase || 'entry'}-${index}`}`,
-        });
-      });
-    });
-
-    return feed.sort((left, right) => String(right?.capturedAt || '').localeCompare(String(left?.capturedAt || '')));
-  }, [queueItems]);
-  const selectedTrackedCameraRawData = useMemo(() => {
-    const fromPayload = Array.isArray(selectedTracked?.payload?.cameraRawData)
-      ? selectedTracked.payload.cameraRawData
-      : [];
-
-    if (fromPayload.length > 0) {
-      return fromPayload;
-    }
-
-    return Array.isArray(cameraRawData) ? cameraRawData : [];
-  }, [selectedTracked, cameraRawData]);
-  const cameraRawSiteOptions = useMemo(() => {
-    const unique = Array.from(new Set(
-      cameraRawFeed
-        .map((item) => String(item?.siteName || '').trim())
-        .filter(Boolean)
-    ));
-    return unique.sort((a, b) => a.localeCompare(b));
-  }, [cameraRawFeed]);
-  const filteredCameraRawFeed = useMemo(() => {
-    const normalizedVrmQuery = normalizeVrm(cameraRawVrmQuery);
-    const normalizedSiteFilter = String(cameraRawSiteFilter || 'all').trim().toLowerCase();
-
-    return cameraRawFeed.filter((item) => {
-      const itemVrm = normalizeVrm(item?.vrm || '');
-      const itemSite = String(item?.siteName || '').trim().toLowerCase();
-      const vrmMatch = !normalizedVrmQuery || itemVrm.includes(normalizedVrmQuery);
-      const siteMatch = normalizedSiteFilter === 'all' || itemSite === normalizedSiteFilter;
-      return vrmMatch && siteMatch;
-    });
-  }, [cameraRawFeed, cameraRawVrmQuery, cameraRawSiteFilter]);
-
-  // VRM → draft lifecycle code for session capture card badges.
-  const draftByVrmForCapture = useMemo(() => {
-    const map = {};
-    const priority = ['CONVERTED', 'SUBMITTED', 'READY', 'FAILED', 'DRAFT_OPEN'];
-    for (const item of queueItems) {
-      const v = normalizeVrm(item?.payload?.vrm || item?.vrm || '');
-      if (!v) continue;
-      const archived = Boolean(item?.archived) || String(item?.status || '').toLowerCase() === 'archived';
-      if (archived) continue;
-      const converted = Boolean(item?.payload?.convertedToPcn) || item?.payload?.breachLifecycle === 'CONVERTED_TO_PCN';
-      const status = String(item?.status || '').toLowerCase();
-      let code = 'DRAFT_OPEN';
-      if (converted) code = 'CONVERTED';
-      else if (status === 'submitted' || status === 'synced') code = 'SUBMITTED';
-      else if (status === 'failed') code = 'FAILED';
-      else if (item?.payload?.breachLifecycle === 'READY_FOR_SYNC') code = 'READY';
-      const existing = map[v];
-      if (!existing || priority.indexOf(code) < priority.indexOf(existing)) map[v] = code;
-    }
-    return map;
-  }, [queueItems]);
-
   const primaryCaptureAction = useMemo(() => {
     if (!hasEntryEvidence) {
       return { key: 'capture-entry', label: 'Capture entry evidence' };
@@ -2608,11 +3242,25 @@ export default function DashboardPage() {
         setMessage('Unable to load patrol sites right now. Check network/API and retry.');
         setOnline(navigator.onLine);
         authReadyRef.current = true;
+      } finally {
+        setDashboardBootstrapped(true);
       }
     }
 
     bootstrapSession();
   }, [router]);
+
+  useEffect(() => {
+    if (activeTab !== 'camera') return;
+    if (!dashboardBootstrapped) return;
+    if (!selectedSiteId) {
+      setCameraFeedRows([]);
+      setCameraFeedError('');
+      return;
+    }
+
+    refreshCameraFeedRows();
+  }, [activeTab, selectedSiteId, dashboardBootstrapped]);
 
   useEffect(() => {
     const handleOnline = () => setOnline(true);
@@ -2707,6 +3355,23 @@ export default function DashboardPage() {
   }, [selectedSiteId]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const storedMode = String(window.localStorage.getItem(WARDEN_CAMERA_FEED_VIEW_MODE_KEY) || '').trim().toLowerCase();
+    if (storedMode === 'card' || storedMode === 'table') {
+      setCameraFeedViewMode(storedMode);
+      return;
+    }
+
+    const prefersCard = window.matchMedia && window.matchMedia('(max-width: 900px)').matches;
+    setCameraFeedViewMode(prefersCard ? 'card' : 'table');
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(WARDEN_CAMERA_FEED_VIEW_MODE_KEY, cameraFeedViewMode === 'card' ? 'card' : 'table');
+  }, [cameraFeedViewMode]);
+
+  useEffect(() => {
     if (!isDemoModeEnabled()) return;
     if (!Array.isArray(sites) || sites.length === 0) return;
 
@@ -2725,6 +3390,52 @@ export default function DashboardPage() {
       saveStoredMobileCameraId(selectedMobileCameraId);
     }
   }, [selectedMobileCameraId]);
+
+  useEffect(() => {
+    const persist = async () => {
+      // Never clear storage before the initial restore has run — doing so erases
+      // persisted cards before loadQuickCaptureCards can read them (race on mount).
+      if (!captureCardsRestoredRef.current) return;
+
+      const minimal = (Array.isArray(captureCards) ? captureCards : [])
+        .slice(0, WARDEN_QUICK_CAPTURE_MAX)
+        .map((card) => sanitizeQuickCaptureCard(card));
+
+      if (minimal.length === 0) {
+        await clearQuickCaptureCards().catch(() => null);
+        return;
+      }
+
+      await saveQuickCaptureCards(minimal).catch(() => null);
+    };
+
+    persist();
+  }, [captureCards]);
+
+  useEffect(() => {
+    const validIds = new Set((Array.isArray(captureCards) ? captureCards : []).map((card) => card?.id).filter(Boolean));
+    setSelectedCaptureCardIds((current) => current.filter((id) => validIds.has(id)));
+  }, [captureCards]);
+
+  useEffect(() => {
+    if (!online) return;
+
+    const queue = (Array.isArray(captureCards) ? captureCards : [])
+      .filter((card) => String(card?.syncStatus || 'queued') === 'queued')
+      .filter((card) => {
+        const siteId = String(card?.siteId || selectedSiteId || '').trim();
+        const vrm = normalizeVrm(card?.plateText || '');
+        return Boolean(siteId && vrm);
+      })
+      .slice(0, 3);
+
+    if (queue.length === 0) return;
+
+    queue.forEach((card) => {
+      if (!card?.id) return;
+      syncQuickCaptureCard(card.id).catch(() => null);
+    });
+  }, [online, captureCards, selectedSiteId]);
 
   useEffect(() => {
     if (!Array.isArray(mobileCameras) || mobileCameras.length === 0) {
@@ -2826,6 +3537,21 @@ export default function DashboardPage() {
   }, [carcheckDialogOpen, carcheckSaveStatus, carcheckSaveNotice]);
 
   useEffect(() => {
+    if (!selectedSiteId || !Array.isArray(cameraFeedRows) || cameraFeedRows.length === 0) return;
+
+    const subset = cameraFeedRows.slice(0, 30);
+    subset.forEach((row) => {
+      if (!row?.vrm) return;
+      if (!row?.permitStatus) {
+        runCameraFeedPermitCheck(row.id, row.vrm);
+      }
+      if (!row?.carcheckStatus) {
+        runCameraFeedCarcheck(row.id, row.vrm);
+      }
+    });
+  }, [cameraFeedRows, selectedSiteId]);
+
+  useEffect(() => {
     if (typeof window === 'undefined') return;
     document.documentElement.classList.toggle('theme-light', !darkMode);
     window.localStorage.setItem('warden-theme', darkMode ? 'dark' : 'light');
@@ -2838,6 +3564,36 @@ export default function DashboardPage() {
       autoSubmitOnClosingCapture ? 'true' : 'false'
     );
   }, [autoSubmitOnClosingCapture]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = await loadQuickCaptureCards();
+        if (cancelled) return;
+        if (!Array.isArray(stored) || stored.length === 0) {
+          captureCardsRestoredRef.current = true;
+          return;
+        }
+
+        const restored = stored
+          .map((entry) => sanitizeQuickCaptureCard(entry))
+          .slice(0, WARDEN_QUICK_CAPTURE_MAX);
+
+        if (restored.length > 0) {
+          setCaptureCards(restored);
+        }
+      } catch (_) {
+        // Ignore malformed store payloads.
+      } finally {
+        captureCardsRestoredRef.current = true;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const vrm = normalizeVrm(selectedVrm);
@@ -3063,71 +3819,114 @@ export default function DashboardPage() {
     setCaptureStepperOpen(true);
   }
 
-  // Direct file-input capture: camera opens immediately, OCR runs per-card without wizard.
-  async function handleQuickCaptureInput(event) {
-    const file = event.target.files?.[0];
-    event.target.value = ''; // reset so same file can be retaken immediately
-    if (!file) return;
-
-    const capturedAt = await getServerTimestamp();
-    file.capturedAt = capturedAt;
-    // Unique card ID — the ONLY key used to update this card; prevents any cross-capture bleed.
-    const cardId = `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const effectiveSiteId = selectedSiteId;
-    const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
-
-    setCaptureCards((prev) => [{
-      id: cardId,
-      capturedAt,
-      plateText: '',
-      plateConfidence: 0,
-      cutoffImage: '',
-      vehiclePreview: '',
-      files: [file],
-      siteId: effectiveSiteId,
-      siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId || '',
-      scanning: true,
-    }, ...prev]);
-
-    // Preview generation — scoped to cardId, cannot overwrite another card.
-    fileToDataUrl(file).then((url) => {
-      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, vehiclePreview: url } : c));
-    }).catch(() => {});
-
-    // OCR — result is keyed to cardId before any setState call.
-    scanPlateFromImage(file).then((result) => {
-      const plate = normalizeVrm(result?.plateText || '');
-      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? {
-        ...c,
-        scanning: false,
-        plateText: plate,
-        plateConfidence: Number(result?.confidence || 0),
-        cutoffImage: result?.cutoffImage || '',
-      } : c));
-      if (plate && effectiveSiteId) {
-        runCardCarcheck(cardId, plate);
-        runCardPermit(cardId, plate, effectiveSiteId);
-      }
-    }).catch(() => {
-      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, scanning: false } : c));
-    });
-
-    // Re-open camera for next vehicle after a brief pause.
-    window.setTimeout(() => quickCaptureInputRef.current?.click(), 350);
+  function launchQuickScanCapture() {
+    if (!selectedSiteId) {
+      setMessage('Select patrol site before capture.');
+      return;
+    }
+    setCaptureIsQuickMode(true);
+    setCaptureStepperPhase('entry');
+    setCaptureStepperOpen(true);
   }
+
+  async function handleQuickCaptureComplete({ files = [], previews = [], scan = null } = {}) {
     const rawFiles = Array.isArray(files) ? files : [];
     if (rawFiles.length === 0) { setCaptureStepperOpen(false); return; }
+
+    // Close the capture sheet immediately so users land directly in VRM/permit
+    // confirmation without an intermediate scanning dialog state.
+    setCaptureStepperOpen(false);
 
     const fallbackTs = await getServerTimestamp();
     const firstFile = rawFiles[0];
     firstFile.capturedAt = normalizeCapturedAt(firstFile?.capturedAt) || fallbackTs;
     const capturedAt = firstFile.capturedAt;
 
-    // Stable card ID scoped to this exact capture invocation — prevents any cross-card bleed.
+    const detectedVrm = normalizeVrm(scan?.plateText || firstFile?.detectedPlateText || '');
+
+    // Show VRM confirmation dialog with image preview for user to review and edit.
+    // Prefer local previews returned by stepper capture so this stage does not depend
+    // on re-reading File objects again in WebView edge cases.
+    const safePreviews = (Array.isArray(previews) ? previews : [])
+      .map((value) => String(value || '').trim());
+    const vehicleFileIndex = rawFiles.findIndex((f) => !String(f?.name || '').toLowerCase().includes('plate_cutoff_'));
+    const vehicleFile = (vehicleFileIndex >= 0 ? rawFiles[vehicleFileIndex] : rawFiles[0]) || rawFiles[0];
+    const vehiclePreviewFromStepper = vehicleFileIndex >= 0 ? String(safePreviews[vehicleFileIndex] || '').trim() : '';
+    const anyVehiclePreviewFromStepper = safePreviews.find((value, index) => (
+      !String(rawFiles[index]?.name || '').toLowerCase().includes('plate_cutoff_')
+      && (/^data:image\//i.test(value) || /^blob:/i.test(value))
+    )) || '';
+
+    let previewUrl = String(
+      scan?.cutoffImage
+      || firstFile?.detectedPlateCutoffImage
+      || vehiclePreviewFromStepper
+      || anyVehiclePreviewFromStepper
+      || safePreviews[0]
+      || ''
+    ).trim();
+    if (!previewUrl && vehicleFile) {
+      try { previewUrl = await fileToDataUrl(vehicleFile); } catch (_) {}
+    }
+
+    const rawPreviews = await toPreviewSrcList(rawFiles);
+    const cameraRawRecords = buildCameraRawRecords(rawFiles, rawPreviews, {
+      phase: 'entry',
+      capturedAt,
+      source: 'WARDEN_QUICK_CAPTURE',
+    });
+
+    setCaptureConfirmDialog({ files: rawFiles, scan, capturedAt, previewUrl, cameraRawRecords });
+    setCaptureConfirmVrm(detectedVrm);
+    if (detectedVrm && detectedVrm.length >= 2) {
+      checkQuickCapturePermit(detectedVrm);
+    } else {
+      setCapturePermitCheck({ status: 'idle', hasPermit: false, checking: false, matchConfidence: null });
+    }
+  }
+
+  async function checkQuickCapturePermit(vrm) {
+    const normalizedVrm = normalizeVrm(vrm);
+    const effectiveSiteId = String(selectedSiteId || '').trim();
+    if (!normalizedVrm || !effectiveSiteId) {
+      setCapturePermitCheck({ status: 'idle', hasPermit: false, checking: false, matchConfidence: null });
+      return;
+    }
+
+    const requestId = capturePermitRequestRef.current + 1;
+    capturePermitRequestRef.current = requestId;
+    setCapturePermitCheck((prev) => ({ ...prev, checking: true }));
+
+    try {
+      const result = await checkAuthorization(normalizedVrm, effectiveSiteId);
+      if (capturePermitRequestRef.current !== requestId) return;
+      const hasPermit = Boolean(result?.hasAuthorization);
+      setCapturePermitCheck({
+        status: 'checked',
+        hasPermit,
+        checking: false,
+        matchConfidence: {
+          bestVrm: String(result?.matchConfidence?.bestVrm || '').trim(),
+          scorePercent: Number(result?.matchConfidence?.scorePercent || 0),
+          comparedCount: Number(result?.matchConfidence?.comparedCount || 0),
+        },
+      });
+    } catch (_) {
+      if (capturePermitRequestRef.current !== requestId) return;
+      setCapturePermitCheck({ status: 'error', hasPermit: false, checking: false, matchConfidence: null });
+    }
+  }
+
+  async function handleConfirmQuickCapture() {
+    if (!captureConfirmDialog) return;
+    const { files: rawFiles, scan, capturedAt, previewUrl, cameraRawRecords } = captureConfirmDialog;
+    const plateText = captureConfirmVrm;
+
+    setCaptureConfirmDialog(null);
+    setCaptureConfirmVrm('');
+    setCapturePermitCheck({ status: 'idle', hasPermit: false, checking: false, matchConfidence: null });
+
     const cardId = `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const plateText = normalizeVrm(scan?.plateText || firstFile?.detectedPlateText || '');
-    const plateConfidence = Number(scan?.confidence || firstFile?.detectedPlateConfidence || 0);
-    const cutoffImage = String(scan?.cutoffImage || firstFile?.detectedPlateCutoffImage || '');
     const effectiveSiteId = selectedSiteId;
     const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
 
@@ -3135,32 +3934,305 @@ export default function DashboardPage() {
       id: cardId,
       capturedAt,
       plateText,
-      plateConfidence,
-      cutoffImage,
-      vehiclePreview: '',
+      plateConfidence: Number(scan?.confidence || rawFiles[0]?.detectedPlateConfidence || 0),
+      cutoffImage: String(scan?.cutoffImage || rawFiles[0]?.detectedPlateCutoffImage || '').trim(),
+      vehiclePreview: previewUrl,
       files: rawFiles,
       siteId: effectiveSiteId,
       siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId || '',
+      syncStatus: 'queued',
+      syncProgress: 0,
+      syncError: '',
+      remoteImageUrls: [],
+      cameraRawData: Array.isArray(cameraRawRecords) ? cameraRawRecords : [],
     };
 
-    // Async preview — keyed to cardId so it can only update its own card.
-    const vehicleFile = rawFiles.find((f) => !String(f?.name || '').toLowerCase().includes('plate_cutoff_')) || rawFiles[0];
-    if (vehicleFile) {
-      fileToDataUrl(vehicleFile).then((url) => {
-        setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, vehiclePreview: url } : c));
-      }).catch(() => {});
+    setCaptureCards((prev) => [card, ...prev].slice(0, WARDEN_QUICK_CAPTURE_MAX));
+
+    if (online && effectiveSiteId && plateText) {
+      window.setTimeout(() => { syncQuickCaptureCard(cardId).catch(() => null); }, 160);
     }
 
-    // Functional update ensures no stale-closure overwrite from concurrent captures.
-    setCaptureCards((prev) => [card, ...prev]);
-    setCaptureStepperOpen(false);
-
-    // Brief pause, then re-open capture for the next vehicle.
+    // Reopen for next vehicle
     window.setTimeout(() => {
       setCaptureIsQuickMode(true);
       setCaptureStepperPhase('entry');
       setCaptureStepperOpen(true);
     }, 380);
+  }
+
+  async function syncQuickCaptureCard(cardId) {
+    if (!cardId) return;
+    if (quickCaptureSyncInFlightRef.current.has(cardId)) return;
+
+    const card = captureCards.find((entry) => entry.id === cardId);
+    if (!card) return;
+
+    const siteId = String(card.siteId || selectedSiteId || '').trim();
+    const vrm = normalizeVrm(card.plateText || '');
+    if (!siteId || !vrm) {
+      setCaptureCards((prev) => prev.map((entry) => (
+        entry.id === cardId
+          ? { ...entry, syncStatus: 'failed', syncError: 'Missing site or VRM for sync.' }
+          : entry
+      )));
+      return;
+    }
+
+    let sourceFiles = (Array.isArray(card.files) ? card.files : [])
+      .map((file, index) => coerceQuickCaptureFile(file, index, card?.capturedAt))
+      .filter(Boolean);
+
+    if (!sourceFiles.length) {
+      const recoveredEntryFiles = await recoverUploadableEvidenceFilesFromCameraRaw(
+        Array.isArray(card?.cameraRawData) ? card.cameraRawData : [],
+        'entry'
+      );
+      sourceFiles = recoveredEntryFiles
+        .map((file, index) => coerceQuickCaptureFile(file?.blob || file, index, card?.capturedAt))
+        .filter(Boolean);
+    }
+
+    if (!sourceFiles.length) {
+      sourceFiles = rebuildQuickCaptureFilesFromCard(card)
+        .map((file, index) => coerceQuickCaptureFile(file, index, card?.capturedAt))
+        .filter(Boolean);
+
+      if (sourceFiles.length) {
+        setCaptureCards((prev) => prev.map((entry) => (
+          entry.id === cardId ? { ...entry, files: sourceFiles } : entry
+        )));
+      }
+    }
+
+    if (!sourceFiles.length) {
+      setCaptureCards((prev) => prev.map((entry) => (
+        entry.id === cardId
+          ? { ...entry, syncStatus: 'failed', syncError: 'No local image files available. Recapture required.' }
+          : entry
+      )));
+      return;
+    }
+
+    setCaptureCards((prev) => prev.map((entry) => (
+      entry.id === cardId
+        ? { ...entry, syncStatus: 'syncing', syncProgress: 0, syncError: '' }
+        : entry
+    )));
+
+    quickCaptureSyncInFlightRef.current.add(cardId);
+    try {
+      let uploadedImages = [];
+      if (sourceFiles.length > 0) {
+        try {
+          const uploadResult = await uploadEvidenceFiles(sourceFiles, vrm, siteId, {
+            phase: 'entry',
+            requireAllSuccess: true,
+            onProgress: ({ status, completed, total }) => {
+              if (!total) return;
+              const ratio = Math.max(0, Math.min(1, Number(completed || 0) / Number(total || 1)));
+              const progress = Math.round(ratio * 100);
+              setCaptureCards((prev) => prev.map((entry) => (
+                entry.id === cardId
+                  ? { ...entry, syncStatus: 'syncing', syncProgress: progress }
+                  : entry
+              )));
+            },
+          });
+          uploadedImages = Array.isArray(uploadResult?.images) ? uploadResult.images : [];
+        } catch (uploadError) {
+          const fallbackRemoteImages = Array.isArray(card?.remoteImageUrls)
+            ? card.remoteImageUrls.filter((value) => /^https?:\/\//i.test(String(value || '').trim()))
+            : [];
+          if (fallbackRemoteImages.length === 0) throw uploadError;
+          uploadedImages = fallbackRemoteImages;
+        }
+      }
+
+      if (uploadedImages.length === 0) {
+        throw new Error('Upload returned no image URLs.');
+      }
+
+      // Prime camera gallery previews with local files so images appear immediately
+      // after sync instead of waiting on remote re-fetch/proxy round-trips.
+      try {
+        const localPreviews = await toPreviewSrcList(sourceFiles);
+        const previewByRemoteUrl = uploadedImages
+          .map((url, index) => ({
+            url: String(url || '').trim(),
+            preview: String(localPreviews[index] || '').trim(),
+          }))
+          .filter((entry) => /^https?:\/\//i.test(entry.url) && /^data:image\//i.test(entry.preview));
+
+        if (previewByRemoteUrl.length > 0) {
+          const merged = { ...cameraFeedPreviewCacheRef.current };
+          previewByRemoteUrl.forEach((entry) => {
+            merged[entry.url] = entry.preview;
+          });
+          cameraFeedPreviewCacheRef.current = merged;
+          setCameraFeedPreviewCache((current) => ({
+            ...current,
+            ...Object.fromEntries(previewByRemoteUrl.map((entry) => [entry.url, entry.preview])),
+          }));
+          await Promise.allSettled(previewByRemoteUrl.map((entry) => saveCameraFeedImagePreview(entry.url, entry.preview)));
+        }
+      } catch (_) {
+        // Continue sync even if preview priming fails.
+      }
+
+      // Ensure quick-capture uploads follow the same alarm ingestion route as other cameras.
+      // The card is only marked synced once relay-to-camera-service confirms acceptance.
+      const imagePairs = sourceFiles.map((file, index) => ({
+        file,
+        url: String(uploadedImages[index] || '').trim(),
+      }));
+      const plateImageUrl = imagePairs.find((entry) => isPlateCutoffFileArtifact(entry.file) && /^https?:\/\//i.test(entry.url))?.url
+        || (String(card?.cutoffImage || '').trim() && /^https?:\/\//i.test(String(card?.cutoffImage || '').trim()) ? String(card.cutoffImage).trim() : '');
+      const vehicleImageUrl = imagePairs.find((entry) => !isPlateCutoffFileArtifact(entry.file) && /^https?:\/\//i.test(entry.url))?.url
+        || uploadedImages.find((value) => /^https?:\/\//i.test(String(value || '').trim()))
+        || '';
+
+      // Call camera service directly — fetchJson routes through the website API
+      // base on native/APK which has no relay route, causing 404.
+      // Ensure ReadTime is sent as UTC ISO string with explicit timezone indicator to prevent
+      // camera service from misinterpreting the timestamp in different timezones.
+      const token = await resolveAuthToken();
+      const readTime = (card?.capturedAt || new Date().toISOString()).trim();
+      // Ensure 'Z' is present to indicate UTC (append if missing)
+      const readTimeUtc = /[zZ]|[+-]\d{2}:?\d{2}$/.test(readTime) ? readTime : `${readTime}Z`;
+      
+      const captureResult = await fetchCameraServiceJson('/api/warden/capture', {
+        method: 'POST',
+        token,
+        body: {
+          Registration: vrm,
+          ReadTime: readTimeUtc,
+          Direction: 'unknown',
+          PlateImage: plateImageUrl || null,
+          OverviewImage: vehicleImageUrl || null,
+          siteId,
+          site: String(card?.siteName || selectedSite?.name || selectedSite?.displayName || siteId).trim(),
+          wardenId: profile?.uid || profile?.id || '',
+          wardenEmail: profile?.email || '',
+          wardenName: profile?.displayName || profile?.name || (profile?.email || '').split('@')[0] || '',
+        },
+      });
+
+      if (!captureResult?.accepted) {
+        throw new Error('Camera service did not accept the capture.');
+      }
+
+      setCaptureCards((prev) => prev.map((entry) => (
+        entry.id === cardId
+          ? {
+            ...entry,
+            syncStatus: 'synced',
+            syncProgress: 100,
+            syncError: '',
+            remoteImageUrls: uploadedImages,
+            files: sourceFiles,
+            cameraRawData: enrichCameraRawRecordsWithUploadedUrls(
+              Array.isArray(entry?.cameraRawData) ? entry.cameraRawData : [],
+              uploadedImages,
+              'entry'
+            ),
+          }
+          : entry
+      )));
+          setMessage(`Capture ${vrm} synced and relayed (${uploadedImages.length} image${uploadedImages.length === 1 ? '' : 's'}).`);
+      refreshCameraFeedRows();
+      return true;
+    } catch (error) {
+      const reason = String(error?.message || 'Sync failed');
+      setCaptureCards((prev) => prev.map((entry) => (
+        entry.id === cardId
+          ? { ...entry, syncStatus: 'failed', syncError: reason }
+          : entry
+      )));
+      setMessage(`Capture sync failed: ${reason}`);
+      return false;
+    } finally {
+      quickCaptureSyncInFlightRef.current.delete(cardId);
+    }
+  }
+
+  function toggleCaptureCardSelection(id) {
+    if (!id) return;
+    setSelectedCaptureCardIds((current) => (
+      current.includes(id)
+        ? current.filter((entryId) => entryId !== id)
+        : [...current, id]
+    ));
+  }
+
+  function markFailedCaptureCardsForSync() {
+    const next = (Array.isArray(cameraTabCaptureCards) ? cameraTabCaptureCards : [])
+      .filter((card) => String(card?.syncStatus || 'queued') === 'failed')
+      .map((card) => card.id)
+      .filter(Boolean);
+    setSelectedCaptureCardIds(next);
+  }
+
+  function clearCaptureCardSelection() {
+    setSelectedCaptureCardIds([]);
+  }
+
+  async function syncSelectedCaptureCards() {
+    if (captureBulkSyncing) return;
+    if (!selectedCaptureCardIds.length) {
+      setMessage('Select camera captures to sync.');
+      return;
+    }
+
+    const selectedCards = (Array.isArray(captureCards) ? captureCards : [])
+      .filter((card) => selectedCaptureCardIds.includes(card.id));
+    const syncable = selectedCards.filter((card) => String(card?.syncStatus || 'queued') === 'failed');
+
+    if (syncable.length === 0) {
+      setMessage('Only failed captures can be retried.');
+      return;
+    }
+
+    setCaptureBulkSyncing(true);
+    try {
+      const results = await Promise.allSettled(syncable.map((card) => syncQuickCaptureCard(card.id)));
+      const okCount = results.filter((result) => result.status === 'fulfilled' && result.value === true).length;
+      const failedCount = syncable.length - okCount;
+
+      if (failedCount > 0) {
+        setMessage(`Bulk sync complete: ${okCount} synced, ${failedCount} failed.`);
+      } else {
+        setMessage(`Bulk sync complete: ${okCount} synced.`);
+      }
+    } finally {
+      setCaptureBulkSyncing(false);
+    }
+  }
+
+  function archiveCaptureCard(id) {
+    if (!id) return;
+    setCaptureCards((current) => (Array.isArray(current) ? current.filter((card) => card?.id !== id) : []));
+    setSelectedCaptureCardIds((current) => current.filter((entryId) => entryId !== id));
+  }
+
+  function archiveSelectedCaptureCards() {
+    if (!selectedCaptureCardIds.length) {
+      setMessage('Select captures to archive.');
+      return;
+    }
+
+    const selectedCount = selectedCaptureCardIds.length;
+    const confirmed = typeof window === 'undefined'
+      ? true
+      : window.confirm(`Archive ${selectedCount} selected capture${selectedCount === 1 ? '' : 's'} from camera tab queue?`);
+    if (!confirmed) return;
+
+    const toArchive = new Set(selectedCaptureCardIds);
+    setCaptureCards((current) => (Array.isArray(current)
+      ? current.filter((card) => !toArchive.has(card?.id))
+      : []));
+    setSelectedCaptureCardIds([]);
+    setMessage(`Archived ${toArchive.size} capture${toArchive.size === 1 ? '' : 's'} from camera tab queue.`);
   }
 
   async function runCardCarcheck(cardId, vrm) {
@@ -3598,6 +4670,7 @@ export default function DashboardPage() {
     const onProgress = typeof options?.onProgress === 'function' ? options.onProgress : null;
     const syncTrace = typeof options?.syncTrace === 'function' ? options.syncTrace : null;
     const phaseLabel = String(options?.phase || 'evidence');
+    const requireAllSuccess = Boolean(options?.requireAllSuccess);
     let completedUploads = 0;
 
     if (syncTrace) {
@@ -3738,6 +4811,8 @@ export default function DashboardPage() {
 
           const putResult = await uploadEvidenceBlobWithXhr({
             url: data?.url,
+            downloadUrl: data?.downloadUrl || null,
+            uploadHeaders: data?.uploadHeaders || null,
             blob,
             contentType,
             fileName,
@@ -3773,7 +4848,9 @@ export default function DashboardPage() {
           return {
             index,
             vrm: fallbackVrm || '',
-            images: putResult?.url ? [putResult.url] : (data?.url ? [String(data.url).split('?')[0]] : []),
+            images: putResult?.url
+              ? [putResult.url]
+              : (data?.downloadUrl ? [String(data.downloadUrl).trim()] : []),
           };
         } catch (signedUploadError) {
           lastError = signedUploadError;
@@ -3876,6 +4953,12 @@ export default function DashboardPage() {
       .find((value) => Boolean(value)) || fallbackVrm;
 
     const uploadedImages = fulfilled.flatMap((result) => (Array.isArray(result?.images) ? result.images : []));
+
+    if (requireAllSuccess && rejected.length > 0) {
+      const firstError = rejected[0];
+      const reason = String(firstError?.message || firstError || 'Upload failed');
+      throw new Error(`${phaseLabel} upload incomplete: ${fulfilled.length}/${uploadCandidates.length} file(s) uploaded. ${reason}`);
+    }
 
     if (syncTrace) {
       syncTrace('upload_batch_done', {
@@ -4489,14 +5572,15 @@ export default function DashboardPage() {
 
     const normalizedVrm = normalizeVrm(selectedVrm);
     const savedVehicleLookup = resolveVehicleDetailsForSubmission(normalizedVrm, selectedTracked?.payload || null);
+    const actorIdentity = resolveActorIdentity();
 
     const payload = stripCarcheckFromPayload({
       vrm: normalizedVrm,
       siteId: effectiveSiteId,
       siteName: effectiveSiteName || 'Site not set',
       source: 'WARDEN',
-      wardenId: profile?.uid,
-      actorId: profile?.uid,
+      wardenId: actorIdentity.uid,
+      actorId: actorIdentity.uid,
       contraventionReason: resolvedContraventionReason,
       status: 'QUEUED_FOR_QC',
       location: locationSnapshot || null,
@@ -4615,6 +5699,7 @@ export default function DashboardPage() {
     });
     const normalizedVrm = normalizeVrm(selectedVrm);
     const savedVehicleLookup = resolveVehicleDetailsForSubmission(normalizedVrm, selectedTracked?.payload || null);
+    const actorIdentity = resolveActorIdentity();
 
     const draftSiteId = String(selectedSiteId || selectedTracked?.payload?.siteId || '').trim();
     const draftSite = sites.find((site) => String(site.id) === draftSiteId) || null;
@@ -4625,8 +5710,8 @@ export default function DashboardPage() {
       siteId: draftSiteId,
       siteName: draftSiteName || 'Site not set',
       source: 'WARDEN',
-      wardenId: profile?.uid,
-      actorId: profile?.uid,
+      wardenId: actorIdentity.uid,
+      actorId: actorIdentity.uid,
       entryCaptureMode,
       contraventionReason: resolvedSelectedContraventionReason,
       status: 'DRAFT_OPEN',
@@ -4851,6 +5936,10 @@ export default function DashboardPage() {
       await refreshQueue();
 
       const token = await resolveAuthToken({ forceRefresh: forceRefreshTokenAtStart });
+      const actorIdentity = resolveActorIdentity();
+      if (!actorIdentity.uid) {
+        throw new Error('Missing warden identity. Re-login and retry sync.');
+      }
       const queuedSiteId = String(queuedItem?.payload?.siteId || selectedSiteId || '').trim();
       if (!queuedSiteId) {
         throw new Error('Assign a patrol site before syncing this Parking Charge.');
@@ -5060,11 +6149,21 @@ export default function DashboardPage() {
         previouslyFailedItem,
       });
       const hasRealLocalEvidencePair = evidenceDecision.hasRealLocalEvidencePair;
-      const shouldPreferStoredPayloadEvidence = evidenceDecision.shouldPreferStoredPayloadEvidence;
-      const shouldUploadLocalEvidence = evidenceDecision.shouldUploadLocalEvidence;
+      const reuseUploadedEvidence = Boolean(
+        queuedItem?.payload?.submissionEvidenceReady
+        && payloadEntryImages.length > 0
+        && payloadClosingImages.length > 0
+      );
+      const shouldPreferStoredPayloadEvidence = reuseUploadedEvidence
+        ? true
+        : evidenceDecision.shouldPreferStoredPayloadEvidence;
+      const shouldUploadLocalEvidence = reuseUploadedEvidence
+        ? false
+        : evidenceDecision.shouldUploadLocalEvidence;
 
       syncTrace('evidence_source_decision', {
         ...evidenceDecision,
+        reuseUploadedEvidence,
         payloadEntryCount: payloadEntryImages.length,
         payloadClosingCount: payloadClosingImages.length,
         deepPayloadCount: deepPayloadImages.length,
@@ -5110,6 +6209,7 @@ export default function DashboardPage() {
         try {
           entryEvidence = await uploadEvidenceFiles(entryUploadableFiles, queuedItem.payload.vrm, queuedSiteId, {
             phase: 'entry',
+            requireAllSuccess: true,
             syncTrace,
             onProgress: ({ status, completed, total }) => {
               if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
@@ -5117,7 +6217,7 @@ export default function DashboardPage() {
             },
           });
         } catch (error) {
-          if (!payloadEntryImages.length) throw error;
+          if (!payloadEntryImages.length || payloadEntryImages.length < entryUploadableFiles.length) throw error;
           console.warn('[warden] opening evidence upload failed, using stored payload evidence', {
             error: error?.message || String(error),
             storedCount: payloadEntryImages.length,
@@ -5179,6 +6279,7 @@ export default function DashboardPage() {
         try {
           closingEvidence = await uploadEvidenceFiles(closingUploadableFiles, queuedItem.payload.vrm, queuedSiteId, {
             phase: 'closing',
+            requireAllSuccess: true,
             syncTrace,
             onProgress: ({ status, completed, total }) => {
               if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
@@ -5186,7 +6287,7 @@ export default function DashboardPage() {
             },
           });
         } catch (error) {
-          if (!payloadClosingImages.length) throw error;
+          if (!payloadClosingImages.length || payloadClosingImages.length < closingUploadableFiles.length) throw error;
           console.warn('[warden] closing evidence upload failed, using stored payload evidence', {
             error: error?.message || String(error),
             storedCount: payloadClosingImages.length,
@@ -5393,8 +6494,8 @@ export default function DashboardPage() {
         status: 'QUEUED_FOR_QC',
         breachLifecycle: 'SUBMITTED',
         source: 'WARDEN',
-        wardenId: profile?.uid,
-        actorId: profile?.uid,
+        wardenId: actorIdentity.uid,
+        actorId: actorIdentity.uid,
         realExitObserved: true,
         breachEvidenceMode: 'paired_exit',
         savedVehicleLookup: vehicleDetails,
@@ -5413,17 +6514,50 @@ export default function DashboardPage() {
           return -1;
         }
       })();
+      const breachSubmitPayload = {
+        ...breachPayload,
+      };
+      // cameraRawData is only used locally for draft/session recovery and can grow large.
+      // Excluding it from backend submit avoids oversized request payloads and sync timeouts.
+      delete breachSubmitPayload.cameraRawData;
+      const submitPayloadBytes = (() => {
+        try {
+          return JSON.stringify(breachSubmitPayload).length;
+        } catch (_) {
+          return -1;
+        }
+      })();
       console.log('[warden] wardencapture payload summary', {
         itemId,
         imageCount: allEvidenceImages.length,
         cameraRawCount: Array.isArray(cameraRawDataForSubmission) ? cameraRawDataForSubmission.length : 0,
         payloadBytes,
+        submitPayloadBytes,
       });
       syncTrace('submission_payload_ready', {
         imageCount: allEvidenceImages.length,
         entryUploadedCount: Array.isArray(entryEvidence?.images) ? entryEvidence.images.length : 0,
         closingUploadedCount: Array.isArray(closingEvidence?.images) ? closingEvidence.images.length : 0,
         payloadBytes,
+        submitPayloadBytes,
+      });
+
+      // Persist uploaded evidence URLs before Stage 4 submit so retries/fallbacks reuse them
+      // and never restart opening/closing image uploads from scratch.
+      await updateQueueItem(itemId, {
+        updatedAt: new Date().toISOString(),
+        payload: {
+          ...submissionSafePayload,
+          ...breachPayload,
+          images: allEvidenceImages,
+          imageUrls: allEvidenceImages,
+          submissionEvidenceReady: true,
+          stage4PreparedAt: new Date().toISOString(),
+        },
+      });
+      syncTrace('submission_evidence_persisted', {
+        imageCount: allEvidenceImages.length,
+        reuseOnRetry: true,
       });
 
       // Relay entry + closing observations to camera service breach engine (fire-and-forget).
@@ -5468,13 +6602,125 @@ export default function DashboardPage() {
         message: 'Step 4/4: Submitting breach to backend',
       });
 
-      const breachResult = await fetchJson('/api/breaches/wardencapture', {
+      const submissionUrl = buildApiUrl('/api/breaches/wardencapture');
+      const submissionUrlLabel = String(submissionUrl || '').trim();
+      appendSyncProgressLog(`Stage 4 request target: ${submissionUrlLabel || 'unresolved API URL'}`, 'info');
+      syncTrace('submission_target_selected', {
+        requestUrl: submissionUrlLabel,
         method: 'POST',
-        token,
         timeoutMs: 180000,
-        body: breachPayload,
-        signal: syncAbortController.signal,
       });
+
+      const formatSubmissionTraceLabel = (traceEvent) => {
+        const stage = String(traceEvent?.stage || 'unknown');
+        const status = Number(traceEvent?.status || 0) || null;
+        const urlLabel = String(traceEvent?.url || traceEvent?.toUrl || '').trim();
+
+        if (stage === 'request_start') return `Stage 4 request_start [${traceEvent?.nativeCandidate ? 'native' : 'fetch'}] ${urlLabel}`;
+        if (stage === 'native_request_start') {
+          const connectTimeoutMs = Number(traceEvent?.connectTimeoutMs || 0) || 0;
+          const readTimeoutMs = Number(traceEvent?.readTimeoutMs || 0) || 0;
+          return `Stage 4 native_request_start ${urlLabel} connect=${connectTimeoutMs || 'auto'}ms read=${readTimeoutMs || 'auto'}ms`;
+        }
+        if (stage === 'native_response') return `Stage 4 native_response status=${status || 'n/a'}`;
+        if (stage === 'native_redirect') return `Stage 4 native_redirect status=${status || 'n/a'} -> ${String(traceEvent?.toUrl || '').trim()}`;
+        if (stage === 'native_request_error') return `Stage 4 native_request_error status=${status || 'n/a'} msg=${String(traceEvent?.message || '').trim()}`;
+        if (stage === 'native_timeout') return `Stage 4 native_timeout ${Number(traceEvent?.timeoutMs || 0) || 0}ms`;
+        if (stage === 'native_retry_start') return 'Stage 4 native_retry_start';
+        if (stage === 'native_retry_error') return `Stage 4 native_retry_error status=${status || 'n/a'} msg=${String(traceEvent?.message || '').trim()}`;
+        if (stage === 'native_fallback_to_fetch') return `Stage 4 native_fallback_to_fetch msg=${String(traceEvent?.message || '').trim()}`;
+        if (stage === 'request_timeout') return `Stage 4 request_timeout ${Number(traceEvent?.timeoutMs || 0) || 0}ms`;
+        if (stage === 'request_response') return `Stage 4 request_response status=${status || 'n/a'}`;
+        if (stage === 'request_error_status') return `Stage 4 request_error_status status=${status || 'n/a'} msg=${String(traceEvent?.message || '').trim()}`;
+        if (stage === 'request_success') return `Stage 4 request_success status=${status || 'ok'} transport=${String(traceEvent?.transport || 'unknown')}`;
+
+        return `Stage 4 ${stage}`;
+      };
+
+      const handleSubmissionTrace = (traceEvent) => {
+        const label = formatSubmissionTraceLabel(traceEvent);
+        if (!label) return;
+        const stage = String(traceEvent?.stage || '');
+        const isErrorStage = stage.includes('error') || stage.includes('timeout');
+        appendSyncProgressLog(label, isErrorStage ? 'error' : 'info');
+        syncTrace('submission_transport_trace', {
+          ...traceEvent,
+          label,
+        });
+      };
+
+      const stage4RequestStartedAt = Date.now();
+      appendSyncProgressLog('Stage 4 request_dispatched', 'info');
+      let stage4HeartbeatId = null;
+      if (typeof window !== 'undefined' && typeof window.setInterval === 'function') {
+        stage4HeartbeatId = window.setInterval(() => {
+          const elapsedSeconds = Math.floor((Date.now() - stage4RequestStartedAt) / 1000);
+          appendSyncProgressLog(`Stage 4 in-flight ${elapsedSeconds}s`, 'info');
+        }, 10000);
+      }
+
+      // Keep the full evidence payload intact. The transport fix is separate from payload content.
+      const submissionRequestBody = {
+        ...breachSubmitPayload,
+        notes: breachSubmitPayload.notes || breachSubmitPayload.manualNote || '',
+      };
+
+      const submissionRequestBodyBytes = (() => {
+        try {
+          return JSON.stringify(submissionRequestBody).length;
+        } catch (_) {
+          return -1;
+        }
+      })();
+      const submissionRequestBodyKeys = Object.keys(submissionRequestBody);
+      const submissionRequestFieldSizes = Object.fromEntries(
+        ['imageUrls', 'evidence', 'closingEvidence', 'vehicleDetails', 'authorization'].map((key) => {
+          const value = submissionRequestBody[key];
+          let size = 0;
+          if (value === undefined || value === null) {
+            size = 0;
+          } else if (typeof value === 'string') {
+            size = value.length;
+          } else {
+            try {
+              size = JSON.stringify(value).length;
+            } catch (_) {
+              size = -1;
+            }
+          }
+          return [key, size];
+        })
+      );
+      appendSyncProgressLog(`Stage 4 request body ${submissionRequestBodyBytes} bytes`, 'info');
+      appendSyncProgressLog(`Stage 4 request body keys (${submissionRequestBodyKeys.length}): ${submissionRequestBodyKeys.join(', ')}`, 'info');
+      appendSyncProgressLog(`Stage 4 field sizes imageUrls=${submissionRequestFieldSizes.imageUrls}, evidence=${submissionRequestFieldSizes.evidence}, closingEvidence=${submissionRequestFieldSizes.closingEvidence}, vehicleDetails=${submissionRequestFieldSizes.vehicleDetails}, authorization=${submissionRequestFieldSizes.authorization}`, 'info');
+      syncTrace('submission_request_body_prepared', {
+        bytes: submissionRequestBodyBytes,
+        keyCount: submissionRequestBodyKeys.length,
+        keys: submissionRequestBodyKeys,
+        fieldSizes: submissionRequestFieldSizes,
+      });
+
+      let breachResult;
+      try {
+        breachResult = await fetchJson(submissionUrl, {
+          method: 'POST',
+          token,
+          timeoutMs: 180000,
+          nativeRequestTimeoutMs: 45000,
+          nativeConnectTimeoutMs: 12000,
+          nativeReadTimeoutMs: 45000,
+          body: submissionRequestBody,
+          signal: syncAbortController.signal,
+          onTrace: handleSubmissionTrace,
+        });
+      } finally {
+        if (stage4HeartbeatId) {
+          window.clearInterval(stage4HeartbeatId);
+        }
+        const elapsedSeconds = Math.floor((Date.now() - stage4RequestStartedAt) / 1000);
+        appendSyncProgressLog(`Stage 4 request_settled after ${elapsedSeconds}s`, 'info');
+      }
 
       const breachId = breachResult?.id || breachResult?.breachId || queuedItem?.payload?.breachId || '';
       syncTrace('sync_success', {
@@ -5561,6 +6807,7 @@ export default function DashboardPage() {
       syncTrace('sync_failed', {
         errorName,
         errorMessage,
+        errorStatus,
       });
       setSyncProgressMeta((current) => ({
         ...current,
@@ -5837,6 +7084,95 @@ export default function DashboardPage() {
     if (failedCount > 0) {
       setMessage(`Queue sync completed with ${failedCount} failed item${failedCount === 1 ? '' : 's'}.`);
     }
+  }
+
+  function toggleQueueSelection(id) {
+    if (!id) return;
+    setSelectedQueueIds((current) => (
+      current.includes(id)
+        ? current.filter((entryId) => entryId !== id)
+        : [...current, id]
+    ));
+  }
+
+  function selectAllQueueCandidates() {
+    setSelectedQueueIds(syncCandidates.map((item) => item.id).filter(Boolean));
+  }
+
+  function clearQueueSelection() {
+    setSelectedQueueIds([]);
+  }
+
+  async function retrySelectedQueueItems() {
+    if (!selectedQueueIds.length) {
+      setMessage('Select queued items to retry.');
+      return;
+    }
+
+    const selectedItems = syncCandidates.filter((item) => selectedQueueIds.includes(item.id));
+    const retryable = selectedItems.filter((item) => item.status !== 'syncing');
+
+    if (!retryable.length) {
+      setMessage('Selected items are currently syncing.');
+      return;
+    }
+
+    const results = await Promise.allSettled(retryable.map((item) => syncQueueItem(item.id)));
+    const okCount = results.filter((result) => result.status === 'fulfilled' && result.value?.ok).length;
+    const failedCount = retryable.length - okCount;
+
+    const failedIds = retryable
+      .filter((_, index) => {
+        const result = results[index];
+        return result.status !== 'fulfilled' || !result.value?.ok;
+      })
+      .map((item) => item.id);
+
+    setSelectedQueueIds(failedIds);
+    setMessage(`Bulk retry complete: ${okCount} sent, ${failedCount} failed.`);
+  }
+
+  async function archiveSelectedQueueItems() {
+    if (!selectedQueueIds.length) {
+      setMessage('Select queued items to archive.');
+      return;
+    }
+
+    const selectedItems = syncCandidates.filter((item) => selectedQueueIds.includes(item.id));
+    if (!selectedItems.length) {
+      setMessage('Selected items are no longer in queue.');
+      setSelectedQueueIds([]);
+      return;
+    }
+
+    const confirmed = typeof window === 'undefined'
+      ? true
+      : window.confirm(`Archive ${selectedItems.length} selected item${selectedItems.length === 1 ? '' : 's'}?`);
+    if (!confirmed) return;
+
+    await Promise.all(selectedItems.map(async (item) => {
+      const controller = syncAbortControllersRef.current.get(item.id);
+      if (controller) {
+        controller.abort(new DOMException('Archive by user', 'AbortError'));
+      }
+      syncAbortControllersRef.current.delete(item.id);
+      await updateQueueItem(item.id, {
+        archived: true,
+        status: 'archived',
+        lastError: 'Archived by warden',
+        updatedAt: new Date().toISOString(),
+      });
+    }));
+
+    if (selectedTrackedId && selectedQueueIds.includes(selectedTrackedId)) {
+      setSelectedTrackedId('');
+      setDetailMessage('');
+    }
+
+    setSelectedQueueIds([]);
+    await refreshQueue();
+    setActiveTab('archive');
+    setMessage(`Archived ${selectedItems.length} queued item${selectedItems.length === 1 ? '' : 's'}.`);
   }
 
   async function handleArchiveTracked(id) {
@@ -6379,7 +7715,7 @@ export default function DashboardPage() {
             aria-label="Open settings"
             title="Settings"
           >
-            ⚙
+            <IconSettings className="header-settings-icon" />
           </button>
           <button type="button" className="header-logout-btn" onClick={handleLogout}>
             Sign out
@@ -6468,7 +7804,7 @@ export default function DashboardPage() {
           {/* Session cards */}
           {filteredBreaches.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">🚗</div>
+              <div className="empty-icon"><IconSessions size={36} /></div>
               <p className="empty-title">No parking charges yet</p>
               <p className="empty-hint">Tap <strong>+</strong> to create a Draft Parking Charge</p>
             </div>
@@ -6837,7 +8173,7 @@ export default function DashboardPage() {
                     className="evidence-capture-btn"
                     onClick={() => openCaptureDialog('entry')}
                   >
-                    <span className="evidence-capture-icon">📷</span>
+                    <IconCamera className="evidence-capture-icon" />
                     <span>Capture entry</span>
                   </button>
                 )}
@@ -6906,7 +8242,7 @@ export default function DashboardPage() {
                     className="evidence-capture-btn"
                     onClick={() => openCaptureDialog('closing')}
                   >
-                    <span className="evidence-capture-icon">📷</span>
+                    <IconCamera className="evidence-capture-icon" />
                     <span>Capture closing</span>
                   </button>
                 )}
@@ -6920,7 +8256,8 @@ export default function DashboardPage() {
             {/* Capture closing evidence */}
             {entryFiles.length > 0 && closingFiles.length === 0 ? (
               <button type="button" className="action-btn action-btn--primary" onClick={() => openCaptureDialog('closing')}>
-                📷 Capture closing evidence
+                <IconCamera className="cta-inline-icon" />
+                Capture closing evidence
               </button>
             ) : null}
 
@@ -6951,7 +8288,9 @@ export default function DashboardPage() {
                       {convertLoading
                         ? (submissionProgressText || 'Submitting...')
                         : (pcnSubmissionGate.ready
-                          ? (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')
+                          ? (selectedTracked?.payload?.breachId
+                            ? <><IconClipboard className="cta-inline-icon" />Submit PCN to backend</>
+                            : <><IconClipboard className="cta-inline-icon" />Sync and submit PCN</>)
                           : 'Checks required before submit')}
                     </button>
                   </div>
@@ -6993,7 +8332,8 @@ export default function DashboardPage() {
                   style={{ marginTop: 8 }}
                   onClick={() => handleDeleteArchived(selectedTracked.id)}
                 >
-                  🗑 Delete from archive
+                  <IconTrash className="cta-inline-icon" />
+                  Delete from archive
                 </button>
               </>
             ) : (
@@ -7002,7 +8342,8 @@ export default function DashboardPage() {
                 className="action-btn action-btn--danger"
                 onClick={() => handleArchiveTracked(selectedTracked.id)}
               >
-                🗄 Archive session
+                <IconArchive className="cta-inline-icon" />
+                Archive session
               </button>
             )}
           </div>
@@ -7040,9 +8381,59 @@ export default function DashboardPage() {
               </div>
             </div>
 
+            {syncCandidates.length > 0 ? (
+              <div className="queue-bulk-toolbar">
+                <div className="queue-bulk-toolbar__left">
+                  <span className="queue-bulk-count">
+                    {selectedQueueIds.length > 0
+                      ? `${selectedQueueIds.length} selected`
+                      : `${syncCandidates.length} in queue`}
+                  </span>
+                  <button
+                    type="button"
+                    className="action-btn action-btn--secondary"
+                    style={{ fontSize: 12, padding: '4px 10px' }}
+                    onClick={selectAllQueueCandidates}
+                    disabled={selectedQueueIds.length === syncCandidates.length}
+                  >
+                    Select all
+                  </button>
+                  <button
+                    type="button"
+                    className="action-btn action-btn--secondary"
+                    style={{ fontSize: 12, padding: '4px 10px' }}
+                    onClick={clearQueueSelection}
+                    disabled={selectedQueueIds.length === 0}
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div className="queue-bulk-toolbar__right">
+                  <button
+                    type="button"
+                    className="action-btn action-btn--secondary"
+                    style={{ fontSize: 12, padding: '4px 10px' }}
+                    onClick={retrySelectedQueueItems}
+                    disabled={selectedQueueIds.length === 0 || syncing}
+                  >
+                    Retry selected
+                  </button>
+                  <button
+                    type="button"
+                    className="action-btn action-btn--danger"
+                    style={{ fontSize: 12, padding: '4px 10px' }}
+                    onClick={archiveSelectedQueueItems}
+                    disabled={selectedQueueIds.length === 0}
+                  >
+                    Archive selected
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
             {syncCandidates.length === 0 ? (
               <div className="empty-state">
-                <div className="empty-icon">✓</div>
+                <div className="empty-icon"><IconCheckCircle size={36} /></div>
                 <p className="empty-title">All synced</p>
                 <p className="empty-hint">No pending items</p>
               </div>
@@ -7050,8 +8441,17 @@ export default function DashboardPage() {
               <div className="sessions-list">
                 {syncCandidates.map(item => {
                   const lcKey = (item.lifecycle?.code || 'unknown').toLowerCase().replace(/_/g, '-');
+                  const selected = selectedQueueIds.includes(item.id);
                   return (
-                    <article key={item.id} className="session-card">
+                    <article key={item.id} className={`session-card queue-session-card ${selected ? 'queue-session-card--selected' : ''}`}>
+                      <label className="queue-select-checkbox" aria-label={`Select ${item.vrm || 'item'}`}>
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleQueueSelection(item.id)}
+                        />
+                        <span />
+                      </label>
                       <div className="sc-left">
                         <div className="sc-plate">{item.vrm}</div>
                         <div className="sc-site">{item.siteName}</div>
@@ -7160,7 +8560,7 @@ export default function DashboardPage() {
             </div>
             {archivedBreaches.length === 0 ? (
               <div className="empty-state">
-                <div className="empty-icon">🗄</div>
+                <div className="empty-icon"><IconArchive size={36} /></div>
                 <p className="empty-title">No archived PCNs</p>
                 <p className="empty-hint">Submitted and archived charges will appear here.</p>
               </div>
@@ -7244,7 +8644,7 @@ export default function DashboardPage() {
 
             {mobileCamerasByAvailability.length === 0 ? (
               <div className="empty-state" style={{ padding: '20px 12px' }}>
-                <div className="empty-icon">🚐</div>
+                <div className="empty-icon"><IconMobile size={36} /></div>
                 <p className="empty-title">No mobile cameras found</p>
                 <p className="empty-hint">Flag a camera as mobile in camera management first.</p>
               </div>
@@ -7359,335 +8759,460 @@ export default function DashboardPage() {
             </select>
           </div>
 
-          {/* ── Quick-capture: hidden file input opens camera directly ─── */}
-          <input
-            ref={quickCaptureInputRef}
-            type="file"
-            accept="image/*"
-            capture="environment"
-            style={{ display: 'none' }}
-            onChange={handleQuickCaptureInput}
-          />
           <button
             type="button"
             className="quick-capture-cta"
-            onClick={() => quickCaptureInputRef.current?.click()}
+            onClick={launchQuickScanCapture}
           >
-            <span className="quick-capture-icon">📷</span>
+            <IconCamera className="quick-capture-icon" />
             <span className="quick-capture-label">Capture vehicle</span>
           </button>
 
-          {/* ── Session capture cards ────────────────────────────── */}
-          {captureCards.length > 0 ? (
-            <div className="capture-cards-section">
-              <div className="capture-cards-header">
-                <span>This session — {captureCards.length} capture{captureCards.length !== 1 ? 's' : ''}</span>
-                <button type="button" className="capture-cards-clear" onClick={() => { setCaptureCards([]); setCaptureCardChecks({}); }}>Clear all</button>
-              </div>
-              {captureCards.map((card) => {
-                const cc = captureCardChecks[card.id] || {};
-                const draftCode = draftByVrmForCapture[normalizeVrm(card.plateText)] || null;
-                const hasPcn = draftCode === 'CONVERTED' || draftCode === 'SUBMITTED';
-                return (
-                  <div key={card.id} className={`capture-card ${cc.permitStatus === 'has_permit' ? 'capture-card--permitted' : cc.permitStatus === 'no_permit' ? 'capture-card--actionable' : ''}`}>
-                    <div className="capture-card-left">
-                      {(card.vehiclePreview || card.cutoffImage) ? (
-                        <img
-                          src={card.vehiclePreview || card.cutoffImage}
-                          alt={card.plateText || 'Capture'}
-                          className="capture-card-thumb"
-                          onClick={() => openImageDetailDialog({ src: card.vehiclePreview || card.cutoffImage, label: card.plateText || 'Capture', capturedAt: card.capturedAt })}
-                        />
-                      ) : (
-                        <div className="capture-card-thumb capture-card-thumb--empty">📷</div>
-                      )}
-                    </div>
-                    <div className="capture-card-body">
-                      <div className="capture-card-plate">
-                        {card.plateText
-                          ? <><strong>{card.plateText}</strong>{card.plateConfidence > 0 ? <span className="capture-card-conf">{card.plateConfidence}%</span> : null}</>
-                          : <span className="capture-card-noplate">No plate detected</span>}
-                      </div>
-                      <div className="capture-card-meta">
-                        <span>{formatLocalTimestamp(card.capturedAt)}</span>
-                        {card.siteName ? <span> · {card.siteName}</span> : null}
-                      </div>
-                      {/* Permit badge */}
-                      <div className="capture-card-badges">
-                        {cc.permitStatus === 'checking' && <span className="wf-badge wf-badge--grey">Checking…</span>}
-                        {cc.permitStatus === 'has_permit' && <span className="wf-badge wf-badge--amber">⚠ Permitted</span>}
-                        {cc.permitStatus === 'no_permit' && <span className="wf-badge wf-badge--green">✓ No permit</span>}
-                        {cc.permitStatus === 'error' && <span className="wf-badge wf-badge--grey">Permit error</span>}
-                        {cc.carcheckStatus === 'ok' && cc.carcheckDetails && (
-                          <span className="wf-badge wf-badge--blue">
-                            {[cc.carcheckDetails.make, cc.carcheckDetails.color].filter(Boolean).join(' ') || 'OK'}
-                          </span>
-                        )}
-                        {cc.carcheckStatus === 'not_found' && <span className="wf-badge wf-badge--grey">Not found</span>}
-                        {draftCode && !hasPcn && <span className={`wf-badge wf-badge--draft-${draftCode.toLowerCase().replace('_', '-')}`}>{draftCode.replace('_', ' ')}</span>}
-                        {hasPcn && <span className="wf-badge wf-badge--submitted">PCN issued</span>}
-                      </div>
-                      <div className="capture-card-actions">
-                        <button type="button" className="wf-btn wf-btn--check" disabled={cc.carcheckStatus === 'checking'} onClick={() => runCardCarcheck(card.id, card.plateText)}>
-                          {cc.carcheckStatus === 'checking' ? '…' : 'Carcheck'}
-                        </button>
-                        <button type="button" className="wf-btn wf-btn--check" disabled={cc.permitStatus === 'checking' || !selectedSiteId} onClick={() => runCardPermit(card.id, card.plateText, card.siteId || selectedSiteId)} title={!selectedSiteId ? 'Select a site first' : 'e-Permit check'}>
-                          {cc.permitStatus === 'checking' ? '…' : 'e-Permit'}
-                        </button>
-                        {!hasPcn ? (
-                          <button
-                            type="button"
-                            className={`wf-btn ${cc.permitStatus === 'has_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
-                            title={cc.permitStatus === 'has_permit' ? 'Vehicle has a permit — issue PCN only if another rule was breached' : 'Start Draft PCN'}
-                            onClick={async () => {
-                              if (!card.plateText) { setMessage('No plate text — enter VRM manually after creating draft.'); }
-                              const entryTime = card.capturedAt || new Date().toISOString();
-                              const vehicleDetails = cc.carcheckDetails?.make ? cc.carcheckDetails : null;
-                              const item = createQueueItem({
-                                payload: {
-                                  vrm: card.plateText || '',
-                                  siteId: card.siteId || selectedSiteId,
-                                  siteName: card.siteName || (sites.find((s) => String(s.id) === selectedSiteId)?.name) || '',
-                                  source: 'WARDEN',
-                                  breachLifecycle: 'DRAFT_OPEN',
-                                  status: 'DRAFT_OPEN',
-                                  entryCaptureMode: 'scan',
-                                  observationStartTime: entryTime,
-                                  entryCapturedAt: entryTime,
-                                  detectedEntryVehicleImage: card.vehiclePreview || '',
-                                  startVehicleImage: card.vehiclePreview || '',
-                                  detectedEntryPlateCutoffImage: card.cutoffImage || '',
-                                  detectedEntryPlateText: card.plateText || '',
-                                  detectedEntryPlateConfidence: card.plateConfidence || 0,
-                                  authorization: cc.permitData || null,
-                                  savedVehicleLookup: vehicleDetails,
-                                  vehicleDetails,
-                                  contraventionReason: contraventions[0]?.label || '',
-                                  selectedContraventionCode: contraventions[0]?.code || '',
-                                  cameraRawData: [],
-                                },
-                                files: card.files.map((f) => ({ name: f.name, type: f.type, blob: f, phase: 'entry' })),
-                              });
-                              item.status = 'draft';
-                              await saveQueueItem(item);
-                              await refreshQueue();
-                              setSelectedTrackedId(item.id);
-                              setActiveTab('tracked');
-                              handleReviewTracked(item);
-                            }}
-                          >
-                            + Draft PCN
-                          </button>
-                        ) : (
-                          <span className="wf-btn wf-btn--issued">PCN issued</span>
-                        )}
-                      </div>
-                    </div>
+          {/* ── Camera service feed (compact gallery table) ── */}
+          <div className="camera-feed-section">
+            <div className="camera-feed-toolbar">
+              <div className="camera-feed-toolbar-top">
+                <span className="camera-feed-title">Camera data gallery</span>
+                {cameraTabCaptureCards.length > 0 ? (
+                  <div className="camera-feed-toolbar-bulk">
+                    <span className="camera-feed-inline-count">
+                      {selectedCaptureCardIds.length > 0
+                        ? `${selectedCaptureCardIds.length} selected`
+                        : `${cameraTabCaptureCards.length} pending`}
+                    </span>
+                    <button type="button" className="camera-feed-local-queue__btn" onClick={markFailedCaptureCardsForSync}>Failed</button>
+                    <button type="button" className="camera-feed-local-queue__btn" onClick={syncSelectedCaptureCards} disabled={selectedCaptureCardIds.length === 0 || captureBulkSyncing}>Retry failed</button>
+                    <button type="button" className="camera-feed-local-queue__btn camera-feed-local-queue__btn--danger" onClick={archiveSelectedCaptureCards} disabled={selectedCaptureCardIds.length === 0 || captureBulkSyncing}>Archive</button>
+                    <button type="button" className="camera-feed-local-queue__btn camera-feed-local-queue__btn--ghost" onClick={clearCaptureCardSelection} disabled={selectedCaptureCardIds.length === 0}>Clear</button>
                   </div>
-                );
-              })}
-            </div>
-          ) : null}
+                ) : null}
+              </div>
 
-          {/* ── Camera service feed (already relayed to breach engine) ── */}
-          <WardenCaptureFeed
-            getToken={resolveAuthToken}
-            selectedSiteId={selectedSiteId}
-            sites={sites}
-            queueItems={queueItems}
-            contraventions={contraventions}
-            onStartDraft={async ({ vrm, vehicleImage, plateImage, timestamp, siteId, carcheckDetails, permitData }) => {
-              const entryTime = timestamp || new Date().toISOString();
-              const effectiveSiteId = siteId || selectedSiteId || '';
-              const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
-              const vehicleDetails = carcheckDetails
-                ? { make: carcheckDetails.make, model: carcheckDetails.model, color: carcheckDetails.color, yearOfManufacture: carcheckDetails.yearOfManufacture }
-                : null;
-              const item = createQueueItem({
-                payload: {
-                  vrm,
-                  siteId: effectiveSiteId,
-                  siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId,
-                  source: 'WARDEN',
-                  breachLifecycle: 'DRAFT_OPEN',
-                  status: 'DRAFT_OPEN',
-                  entryCaptureMode: 'manual',
-                  observationStartTime: entryTime,
-                  entryCapturedAt: entryTime,
-                  detectedEntryVehicleImage: vehicleImage || '',
-                  startVehicleImage: vehicleImage || '',
-                  detectedEntryPlateCutoffImage: plateImage || '',
-                  authorization: permitData || null,
-                  savedVehicleLookup: vehicleDetails || null,
-                  vehicleDetails: vehicleDetails || null,
-                  contraventionReason: contraventions[0]?.label || '',
-                  selectedContraventionCode: contraventions[0]?.code || '',
-                  cameraRawData: [],
-                },
-                files: [],
-              });
-              item.status = 'draft';
-              await saveQueueItem(item);
-              await refreshQueue();
-              setSelectedTrackedId(item.id);
-              setActiveTab('tracked');
-              handleReviewTracked(item);
-              setMessage(`Draft PCN started for ${vrm} from camera feed.`);
-            }}
-          />
-        </main>
-      ) : null}
-              {cameraRawFeed.length > 0 ? (
-                <div className="camera-raw-view-toggle" role="group" aria-label="Camera raw view mode">
+              <div className="camera-feed-toolbar-actions">
+                <div className="camera-feed-filter-group">
+                  <input
+                    className="camera-feed-filter"
+                    type="text"
+                    value={cameraFeedVrmFilter}
+                    onChange={(event) => setCameraFeedVrmFilter(normalizeVrm(event.target.value))}
+                    placeholder="Search VRM"
+                    maxLength={10}
+                  />
+                  {cameraFeedVrmFilter ? (
+                    <button
+                      type="button"
+                      className="camera-feed-filter-clear"
+                      onClick={() => setCameraFeedVrmFilter('')}
+                      title="Clear VRM filter"
+                    >
+                      Clear
+                    </button>
+                  ) : null}
                   <button
                     type="button"
-                    className={`camera-raw-view-btn ${cameraRawViewMode === 'grid' ? 'camera-raw-view-btn--active' : ''}`}
-                    onClick={() => setCameraRawViewMode('grid')}
+                    className="camera-feed-refresh"
+                    onClick={refreshCameraFeedRows}
+                    disabled={cameraFeedLoading}
+                    title="Refresh camera feed"
                   >
-                    Grid
+                    <IconRefresh className="camera-feed-refresh-icon" />
                   </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="camera-feed-toggle-row">
+                <div className="camera-feed-view-toggle" role="group" aria-label="Camera feed view mode">
                   <button
                     type="button"
-                    className={`camera-raw-view-btn ${cameraRawViewMode === 'list' ? 'camera-raw-view-btn--active' : ''}`}
-                    onClick={() => setCameraRawViewMode('list')}
+                    className={`camera-feed-view-btn ${cameraFeedViewMode === 'table' ? 'camera-feed-view-btn--active' : ''}`}
+                    onClick={() => setCameraFeedViewMode('table')}
                   >
                     List
                   </button>
+                  <button
+                    type="button"
+                    className={`camera-feed-view-btn ${cameraFeedViewMode === 'card' ? 'camera-feed-view-btn--active' : ''}`}
+                    onClick={() => setCameraFeedViewMode('card')}
+                  >
+                    Card
+                  </button>
                 </div>
-              ) : null}
             </div>
-            {cameraRawFeed.length > 0 ? (
-              <div className="camera-raw-filters" role="region" aria-label="Camera raw filters">
-                <input
-                  type="text"
-                  className="camera-raw-search"
-                  placeholder="Search by VRM"
-                  value={cameraRawVrmQuery}
-                  onChange={(event) => setCameraRawVrmQuery(event.target.value.toUpperCase())}
-                />
-                <select
-                  className="camera-raw-site-filter"
-                  value={cameraRawSiteFilter}
-                  onChange={(event) => setCameraRawSiteFilter(event.target.value)}
-                >
-                  <option value="all">All sites</option>
-                  {cameraRawSiteOptions.map((siteName) => (
-                    <option key={siteName} value={siteName}>
-                      {siteName}
-                    </option>
-                  ))}
-                </select>
+
+            {cameraFeedError ? <div className="camera-feed-error">{cameraFeedError}</div> : null}
+
+            {!selectedSiteId ? (
+              <p className="camera-feed-hint">Select a patrol site to load camera data.</p>
+            ) : cameraDisplayRows.length === 0 && !cameraFeedLoading ? (
+              <p className="camera-feed-hint">No camera captures found for this site.</p>
+            ) : cameraFeedViewMode === 'card' ? (
+              <div className="camera-feed-cards">
+                {cameraDisplayRows.map((row) => (
+                  <article key={row.id} className={`camera-feed-item-card ${row.isLocalCapture ? 'camera-feed-item-card--local' : ''}`}>
+                    {(() => {
+                      const isLocal = Boolean(row.isLocalCapture);
+                      const localCardId = String(row.localCardId || '');
+                      const localSelected = isLocal && selectedCaptureCardIds.includes(localCardId);
+                      const localStatus = String(row.syncStatus || 'queued');
+                      const canRetryLocal = localStatus === 'failed';
+                      const vehicleUrl = row.vehicleImageUrl || row.imageUrl;
+                      const plateUrl = row.plateImageUrl || row.imageUrl;
+                      const vehicleSrc = resolveCameraFeedImageSrc(vehicleUrl);
+                      const plateSrc = resolveCameraFeedImageSrc(plateUrl);
+                      const vehicleState = getCameraFeedImageLoadState(vehicleUrl);
+                      const plateState = getCameraFeedImageLoadState(plateUrl);
+                      return (
+                    <div className="camera-feed-item-row">
+                          <div className="camera-feed-item-media">
+                        {vehicleSrc ? (
+                          <button
+                            type="button"
+                            className="camera-feed-image-btn"
+                            onClick={() => openImageDetailDialog({
+                              src: vehicleSrc,
+                              label: `${row.vrm || 'Vehicle'} full image`,
+                              capturedAt: row.readTimestamp,
+                            })}
+                            title="Open full vehicle image"
+                          >
+                            <img
+                              src={vehicleSrc}
+                              alt={row.vrm || 'vehicle'}
+                              className="camera-feed-thumb camera-feed-thumb--card-main"
+                              loading="lazy"
+                              onError={() => { ensureCameraFeedPreview(vehicleUrl, '', { forceRetry: true }).catch(() => null); }}
+                            />
+                          </button>
+                        ) : vehicleState === 'loading' ? (
+                          <div className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--card-main">Loading...</div>
+                        ) : vehicleState === 'failed' ? (
+                          <button
+                            type="button"
+                            className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--card-main"
+                            onClick={() => ensureCameraFeedPreview(vehicleUrl, '', { forceRetry: true }).catch(() => null)}
+                            title="Retry image load"
+                          >
+                            Retry image
+                          </button>
+                        ) : (
+                          <div className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--card-main">No image</div>
+                        )}
+
+                        {plateSrc ? (
+                          <button
+                            type="button"
+                            className="camera-feed-image-btn"
+                            onClick={() => openImageDetailDialog({
+                              src: plateSrc,
+                              label: `${row.vrm || 'Vehicle'} plate`,
+                              capturedAt: row.readTimestamp,
+                            })}
+                            title="Open plate image"
+                          >
+                            <img
+                              src={plateSrc}
+                              alt={row.vrm || 'plate'}
+                              className="camera-feed-thumb camera-feed-thumb--plate camera-feed-thumb--card-plate"
+                              loading="lazy"
+                              onError={() => { ensureCameraFeedPreview(plateUrl, '', { forceRetry: true }).catch(() => null); }}
+                            />
+                          </button>
+                        ) : plateState === 'loading' ? (
+                          <div className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--plate camera-feed-thumb--card-plate">Loading...</div>
+                        ) : plateState === 'failed' ? (
+                          <button
+                            type="button"
+                            className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--plate camera-feed-thumb--card-plate"
+                            onClick={() => ensureCameraFeedPreview(plateUrl, '', { forceRetry: true }).catch(() => null)}
+                            title="Retry plate image load"
+                          >
+                            Retry plate
+                          </button>
+                        ) : null}
+                      </div>
+
+                      <div className="camera-feed-item-body">
+                        <div className="camera-feed-item-head">
+                          <div className="camera-feed-item-vrm-wrap">
+                            {isLocal ? (
+                              <label className="camera-feed-inline-select" aria-label={`Select ${row.vrm || 'capture'}`}>
+                                <input
+                                  type="checkbox"
+                                  checked={localSelected}
+                                  onChange={() => toggleCaptureCardSelection(localCardId)}
+                                />
+                                <span />
+                              </label>
+                            ) : null}
+                            <span className="camera-feed-vrm">{row.vrm || 'N/A'}</span>
+                            <span className={`camera-feed-conf ${row.confidence >= 90 ? 'camera-feed-conf--high' : row.confidence >= 70 ? 'camera-feed-conf--mid' : 'camera-feed-conf--low'}`}>
+                              {Number(row.confidence || 0)}%
+                            </span>
+                          </div>
+                        </div>
+                        <div className="camera-feed-item-meta-line">{row.readTimestamp ? formatLocalTimestamp(row.readTimestamp) : '-'}{row.siteName ? ` · ${row.siteName}` : ''}</div>
+                        <div className="camera-feed-item-meta-line">{row.cameraName || '-'}</div>
+
+                        <div className="camera-feed-item-foot">
+                          {isLocal ? (
+                            <>
+                              <span className={`capture-card-sync-pill capture-card-sync-pill--${localStatus}`}>{localStatus}</span>
+                              <div className="camera-feed-actions">
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => syncQuickCaptureCard(localCardId)}
+                                  disabled={!canRetryLocal || captureBulkSyncing}
+                                >
+                                  Retry
+                                </button>
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => archiveCaptureCard(localCardId)}
+                                  disabled={captureBulkSyncing}
+                                >
+                                  Archive
+                                </button>
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <span className={`camera-feed-pill ${row.permitStatus === 'has_permit' ? 'camera-feed-pill--warn' : row.permitStatus === 'no_permit' ? 'camera-feed-pill--ok' : row.permitStatus === 'error' ? 'camera-feed-pill--err' : 'camera-feed-pill--idle'}`}>
+                                {row.permitStatus === 'checking' ? 'Checking permit' : row.permitStatus === 'has_permit' ? 'Permit' : row.permitStatus === 'no_permit' ? 'No permit' : row.permitStatus === 'error' ? 'Permit error' : 'Permit pending'}
+                              </span>
+                              <span className={`camera-feed-pill ${row.carcheckStatus === 'ok' ? 'camera-feed-pill--ok' : row.carcheckStatus === 'not_found' ? 'camera-feed-pill--warn' : row.carcheckStatus === 'error' ? 'camera-feed-pill--err' : 'camera-feed-pill--idle'}`}>
+                                {row.carcheckStatus === 'checking' ? 'Checking vehicle' : row.carcheckStatus === 'ok' ? ([row.carcheckDetails?.make, row.carcheckDetails?.color].filter(Boolean).join(' ') || 'Carcheck OK') : row.carcheckStatus === 'not_found' ? 'Vehicle unknown' : row.carcheckStatus === 'error' ? 'Carcheck error' : 'Carcheck pending'}
+                              </span>
+                              <div className="camera-feed-actions">
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => runCameraFeedCarcheck(row.id, row.vrm)}
+                                  disabled={row.carcheckStatus === 'checking'}
+                                >
+                                  Carcheck
+                                </button>
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => runCameraFeedPermitCheck(row.id, row.vrm)}
+                                  disabled={row.permitStatus === 'checking' || !selectedSiteId}
+                                >
+                                  e-Permit
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                      );
+                    })()}
+                  </article>
+                ))}
               </div>
-            ) : null}
-            {filteredCameraRawFeed.length > 0 ? (
-              cameraRawViewMode === 'list' ? (
-                <div className="camera-raw-list">
-                  {filteredCameraRawFeed.map((item, index) => (
-                    <article className="camera-raw-list-item" key={item.recordKey || `camera-raw-${index}`}>
-                      {resolveCameraRawImageSrc(item) ? (
-                        <button
-                          type="button"
-                          className="camera-raw-image-btn"
-                          onClick={() => openImageDetailDialog({
-                            src: resolveCameraRawImageSrc(item),
-                            label: `${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`,
-                            phase: item?.phase === 'closing' ? 'closing' : 'entry',
-                            isMain: false,
-                            capturedAt: item?.capturedAt || '',
-                            fileName: item?.fileName || `capture_${index + 1}.jpg`,
-                            mimeType: item?.mimeType || '',
-                            sizeBytes: Number(item?.sizeBytes || 0),
-                            record: item,
-                          })}
-                        >
-                          <img
-                            src={resolveCameraRawImageSrc(item)}
-                            alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
-                            className="camera-raw-list-image"
-                          />
-                        </button>
-                      ) : (
-                        <div className="camera-raw-list-placeholder">No image</div>
-                      )}
-                      <div className="camera-raw-meta camera-raw-meta--list">
-                        <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
-                          {item?.phase === 'closing' ? 'Closing' : 'Entry'}
-                        </span>
-                        <span className="camera-raw-filename">
-                          {item?.fileName || `Capture ${index + 1}`}
-                          {item?.imageRole === 'plate_cutoff' ? ' · Plate cutout' : ' · Full vehicle'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.capturedAt ? formatCaptureTimestamp(item.capturedAt) : 'Capture time pending'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
-                        </span>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              ) : (
-                <div className="camera-raw-grid">
-                  {filteredCameraRawFeed.map((item, index) => (
-                    <article className="camera-raw-card" key={item.recordKey || `camera-raw-${index}`}>
-                      {resolveCameraRawImageSrc(item) ? (
-                        <button
-                          type="button"
-                          className="camera-raw-image-btn"
-                          onClick={() => openImageDetailDialog({
-                            src: resolveCameraRawImageSrc(item),
-                            label: `${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`,
-                            phase: item?.phase === 'closing' ? 'closing' : 'entry',
-                            isMain: false,
-                            capturedAt: item?.capturedAt || '',
-                            fileName: item?.fileName || `capture_${index + 1}.jpg`,
-                            mimeType: item?.mimeType || '',
-                            sizeBytes: Number(item?.sizeBytes || 0),
-                            record: item,
-                          })}
-                        >
-                          <img
-                            src={resolveCameraRawImageSrc(item)}
-                            alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
-                            className="camera-raw-image"
-                          />
-                        </button>
-                      ) : null}
-                      <div className="camera-raw-meta">
-                        <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
-                          {item?.phase === 'closing' ? 'Closing' : 'Entry'}
-                        </span>
-                        <span className="camera-raw-filename">
-                          {item?.fileName || `Capture ${index + 1}`}
-                          {item?.imageRole === 'plate_cutoff' ? ' · Plate cutout' : ' · Full vehicle'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.capturedAt ? formatCaptureTimestamp(item.capturedAt) : 'Capture time pending'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
-                        </span>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              )
             ) : (
-              <div className="empty-state" style={{ padding: '24px 12px' }}>
-                <div className="empty-icon">📷</div>
-                <p className="empty-title">No camera raw captures found</p>
-                <p className="empty-hint">
-                  {cameraRawFeed.length > 0
-                    ? 'Try a different VRM or site filter.'
-                    : 'Vehicle evidence captures will auto-populate here.'}
-                </p>
+              <div className="camera-feed-table-wrap">
+                <table className="camera-feed-table">
+                  <thead>
+                    <tr>
+                      <th>Sel</th>
+                      <th>Read VRM</th>
+                      <th>Images</th>
+                      <th>Confidence</th>
+                      <th>Site</th>
+                      <th>Read</th>
+                      <th>Permit</th>
+                      <th>Carcheck</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cameraDisplayRows.map((row) => {
+                      const isLocal = Boolean(row.isLocalCapture);
+                      const localCardId = String(row.localCardId || '');
+                      const localStatus = String(row.syncStatus || 'queued');
+                      const localSelected = isLocal && selectedCaptureCardIds.includes(localCardId);
+                      const canRetryLocal = localStatus === 'failed';
+                      return (
+                      <tr key={row.id} className={isLocal ? 'camera-feed-row--local' : ''}>
+                        <td className="camera-feed-select-cell">
+                          {isLocal ? (
+                            <label className="camera-feed-inline-select" aria-label={`Select ${row.vrm || 'capture'}`}>
+                              <input
+                                type="checkbox"
+                                checked={localSelected}
+                                onChange={() => toggleCaptureCardSelection(localCardId)}
+                              />
+                              <span />
+                            </label>
+                          ) : null}
+                        </td>
+                        <td className="camera-feed-vrm-cell">
+                          <span className="camera-feed-vrm">{row.vrm || 'N/A'}</span>
+                          <span className="camera-feed-vrm-label">plate</span>
+                        </td>
+                        <td>
+                          <div className="camera-feed-images-inline">
+                            {(() => {
+                              const plateUrl = row.plateImageUrl || row.imageUrl;
+                              const plateSrc = resolveCameraFeedImageSrc(plateUrl);
+                              const plateState = getCameraFeedImageLoadState(plateUrl);
+                              if (plateSrc) {
+                                return (
+                              <button
+                                type="button"
+                                className="camera-feed-image-btn"
+                                onClick={() => openImageDetailDialog({
+                                  src: plateSrc,
+                                  label: `${row.vrm || 'Vehicle'} plate`,
+                                  capturedAt: row.readTimestamp,
+                                })}
+                                title="Open plate image"
+                              >
+                                <img
+                                  src={plateSrc}
+                                  alt={row.vrm || 'plate'}
+                                  className="camera-feed-thumb camera-feed-thumb--plate"
+                                  loading="lazy"
+                                  onError={() => { ensureCameraFeedPreview(plateUrl, '', { forceRetry: true }).catch(() => null); }}
+                                />
+                              </button>
+                                );
+                              }
+                              if (plateState === 'loading') return <div className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--plate">Loading...</div>;
+                              if (plateState === 'failed') {
+                                return (
+                                  <button
+                                    type="button"
+                                    className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--plate"
+                                    onClick={() => ensureCameraFeedPreview(plateUrl, '', { forceRetry: true }).catch(() => null)}
+                                    title="Retry plate image load"
+                                  >
+                                    Retry
+                                  </button>
+                                );
+                              }
+                              return <div className="camera-feed-thumb camera-feed-thumb--empty camera-feed-thumb--plate">No plate</div>;
+                            })()}
+
+                            {(() => {
+                              const vehicleUrl = row.vehicleImageUrl || row.imageUrl;
+                              const vehicleSrc = resolveCameraFeedImageSrc(vehicleUrl);
+                              const vehicleState = getCameraFeedImageLoadState(vehicleUrl);
+                              if (vehicleSrc) {
+                                return (
+                              <button
+                                type="button"
+                                className="camera-feed-image-btn"
+                                onClick={() => openImageDetailDialog({
+                                  src: vehicleSrc,
+                                  label: `${row.vrm || 'Vehicle'} full image`,
+                                  capturedAt: row.readTimestamp,
+                                })}
+                                title="Open full vehicle image"
+                              >
+                                <img
+                                  src={vehicleSrc}
+                                  alt={row.vrm || 'vehicle'}
+                                  className="camera-feed-thumb"
+                                  loading="lazy"
+                                  onError={() => { ensureCameraFeedPreview(vehicleUrl, '', { forceRetry: true }).catch(() => null); }}
+                                />
+                              </button>
+                                );
+                              }
+                              if (vehicleState === 'loading') return <div className="camera-feed-thumb camera-feed-thumb--empty">Loading...</div>;
+                              if (vehicleState === 'failed') {
+                                return (
+                                  <button
+                                    type="button"
+                                    className="camera-feed-thumb camera-feed-thumb--empty"
+                                    onClick={() => ensureCameraFeedPreview(vehicleUrl, '', { forceRetry: true }).catch(() => null)}
+                                    title="Retry vehicle image load"
+                                  >
+                                    Retry
+                                  </button>
+                                );
+                              }
+                              return <div className="camera-feed-thumb camera-feed-thumb--empty">No vehicle</div>;
+                            })()}
+                          </div>
+                        </td>
+                        <td>
+                          <span className={`camera-feed-conf ${row.confidence >= 90 ? 'camera-feed-conf--high' : row.confidence >= 70 ? 'camera-feed-conf--mid' : 'camera-feed-conf--low'}`}>
+                            {Number(row.confidence || 0)}%
+                          </span>
+                        </td>
+                        <td>{row.siteName || '-'}</td>
+                        <td>{row.readTimestamp ? formatLocalTimestamp(row.readTimestamp) : '-'}</td>
+                        <td>
+                          {isLocal ? (
+                            <span className={`capture-card-sync-pill capture-card-sync-pill--${localStatus}`}>{localStatus}</span>
+                          ) : (
+                            <span className={`camera-feed-pill ${row.permitStatus === 'has_permit' ? 'camera-feed-pill--warn' : row.permitStatus === 'no_permit' ? 'camera-feed-pill--ok' : row.permitStatus === 'error' ? 'camera-feed-pill--err' : 'camera-feed-pill--idle'}`}>
+                              {row.permitStatus === 'checking' ? 'Checking' : row.permitStatus === 'has_permit' ? 'Permit' : row.permitStatus === 'no_permit' ? 'Clear' : row.permitStatus === 'error' ? 'Error' : 'Pending'}
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          {isLocal
+                            ? (row.syncError ? <span className="camera-feed-sync-error">{row.syncError}</span> : <span className="camera-feed-pill camera-feed-pill--idle">Local pending</span>)
+                            : (
+                              <span className={`camera-feed-pill ${row.carcheckStatus === 'ok' ? 'camera-feed-pill--ok' : row.carcheckStatus === 'not_found' ? 'camera-feed-pill--warn' : row.carcheckStatus === 'error' ? 'camera-feed-pill--err' : 'camera-feed-pill--idle'}`}>
+                                {row.carcheckStatus === 'checking' ? 'Checking' : row.carcheckStatus === 'ok' ? ([row.carcheckDetails?.make, row.carcheckDetails?.color].filter(Boolean).join(' ') || 'OK') : row.carcheckStatus === 'not_found' ? 'Unknown' : row.carcheckStatus === 'error' ? 'Error' : 'Pending'}
+                              </span>
+                            )}
+                        </td>
+                        <td>
+                          <div className="camera-feed-actions">
+                            {isLocal ? (
+                              <>
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => syncQuickCaptureCard(localCardId)}
+                                  disabled={!canRetryLocal || captureBulkSyncing}
+                                >
+                                  Retry
+                                </button>
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => archiveCaptureCard(localCardId)}
+                                  disabled={captureBulkSyncing}
+                                >
+                                  Archive
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => runCameraFeedPermitCheck(row.id, row.vrm)}
+                                  disabled={row.permitStatus === 'checking' || !selectedSiteId}
+                                >
+                                  eP
+                                </button>
+                                <button
+                                  type="button"
+                                  className="camera-feed-action camera-feed-action--secondary"
+                                  onClick={() => runCameraFeedCarcheck(row.id, row.vrm)}
+                                  disabled={row.carcheckStatus === 'checking'}
+                                >
+                                  CC
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );})}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
@@ -7701,7 +9226,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'camera' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('camera')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">📷</span>
+          <IconCamera className="bottom-nav-icon" />
           <span className="bottom-nav-label">Camera</span>
         </button>
         <button
@@ -7714,7 +9239,7 @@ export default function DashboardPage() {
             setMessage('');
           }}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🚗</span>
+          <IconSessions className="bottom-nav-icon" />
           <span className="bottom-nav-label">Sessions</span>
           {trackedBreaches.filter(i => ['DRAFT_OPEN', 'READY'].includes(i.lifecycle.code)).length > 0 ? (
             <span className="bottom-nav-badge">
@@ -7727,7 +9252,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'queue' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('queue')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">⬆</span>
+          <IconQueue className="bottom-nav-icon" />
           <span className="bottom-nav-label">Queue</span>
           {syncCandidates.length > 0 ? (
             <span className="bottom-nav-badge">{syncCandidates.length}</span>
@@ -7738,7 +9263,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'mobile' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('mobile')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🚐</span>
+          <IconMobile className="bottom-nav-icon" />
           <span className="bottom-nav-label">Mobile</span>
         </button>
         <button
@@ -7746,7 +9271,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'archive' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('archive')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🗄</span>
+          <IconArchive className="bottom-nav-icon" />
           <span className="bottom-nav-label">Archive</span>
           {archivedBreaches.length > 0 ? (
             <span className="bottom-nav-badge">{archivedBreaches.length}</span>
@@ -8070,11 +9595,13 @@ export default function DashboardPage() {
         <button
           type="button"
           className="fab-new-breach"
-          onClick={() => setStepperOpen(true)}
-          aria-label="Start Draft Parking Charge"
-          title="Start Draft Parking Charge"
+          onClick={currentScreen === 'camera' ? launchQuickScanCapture : () => setStepperOpen(true)}
+          aria-label={currentScreen === 'camera' ? 'Start camera scan capture' : 'Start Draft Parking Charge'}
+          title={currentScreen === 'camera' ? 'Start camera scan capture' : 'Start Draft Parking Charge'}
         >
-          +
+          {currentScreen === 'camera'
+            ? <IconCamera className="fab-icon" size={24} />
+            : <IconPlus className="fab-icon" size={24} />}
         </button>
       ) : null}
 
@@ -8083,6 +9610,7 @@ export default function DashboardPage() {
         open={stepperOpen}
         onClose={() => setStepperOpen(false)}
         onComplete={handleStepperComplete}
+        onPermitCheck={checkAuthorization}
         sites={sites}
         contraventions={contraventions}
         selectedSiteId={selectedSiteId}
@@ -8099,7 +9627,104 @@ export default function DashboardPage() {
         onPlateScan={scanPlateFromImage}
         mode="capture-only"
         capturePhase={captureStepperPhase}
+        allowManualCaptureMode={false}
+        autoStartScan={captureIsQuickMode}
+        requireOcrArtifacts
       />
+
+      {captureConfirmDialog ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Confirm capture"
+          onClick={() => setCaptureConfirmDialog(null)}
+        >
+          <div
+            className={[
+              'carcheck-sheet',
+              'capture-confirm-sheet',
+              capturePermitCheck.checking
+                ? 'capture-confirm-sheet--checking'
+                : (capturePermitCheck.status === 'checked'
+                  ? (capturePermitCheck.hasPermit ? 'capture-confirm-sheet--permit' : 'capture-confirm-sheet--no-permit')
+                  : (capturePermitCheck.status === 'error' ? 'capture-confirm-sheet--error' : '')),
+            ].filter(Boolean).join(' ')}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-kicker">Confirm capture</div>
+                <div className="carcheck-sheet-title">{selectedSite?.displayName || selectedSite?.name || selectedSiteId}</div>
+                <div className="capture-confirm-subtitle">Review VRM and permit status before syncing this capture.</div>
+              </div>
+              <button type="button" className="ghost-button stepper-close" onClick={() => setCaptureConfirmDialog(null)}>✕</button>
+            </div>
+            <div className="capture-confirm-preview-wrap">
+              {String(captureConfirmDialog?.previewUrl || '').trim() ? (
+                <img
+                  src={String(captureConfirmDialog.previewUrl).trim()}
+                  alt="Captured vehicle preview"
+                  className="capture-confirm-preview-image"
+                />
+              ) : (
+                <div className="capture-confirm-preview-empty">Preview unavailable. You can still confirm VRM and sync.</div>
+              )}
+            </div>
+            <label className="stepper-field capture-confirm-field">
+              <span className="stepper-field-label">Registration (VRM)</span>
+              <div className="capture-confirm-vrm-shell">
+                <input
+                  className="stepper-vrm-input"
+                  value={captureConfirmVrm}
+                  onChange={(e) => {
+                    const newVrm = normalizeVrm(e.target.value);
+                    setCaptureConfirmVrm(newVrm);
+                    if (newVrm.length >= 2) {
+                      checkQuickCapturePermit(newVrm);
+                    } else {
+                      setCapturePermitCheck({ status: 'idle', hasPermit: false, checking: false, matchConfidence: null });
+                    }
+                  }}
+                  placeholder="AB12CDE — edit if OCR is wrong"
+                  autoFocus
+                  maxLength={10}
+                />
+              </div>
+              {capturePermitCheck.checking ? (
+                <div className="capture-confirm-status capture-confirm-status--checking">Checking permit status...</div>
+              ) : capturePermitCheck.status === 'checked' ? (
+                <div className={`capture-confirm-status ${capturePermitCheck.hasPermit ? 'capture-confirm-status--ok' : 'capture-confirm-status--warn'}`}>
+                  {capturePermitCheck.hasPermit
+                    ? 'Permit matched: valid permit or payment found'
+                    : 'No valid permit or payment found'}
+                </div>
+              ) : capturePermitCheck.status === 'error' ? (
+                <div className="capture-confirm-status capture-confirm-status--warn">Permit check unavailable. Confirm VRM and try again.</div>
+              ) : null}
+              {Number(capturePermitCheck?.matchConfidence?.scorePercent || 0) > 0
+              && String(capturePermitCheck?.matchConfidence?.bestVrm || '').trim() ? (
+                <div className="auth-match-pill" role="status" aria-label="Closest exemption match confidence">
+                  <span className="auth-match-pill-label">Closest exemption match</span>
+                  <span className="auth-match-pill-vrm">{capturePermitCheck.matchConfidence.bestVrm}</span>
+                  <span className="auth-match-pill-score">{capturePermitCheck.matchConfidence.scorePercent}%</span>
+                </div>
+              ) : null}
+            </label>
+            <div className="stepper-nav capture-confirm-actions" style={{ marginTop: 12 }}>
+              <button type="button" className="ghost-button" onClick={() => setCaptureConfirmDialog(null)}>Cancel</button>
+              <button
+                type="button"
+                className="primary-button"
+                disabled={!captureConfirmVrm}
+                onClick={handleConfirmQuickCapture}
+              >
+                {captureConfirmVrm ? 'Confirm \u2192 Sync' : 'Enter VRM to continue'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {carcheckDialogOpen ? (
         <div
@@ -8275,7 +9900,9 @@ export default function DashboardPage() {
                         ) : (
                           <div className="pcn-summary-image-empty">No observation image</div>
                         )}
-                        <div className="pcn-summary-image-time pcn-summary-image-time--overlay">
+                      </div>
+                      <div className="pcn-summary-image-time-box" role="note" aria-label="Observation capture time">
+                        <div className="pcn-summary-image-time pcn-summary-image-time--outer">
                           {pcnPreview.observationCapture?.capturedAt
                             ? formatCaptureTimestamp(pcnPreview.observationCapture.capturedAt)
                             : 'Capture time unavailable'}
@@ -8294,7 +9921,9 @@ export default function DashboardPage() {
                         ) : (
                           <div className="pcn-summary-image-empty">No contravention image</div>
                         )}
-                        <div className="pcn-summary-image-time pcn-summary-image-time--overlay">
+                      </div>
+                      <div className="pcn-summary-image-time-box" role="note" aria-label="Contravention capture time">
+                        <div className="pcn-summary-image-time pcn-summary-image-time--outer">
                           {pcnPreview.contraventionCapture?.capturedAt
                             ? formatCaptureTimestamp(pcnPreview.contraventionCapture.capturedAt)
                             : 'Capture time unavailable'}
@@ -8337,7 +9966,9 @@ export default function DashboardPage() {
                 >
                   {convertLoading
                     ? 'Submitting…'
-                    : (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')}
+                    : (selectedTracked?.payload?.breachId
+                      ? <><IconClipboard className="cta-inline-icon" />Submit PCN to backend</>
+                      : <><IconClipboard className="cta-inline-icon" />Sync and submit PCN</>)}
                 </button>
               </div>
             </div>

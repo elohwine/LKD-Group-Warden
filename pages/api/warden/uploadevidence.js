@@ -1,6 +1,7 @@
 import { getStorage } from 'firebase-admin/storage';
 import formidable from 'formidable';
 import fs from 'fs';
+import crypto from 'crypto';
 import { adminAuth } from '../../../lib/firebase-admin.mjs';
 
 export const config = {
@@ -68,15 +69,26 @@ export async function createSignedUploadUrl({
   const bucket = getStorage().bucket(bucketName);
   const safeName = sanitizeUploadName(fileName, 'upload').slice(0, 100);
   const destination = `${String(folderName || 'warden_evidence').replace(/^\/+|\/+$/g, '')}/${Date.now()}-${Math.random().toString(36).slice(2, 9)}-${safeName}`;
+  const downloadToken = crypto.randomUUID();
 
-  const [url] = await bucket.file(destination).getSignedUrl({
+  const [writeUrl] = await bucket.file(destination).getSignedUrl({
+    version: 'v4',
     action: 'write',
-    expires: '01-01-2100',
+    expires: Date.now() + (60 * 60 * 1000),
     contentType,
+    extensionHeaders: {
+      'x-goog-meta-firebaseStorageDownloadTokens': downloadToken,
+    },
   });
 
+  const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(bucketName)}/o/${encodeURIComponent(destination)}?alt=media&token=${encodeURIComponent(downloadToken)}`;
+
   return {
-    url,
+    url: writeUrl,
+    downloadUrl,
+    uploadHeaders: {
+      'x-goog-meta-firebaseStorageDownloadTokens': downloadToken,
+    },
     path: destination,
     filename: safeName,
     mode: 'signed-upload',
@@ -274,6 +286,7 @@ export default async function handler(req, res) {
           metadata: {
             contentType: resolveContentType(file),
             metadata: {
+              firebaseStorageDownloadTokens: crypto.randomUUID(),
               wardenId,
               siteId,
               uploadedAt: new Date().toISOString(),
@@ -281,11 +294,17 @@ export default async function handler(req, res) {
           },
         });
 
-        // Get signed URL (7 days expiration for processing)
-        const [url] = await bucket.file(uploadPath).getSignedUrl({
-          action: 'read',
-          expires: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days
-        });
+        let downloadToken = '';
+        try {
+          const [meta] = await bucket.file(uploadPath).getMetadata();
+          downloadToken = String(meta?.metadata?.firebaseStorageDownloadTokens || '').split(',')[0].trim();
+        } catch (_) {
+          downloadToken = '';
+        }
+
+        const url = downloadToken
+          ? `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(bucketName)}/o/${encodeURIComponent(uploadPath)}?alt=media&token=${encodeURIComponent(downloadToken)}`
+          : `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(bucketName)}/o/${encodeURIComponent(uploadPath)}?alt=media`;
 
         uploadedUrls.push(url);
         console.log(`[uploadevidence] Upload successful: ${uploadPath}`);

@@ -8,6 +8,14 @@ def keystorePath = envOrProperty('WARDEN_KEYSTORE_PATH')
 def keystoreAlias = envOrProperty('WARDEN_KEYSTORE_ALIAS')
 def keystorePassword = envOrProperty('WARDEN_KEYSTORE_PASSWORD')
 def keystoreAliasPassword = envOrProperty('WARDEN_KEY_PASSWORD')
+def versionCodeRaw = envOrProperty('WARDEN_VERSION_CODE') ?: envOrProperty('VERSION_CODE') ?: '1'
+def versionNameValue = envOrProperty('WARDEN_VERSION_NAME') ?: envOrProperty('VERSION_NAME') ?: '1.0.0'
+def versionCodeValue
+try {
+    versionCodeValue = Integer.parseInt(String.valueOf(versionCodeRaw))
+} catch (Exception ignored) {
+    throw new GradleException("Invalid WARDEN_VERSION_CODE/VERSION_CODE value: ${versionCodeRaw}. It must be an integer.")
+}
 def isReleaseBuildRequested = gradle.startParameter.taskNames.any { taskName ->
     def normalized = String.valueOf(taskName).toLowerCase()
     normalized.contains('release') || normalized.contains('bundle')
@@ -35,8 +43,8 @@ android {
         applicationId "com.ldk.warden.mobile"
         minSdkVersion 23
         targetSdkVersion 35
-        versionCode 1
-        versionName "1.0"
+        versionCode versionCodeValue
+        versionName versionNameValue
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         aaptOptions {

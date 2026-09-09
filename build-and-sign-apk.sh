@@ -5,7 +5,8 @@ APP_NAME="LDK Warden"
 PACKAGE_NAME="com.ldk.warden.mobile"
 SDK_VERSION="33.0.2"
 ANDROID_SDK_ROOT="$HOME/Android/Sdk"
-APP_PATH="android/app/build/outputs/apk/release/ldk-warden-v1.0-release-signed.apk"
+APP_PATH=""
+ANDROID_GRADLE_PROPERTIES="android/gradle.properties"
 
 load_env_file_if_present() {
     local env_file="$1"
@@ -43,7 +44,6 @@ ensure_public_firebase_config() {
 validate_public_api_base() {
     local base="${NEXT_PUBLIC_API_BASE_URL:-}"
     local secondary="${NEXT_PUBLIC_API_BASE_URL_SECONDARY:-}"
-    local render_primary="https://ldk-group-ltd-website-react-p2ea.onrender.com"
 
     # Respect inline/exported values first. Only fall back to env files when unset.
     if [ -z "$base" ]; then
@@ -54,7 +54,9 @@ validate_public_api_base() {
     fi
 
     if [ -z "$base" ]; then
-        base="$render_primary"
+        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL is required for APK builds.${NC}"
+        echo -e "${YELLOW}Set exactly one API host per test run (for example: https://www.ldkgroup.co.uk or https://ldk-group-ltd-website-react-p2ea.onrender.com).${NC}"
+        exit 1
     fi
 
     if [[ ! "$base" =~ ^https?:// ]]; then
@@ -64,36 +66,13 @@ validate_public_api_base() {
     base="${base%/}"
     secondary="${secondary%/}"
 
-    # Never keep www as first preference for API origin in APK builds.
-    if [[ "$base" =~ ^https://www\.ldkgroup\.co\.uk$ ]]; then
-        base="https://ldkgroup.co.uk"
-    fi
-
-    if [[ "$secondary" =~ ^https://www\.ldkgroup\.co\.uk$ ]]; then
-        secondary="https://ldkgroup.co.uk"
-    fi
-
-    if [[ ! "$base" =~ ^https://(ldkgroup\.co\.uk|ldk-group-ltd-website-react-p2ea\.onrender\.com)$ ]]; then
-        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL must point to ldkgroup.co.uk or ldk-group-ltd-website-react-p2ea.onrender.com over HTTPS (got: $base)${NC}"
+    if [[ ! "$base" =~ ^https://(www\.ldkgroup\.co\.uk|ldkgroup\.co\.uk|ldk-group-ltd-website-react-p2ea\.onrender\.com)$ ]]; then
+        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL must point to www.ldkgroup.co.uk, ldkgroup.co.uk, or ldk-group-ltd-website-react-p2ea.onrender.com over HTTPS (got: $base)${NC}"
         exit 1
     fi
 
-    # Enforce Render as primary to avoid host redirect/auth drift in mobile runtime.
-    if [[ "$base" != "$render_primary" ]]; then
-        secondary="$base"
-        base="$render_primary"
-    elif [[ -z "$secondary" ]]; then
-        secondary="https://ldkgroup.co.uk"
-    fi
-
-    if [[ -n "$secondary" && ! "$secondary" =~ ^https://(ldkgroup\.co\.uk|ldk-group-ltd-website-react-p2ea\.onrender\.com)$ ]]; then
-        echo -e "${RED}NEXT_PUBLIC_API_BASE_URL_SECONDARY must point to ldkgroup.co.uk or ldk-group-ltd-website-react-p2ea.onrender.com over HTTPS (got: $secondary)${NC}"
-        exit 1
-    fi
-
-    if [[ "$secondary" == "$base" ]]; then
-        secondary=""
-    fi
+    # Single-source API mode: disable secondary host fallback in APK builds.
+    secondary=""
 
     export NEXT_PUBLIC_API_BASE_URL="$base"
     export NEXT_PUBLIC_API_BASE_URL_SECONDARY="$secondary"
@@ -160,6 +139,56 @@ require_env() {
         echo -e "${RED}Missing required environment variable: $name${NC}"
         exit 1
     fi
+}
+
+set_gradle_property() {
+    local key="$1"
+    local value="$2"
+
+    if [ ! -f "$ANDROID_GRADLE_PROPERTIES" ]; then
+        echo -e "${RED}Missing ${ANDROID_GRADLE_PROPERTIES}${NC}"
+        exit 1
+    fi
+
+    if grep -q "^${key}=" "$ANDROID_GRADLE_PROPERTIES"; then
+        sed -i "s#^${key}=.*#${key}=${value}#" "$ANDROID_GRADLE_PROPERTIES"
+    else
+        printf "\n%s=%s\n" "$key" "$value" >> "$ANDROID_GRADLE_PROPERTIES"
+    fi
+}
+
+resolve_signed_apk_path() {
+    local signed_apk
+    signed_apk=$(find android/app/build/outputs/apk/release -type f \( -iname '*signed*.apk' -o -iname '*-signed.apk' \) 2>/dev/null | sort | tail -n 1)
+    if [ -z "$signed_apk" ]; then
+        echo -e "${RED}Signed APK not found in android/app/build/outputs/apk/release${NC}"
+        exit 1
+    fi
+    APP_PATH="$signed_apk"
+}
+
+prepare_release_versioning() {
+    local current_code next_code package_version
+
+    current_code=$(grep -E '^WARDEN_VERSION_CODE=' "$ANDROID_GRADLE_PROPERTIES" | tail -n 1 | cut -d'=' -f2)
+    if [[ ! "$current_code" =~ ^[0-9]+$ ]]; then
+        current_code=0
+    fi
+    next_code=$((current_code + 1))
+
+    package_version=$(node -p "require('./package.json').version" 2>/dev/null)
+    if [ -z "$package_version" ]; then
+        package_version="1.0.0"
+    fi
+
+    set_gradle_property "WARDEN_VERSION_CODE" "$next_code"
+    set_gradle_property "WARDEN_VERSION_NAME" "$package_version"
+
+    export WARDEN_VERSION_CODE="$next_code"
+    export WARDEN_VERSION_NAME="$package_version"
+
+    echo -e "${GREEN}Using WARDEN_VERSION_CODE=${WARDEN_VERSION_CODE}${NC}"
+    echo -e "${GREEN}Using WARDEN_VERSION_NAME=${WARDEN_VERSION_NAME}${NC}"
 }
 
 normalize_signing_env() {
@@ -256,6 +285,9 @@ print_step "Ensuring public Firebase client config..."
 ensure_public_firebase_config
 echo -e "${GREEN}Using NEXT_PUBLIC_FIREBASE_PROJECT_ID=${NEXT_PUBLIC_FIREBASE_PROJECT_ID}${NC}"
 
+print_step "Preparing Android release versioning..."
+prepare_release_versioning
+
 normalize_signing_env
 
 if [ -n "${CAPACITOR_SERVER_URL:-}" ]; then
@@ -295,6 +327,7 @@ cd - >/dev/null 2>&1 || true
 
 # ========= STEP 7 — VERIFY APK SIGNATURE =========
 print_step "Verifying APK signature..."
+resolve_signed_apk_path
 $ANDROID_SDK_ROOT/build-tools/$SDK_VERSION/apksigner verify --verbose $APP_PATH
 if [ $? -ne 0 ]; then
     echo -e "${RED}APK signature verification failed!${NC}"
