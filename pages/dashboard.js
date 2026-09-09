@@ -36,6 +36,141 @@ import PcnPreviewDialog from '../components/PcnPreviewDialog';
 import WardenCaptureFeed from '../components/WardenCaptureFeed';
 import { buildDemoSites, isDemoModeEnabled } from '../lib/demoMode';
 
+function IconBase({ className = '', size = 20, children }) {
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function IconCamera({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z" />
+      <circle cx="12" cy="13" r="3.25" />
+    </IconBase>
+  );
+}
+
+function IconSessions({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <rect x="6" y="4" width="12" height="16" rx="2" />
+      <path d="M9 9h6" />
+      <path d="M9 13h6" />
+      <path d="M9 17h4" />
+    </IconBase>
+  );
+}
+
+function IconQueue({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M12 16V8" />
+      <path d="m8 12 4-4 4 4" />
+      <path d="M5 18h14" />
+    </IconBase>
+  );
+}
+
+function IconMobile({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <rect x="8" y="3" width="8" height="18" rx="2" />
+      <circle cx="12" cy="17" r="1" />
+    </IconBase>
+  );
+}
+
+function IconArchive({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M3 7h18" />
+      <rect x="4" y="7" width="16" height="13" rx="2" />
+      <path d="M9 11h6" />
+    </IconBase>
+  );
+}
+
+function IconClipboard({ className = '', size = 18 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <rect x="7" y="5" width="10" height="16" rx="2" />
+      <path d="M10 3h4" />
+      <path d="M9 9h6" />
+      <path d="M9 13h6" />
+    </IconBase>
+  );
+}
+
+function IconTrash({ className = '', size = 18 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 10v7" />
+      <path d="M14 10v7" />
+    </IconBase>
+  );
+}
+
+function IconCheckCircle({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="m8.5 12 2.3 2.3L15.5 9.6" />
+    </IconBase>
+  );
+}
+
+function IconPlus({ className = '', size = 20 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </IconBase>
+  );
+}
+
+function IconSettings({ className = '', size = 18 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 2v2" />
+      <path d="M12 20v2" />
+      <path d="M4.93 4.93l1.41 1.41" />
+      <path d="M17.66 17.66l1.41 1.41" />
+      <path d="M2 12h2" />
+      <path d="M20 12h2" />
+      <path d="M4.93 19.07l1.41-1.41" />
+      <path d="M17.66 6.34l1.41-1.41" />
+    </IconBase>
+  );
+}
+
+function IconRefresh({ className = '', size = 16 }) {
+  return (
+    <IconBase className={className} size={size}>
+      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+      <path d="M21 3v6h-6" />
+    </IconBase>
+  );
+}
+
 function formatElapsed(startIso, endIso = '') {
   const startMs = new Date(startIso || '').getTime();
   if (!Number.isFinite(startMs) || startMs <= 0) return '00:00';
@@ -6789,7 +6924,7 @@ export default function DashboardPage() {
                     className="evidence-capture-btn"
                     onClick={() => openCaptureDialog('entry')}
                   >
-                    <span className="evidence-capture-icon">📷</span>
+                    <IconCamera className="evidence-capture-icon" />
                     <span>Capture entry</span>
                   </button>
                 )}
@@ -6858,7 +6993,7 @@ export default function DashboardPage() {
                     className="evidence-capture-btn"
                     onClick={() => openCaptureDialog('closing')}
                   >
-                    <span className="evidence-capture-icon">📷</span>
+                    <IconCamera className="evidence-capture-icon" />
                     <span>Capture closing</span>
                   </button>
                 )}
@@ -6872,7 +7007,8 @@ export default function DashboardPage() {
             {/* Capture closing evidence */}
             {entryFiles.length > 0 && closingFiles.length === 0 ? (
               <button type="button" className="action-btn action-btn--primary" onClick={() => openCaptureDialog('closing')}>
-                📷 Capture closing evidence
+                <IconCamera className="cta-inline-icon" />
+                Capture closing evidence
               </button>
             ) : null}
 
@@ -7325,7 +7461,7 @@ export default function DashboardPage() {
             className="quick-capture-cta"
             onClick={() => quickCaptureInputRef.current?.click()}
           >
-            <span className="quick-capture-icon">📷</span>
+            <IconCamera className="quick-capture-icon" />
             <span className="quick-capture-label">Capture vehicle</span>
           </button>
 
@@ -7351,7 +7487,7 @@ export default function DashboardPage() {
                           onClick={() => openImageDetailDialog({ src: card.vehiclePreview || card.cutoffImage, label: card.plateText || 'Capture', capturedAt: card.capturedAt })}
                         />
                       ) : (
-                        <div className="capture-card-thumb capture-card-thumb--empty">📷</div>
+                        <div className="capture-card-thumb capture-card-thumb--empty"><IconCamera className="capture-card-thumb-icon" /></div>
                       )}
                     </div>
                     <div className="capture-card-body">
@@ -7448,7 +7584,6 @@ export default function DashboardPage() {
             sites={sites}
             queueItems={queueItems}
             contraventions={contraventions}
-            showPcnActions
             onStartDraft={async ({ vrm, vehicleImage, plateImage, timestamp, siteId, carcheckDetails, permitData }) => {
               const entryTime = timestamp || new Date().toISOString();
               const effectiveSiteId = siteId || selectedSiteId || '';
@@ -7632,7 +7767,7 @@ export default function DashboardPage() {
               )
             ) : (
               <div className="empty-state" style={{ padding: '24px 12px' }}>
-                <div className="empty-icon">📷</div>
+                <div className="empty-icon"><IconCamera size={36} /></div>
                 <p className="empty-title">No camera raw captures found</p>
                 <p className="empty-hint">
                   {cameraRawFeed.length > 0
@@ -7652,7 +7787,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'camera' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('camera')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">📷</span>
+          <IconCamera className="bottom-nav-icon" />
           <span className="bottom-nav-label">Camera</span>
         </button>
         <button
@@ -7665,7 +7800,7 @@ export default function DashboardPage() {
             setMessage('');
           }}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🚗</span>
+          <IconSessions className="bottom-nav-icon" />
           <span className="bottom-nav-label">Sessions</span>
           {trackedBreaches.filter(i => ['DRAFT_OPEN', 'READY'].includes(i.lifecycle.code)).length > 0 ? (
             <span className="bottom-nav-badge">
@@ -7678,7 +7813,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'queue' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('queue')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">⬆</span>
+          <IconQueue className="bottom-nav-icon" />
           <span className="bottom-nav-label">Queue</span>
           {syncCandidates.length > 0 ? (
             <span className="bottom-nav-badge">{syncCandidates.length}</span>
@@ -7689,7 +7824,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'mobile' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('mobile')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🚐</span>
+          <IconMobile className="bottom-nav-icon" />
           <span className="bottom-nav-label">Mobile</span>
         </button>
         <button
@@ -7697,7 +7832,7 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'archive' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('archive')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🗄</span>
+          <IconArchive className="bottom-nav-icon" />
           <span className="bottom-nav-label">Archive</span>
           {archivedBreaches.length > 0 ? (
             <span className="bottom-nav-badge">{archivedBreaches.length}</span>
