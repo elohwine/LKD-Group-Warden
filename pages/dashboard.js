@@ -3115,54 +3115,6 @@ export default function DashboardPage() {
     // Re-open camera for next vehicle after a brief pause.
     window.setTimeout(() => quickCaptureInputRef.current?.click(), 350);
   }
-    const rawFiles = Array.isArray(files) ? files : [];
-    if (rawFiles.length === 0) { setCaptureStepperOpen(false); return; }
-
-    const fallbackTs = await getServerTimestamp();
-    const firstFile = rawFiles[0];
-    firstFile.capturedAt = normalizeCapturedAt(firstFile?.capturedAt) || fallbackTs;
-    const capturedAt = firstFile.capturedAt;
-
-    // Stable card ID scoped to this exact capture invocation — prevents any cross-card bleed.
-    const cardId = `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const plateText = normalizeVrm(scan?.plateText || firstFile?.detectedPlateText || '');
-    const plateConfidence = Number(scan?.confidence || firstFile?.detectedPlateConfidence || 0);
-    const cutoffImage = String(scan?.cutoffImage || firstFile?.detectedPlateCutoffImage || '');
-    const effectiveSiteId = selectedSiteId;
-    const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
-
-    const card = {
-      id: cardId,
-      capturedAt,
-      plateText,
-      plateConfidence,
-      cutoffImage,
-      vehiclePreview: '',
-      files: rawFiles,
-      siteId: effectiveSiteId,
-      siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId || '',
-    };
-
-    // Async preview — keyed to cardId so it can only update its own card.
-    const vehicleFile = rawFiles.find((f) => !String(f?.name || '').toLowerCase().includes('plate_cutoff_')) || rawFiles[0];
-    if (vehicleFile) {
-      fileToDataUrl(vehicleFile).then((url) => {
-        setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, vehiclePreview: url } : c));
-      }).catch(() => {});
-    }
-
-    // Functional update ensures no stale-closure overwrite from concurrent captures.
-    setCaptureCards((prev) => [card, ...prev]);
-    setCaptureStepperOpen(false);
-
-    // Brief pause, then re-open capture for the next vehicle.
-    window.setTimeout(() => {
-      setCaptureIsQuickMode(true);
-      setCaptureStepperPhase('entry');
-      setCaptureStepperOpen(true);
-    }, 380);
-  }
-
   async function runCardCarcheck(cardId, vrm) {
     if (!vrm) return;
     setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], carcheckStatus: 'checking' } }));
@@ -7535,8 +7487,7 @@ export default function DashboardPage() {
               setMessage(`Draft PCN started for ${vrm} from camera feed.`);
             }}
           />
-        </main>
-      ) : null}
+          <div className="camera-raw-panel">
               {cameraRawFeed.length > 0 ? (
                 <div className="camera-raw-view-toggle" role="group" aria-label="Camera raw view mode">
                   <button
@@ -7555,7 +7506,6 @@ export default function DashboardPage() {
                   </button>
                 </div>
               ) : null}
-            </div>
             {cameraRawFeed.length > 0 ? (
               <div className="camera-raw-filters" role="region" aria-label="Camera raw filters">
                 <input
