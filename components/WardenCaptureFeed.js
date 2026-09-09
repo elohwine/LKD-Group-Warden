@@ -27,7 +27,7 @@ function CarcheckBadge({ s, d }) {
   return null;
 }
 
-export default function WardenCaptureFeed({ getToken, selectedSiteId = '', sites = [], queueItems = [], contraventions = [], onStartDraft }) {
+export default function WardenCaptureFeed({ getToken, selectedSiteId = '', sites = [], queueItems = [], contraventions = [], onStartDraft, showPcnActions = true }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -158,7 +158,7 @@ export default function WardenCaptureFeed({ getToken, selectedSiteId = '', sites
                 <th className="wf-th">Time</th>
                 <th className="wf-th">Permit</th>
                 <th className="wf-th">Vehicle</th>
-                <th className="wf-th">PCN</th>
+                {showPcnActions ? <th className="wf-th">PCN</th> : null}
                 <th className="wf-th">Actions</th>
               </tr>
             </thead>
@@ -177,12 +177,12 @@ export default function WardenCaptureFeed({ getToken, selectedSiteId = '', sites
                     <td className="wf-td wf-td-ts">{fmt(row.timestamp)}</td>
                     <td className="wf-td"><PermitBadge s={cc.permitStatus} /></td>
                     <td className="wf-td"><CarcheckBadge s={cc.carcheckStatus} d={cc.carcheckDetails} /></td>
-                    <td className="wf-td">{draftCode && <span className={`wf-badge wf-badge--${hasPcn ? 'submitted' : 'draft-open'}`}>{hasPcn ? 'Issued' : 'Draft'}</span>}</td>
+                    {showPcnActions ? <td className="wf-td">{draftCode && <span className={`wf-badge wf-badge--${hasPcn ? 'submitted' : 'draft-open'}`}>{hasPcn ? 'Issued' : 'Draft'}</span>}</td> : null}
                     <td className="wf-td wf-td-actions">
                       <div className="wf-action-row">
                         <button type="button" className="wf-btn wf-btn--check" disabled={cc.carcheckStatus === 'checking'} onClick={() => runCarcheck(row.id, row.vrm)}>CC</button>
                         <button type="button" className="wf-btn wf-btn--check" disabled={cc.permitStatus === 'checking' || !selectedSiteId} onClick={() => runPermitCheck(row.id, row.vrm)}>eP</button>
-                        {!hasPcn && (
+                        {showPcnActions && !hasPcn && (
                           <button type="button" className={`wf-btn ${cc.permitStatus === 'has_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
                             onClick={() => onStartDraft?.({ vrm: row.vrm, vehicleImage: row.imgUrl, plateImage: row.plateUrl, timestamp: row.timestamp, siteId: selectedSiteId, carcheckDetails: cc.carcheckDetails, permitData: cc.permitData })}>
                             +PCN

@@ -7448,6 +7448,7 @@ export default function DashboardPage() {
             sites={sites}
             queueItems={queueItems}
             contraventions={contraventions}
+            showPcnActions
             onStartDraft={async ({ vrm, vehicleImage, plateImage, timestamp, siteId, carcheckDetails, permitData }) => {
               const entryTime = timestamp || new Date().toISOString();
               const effectiveSiteId = siteId || selectedSiteId || '';
