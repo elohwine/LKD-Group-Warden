@@ -28,6 +28,8 @@ import {
   recoverUploadableEvidenceFilesFromCameraRaw,
   resolveCameraRawImageSrc,
 } from '../lib/pcnEvidenceSync';
+import { loadCameraFeedImagePreviews, saveCameraFeedImagePreview } from '../lib/cameraFeedImageCache';
+import { clearQuickCaptureCards, loadQuickCaptureCards, saveQuickCaptureCards } from '../lib/quickCaptureStore';
 import AppShell from '../components/AppShell';
 import LoadingSpinner from '../components/LoadingSpinner.js';
 import LicensePlate from '../components/LicensePlate.js';
@@ -36,30 +38,19 @@ import PcnPreviewDialog from '../components/PcnPreviewDialog';
 import WardenCaptureFeed from '../components/WardenCaptureFeed';
 import { buildDemoSites, isDemoModeEnabled } from '../lib/demoMode';
 
-function formatElapsed(startIso, endIso = '') {
-  const startMs = new Date(startIso || '').getTime();
-  if (!Number.isFinite(startMs) || startMs <= 0) return '00:00';
-
-  const endMs = endIso ? new Date(endIso).getTime() : Date.now();
-  const diffMs = Math.max(0, endMs - startMs);
-  const totalSeconds = Math.floor(diffMs / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (hours > 0) {
-    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-  }
-
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
-
-function formatRemaining(secondsRemaining) {
-  const totalSeconds = Math.max(0, Math.floor(Number(secondsRemaining) || 0));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
+const WARDEN_SYNC_TRACE_TOGGLE_KEY = 'warden-sync-trace-enabled';
+const WARDEN_SYNC_TRACE_LOG_KEY = 'warden-sync-trace-log';
+const WARDEN_SYNC_TRACE_MAX_ENTRIES = 250;
+const WARDEN_QUICK_CAPTURE_MAX = 120;
+const WARDEN_CAMERA_FEED_VIEW_MODE_KEY = 'warden-camera-feed-view-mode';
+const WARDEN_GALLERY_LOOKUP_CACHE_KEY = 'warden-gallery-lookup-cache';
+const PCN_SYNC_CONCURRENCY = 1;
+const IMAGE_UPLOAD_CONCURRENCY = 1;
+const EVIDENCE_UPLOAD_TIMEOUT_MS = 120000;
+const EVIDENCE_UPLOAD_MAX_RETRIES = 2;
+const EVIDENCE_UPLOAD_COMPLETING_STALL_MS = 120000;
+const EVIDENCE_UPLOAD_PROGRESS_STALL_MS = 120000;
+const CAMERA_FEED_PREVIEW_FAILED = '__CAMERA_FEED_PREVIEW_FAILED__';
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   if (typeof fetch !== 'function') {
@@ -111,15 +102,30 @@ function isUploadableBlob(value) {
   return typeof value.arrayBuffer === 'function' && Number.isFinite(Number(value.size));
 }
 
-const PCN_SYNC_CONCURRENCY = 1;
-const IMAGE_UPLOAD_CONCURRENCY = 1;
-const EVIDENCE_UPLOAD_TIMEOUT_MS = 120000;
-const EVIDENCE_UPLOAD_MAX_RETRIES = 2;
-const EVIDENCE_UPLOAD_COMPLETING_STALL_MS = 120000;
-const EVIDENCE_UPLOAD_PROGRESS_STALL_MS = 120000;
-const WARDEN_SYNC_TRACE_TOGGLE_KEY = 'warden-sync-trace-enabled';
-const WARDEN_SYNC_TRACE_LOG_KEY = 'warden-sync-trace-log';
-const WARDEN_SYNC_TRACE_MAX_ENTRIES = 250;
+function formatElapsed(startIso, endIso = '') {
+  const startMs = new Date(startIso || '').getTime();
+  if (!Number.isFinite(startMs) || startMs <= 0) return '00:00';
+
+  const endMs = endIso ? new Date(endIso).getTime() : Date.now();
+  const diffMs = Math.max(0, endMs - startMs);
+  const totalSeconds = Math.floor(diffMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatRemaining(secondsRemaining) {
+  const totalSeconds = Math.max(0, Math.floor(Number(secondsRemaining) || 0));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
 
 function detectImageSrcKind(value) {
   const candidate = String(value || '').trim();
@@ -493,74 +499,79 @@ function formatCaptureTimestamp(capturedAt) {
   return formatLocalTimestamp(capturedAt);
 }
 
-async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
+// Enhanced version with separate header band (matches plate-cutout treatment).
+// Timestamp is now its own full-width section above the image with bigger, clearer text.
+// Supports VRM in header for vehicle images too.
+async function stampEvidenceImage(file, { capturedAt, phase, vrmText = '' } = {}) {
   if (!file || !(file.type || '').startsWith('image/')) return file;
 
   try {
     const image = await loadImageElement(file);
+    const imageWidth = image.naturalWidth || image.width;
+    const imageHeight = image.naturalHeight || image.height;
+    if (!imageWidth || !imageHeight) return file;
+
+    const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
+    const normalizedVrm = normalizeVrm(vrmText || file?.detectedPlateText || '');
+    const localCaptured = formatCaptureTimestamp(capturedAt);
+    const headerLine = normalizedVrm
+      ? `VRM ${normalizedVrm} | Captured ${localCaptured}`
+      : `Captured ${localCaptured}`;
+
+    const headerPadX = Math.max(8, Math.floor(imageWidth * 0.01));
+    const headerPadY = Math.max(8, Math.floor(imageHeight * 0.01));
+    const maxTextWidth = Math.max(48, imageWidth - (headerPadX * 2));
+
+    // Reuse simple font fitting (from BreachStepper)
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 8;
+    tempCanvas.height = 8;
+    const tempCtx = tempCanvas.getContext('2d');
+    if (!tempCtx) return file;
+
+    let headerFont = Math.max(14, Math.min(isPlateCutout ? 26 : 32, Math.floor(imageWidth / (isPlateCutout ? 38 : 28))));
+    while (headerFont > 14) {
+      tempCtx.font = `700 ${headerFont}px "Roboto Mono", "Courier New", monospace`;
+      if (tempCtx.measureText(headerLine).width <= maxTextWidth) break;
+      headerFont -= 1;
+    }
+
+    const measuredHeaderHeight = (headerPadY * 2) + headerFont + 4;
+    const headerHeight = Math.min(88, Math.max(42, measuredHeaderHeight));
+
     const canvas = document.createElement('canvas');
-    canvas.width = image.naturalWidth || image.width;
-    canvas.height = image.naturalHeight || image.height;
+    canvas.width = imageWidth;
+    canvas.height = imageHeight + headerHeight;
     const ctx = canvas.getContext('2d');
     if (!ctx || !canvas.width || !canvas.height) return file;
 
-    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-
-    const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
-    const stampText = formatCaptureTimestamp(capturedAt);
-    let baseFont = 3 * (isPlateCutout
-      ? Math.max(10, Math.min(14, Math.floor(canvas.width / 90)))
-      : Math.max(11, Math.min(16, Math.floor(canvas.width / 88))));
-    const marginX = Math.max(6, Math.floor(canvas.width * 0.012));
-    const marginY = Math.max(6, Math.floor(canvas.height * 0.014));
-    const maxBoxWidth = Math.max(40, canvas.width - (marginX * 2));
-    const maxBoxHeight = Math.max(20, canvas.height - (marginY * 2));
-
-    let paddingX = 0;
-    let paddingY = 0;
-    let boxWidth = 0;
-    let boxHeight = 0;
-    while (baseFont >= 10) {
-      paddingX = Math.max(8, Math.floor(baseFont * 0.45));
-      paddingY = Math.max(5, Math.floor(baseFont * 0.3));
-      ctx.font = `600 ${baseFont}px "Roboto Mono", "Courier New", monospace`;
-      const textWidth = Math.ceil(ctx.measureText(stampText).width);
-      boxWidth = textWidth + (paddingX * 2);
-      boxHeight = Math.ceil(baseFont + (paddingY * 2));
-      if (boxWidth <= maxBoxWidth && boxHeight <= maxBoxHeight) break;
-      baseFont -= 2;
-    }
-
-    const clampedBoxWidth = Math.min(maxBoxWidth, boxWidth);
-    const clampedBoxHeight = Math.min(maxBoxHeight, boxHeight);
-
-    // ANPR-style timestamp container: compact dark chip for readability.
-    ctx.fillStyle = 'rgba(5, 10, 18, 0.64)';
-    ctx.fillRect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
-    ctx.strokeStyle = 'rgba(220, 235, 255, 0.26)';
-    ctx.lineWidth = Math.max(1, Math.floor(baseFont * 0.08));
-    ctx.strokeRect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
+    // Header band - separate section, bigger and always visible (matches enhanced plate treatment)
+    ctx.fillStyle = 'rgba(5, 10, 18, 0.94)';
+    ctx.fillRect(0, 0, imageWidth, headerHeight);
+    ctx.strokeStyle = 'rgba(220, 235, 255, 0.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, headerHeight - 0.5);
+    ctx.lineTo(imageWidth, headerHeight - 0.5);
+    ctx.stroke();
 
     ctx.textBaseline = 'top';
-    ctx.lineJoin = 'round';
-    ctx.strokeStyle = 'rgba(0, 0, 0, 0.82)';
-    ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.22));
-    ctx.fillStyle = '#f7fbff';
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
-    ctx.clip();
-    ctx.strokeText(stampText, marginX + paddingX, marginY + paddingY);
-    ctx.fillText(stampText, marginX + paddingX, marginY + paddingY);
-    ctx.restore();
+    ctx.fillStyle = normalizedVrm ? '#a5e0ff' : '#e0e9f5';
+    ctx.font = `700 ${headerFont}px "Roboto Mono", "Courier New", monospace`;
+    ctx.fillText(headerLine, headerPadX, headerPadY + 2);
+
+    // Draw original image below the header (no overlay)
+    ctx.drawImage(image, 0, headerHeight, imageWidth, imageHeight);
 
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, file.type || 'image/jpeg', 0.92));
     if (!blob) return file;
 
-    return new File([blob], file.name, {
+    const stamped = new File([blob], file.name, {
       type: blob.type || file.type || 'image/jpeg',
       lastModified: file.lastModified || Date.now(),
     });
+    stamped.capturedAt = normalizeCapturedAt(capturedAt) || new Date().toISOString();
+    return stamped;
   } catch (_) {
     return file;
   }
@@ -773,6 +784,20 @@ function withAuthorizationMatchConfidence(result, inputVrm) {
       comparedCount: candidateVrms.length,
     },
   };
+}
+
+function MatchConfidencePill({ matchConfidence }) {
+  const score = Number(matchConfidence?.scorePercent || 0);
+  const bestVrm = String(matchConfidence?.bestVrm || '').trim();
+  if (!(score > 0 && bestVrm)) return null;
+
+  return (
+    <div className="auth-match-pill" role="status" aria-label="Closest match confidence">
+      <span className="auth-match-pill-label">Closest match</span>
+      <span className="auth-match-pill-vrm">{bestVrm}</span>
+      <span className="auth-match-pill-score">{score}%</span>
+    </div>
+  );
 }
 
 let ocrWorkerPromise = null;
@@ -1633,6 +1658,7 @@ export default function DashboardPage() {
   const [vehicleLookupLoading, setVehicleLookupLoading] = useState(false);
   const [vehicleLookupByVrm, setVehicleLookupByVrm] = useState({});
   const [carcheckDialogMessage, setCarcheckDialogMessage] = useState('');
+  const [galleryLookupDialog, setGalleryLookupDialog] = useState(null);
   const [carcheckSaveLoading, setCarcheckSaveLoading] = useState(false);
   const [carcheckSaveNotice, setCarcheckSaveNotice] = useState('');
   const [carcheckSaveStatus, setCarcheckSaveStatus] = useState('idle');
@@ -1663,8 +1689,21 @@ export default function DashboardPage() {
   const [captureStepperOpen, setCaptureStepperOpen] = useState(false);
   const [captureStepperPhase, setCaptureStepperPhase] = useState('entry');
   const [captureIsQuickMode, setCaptureIsQuickMode] = useState(false);
+  const [captureQuickForceScan, setCaptureQuickForceScan] = useState(false);
+
+  const [captureConfirmDialog, setCaptureConfirmDialog] = useState(null);
+  const [captureConfirmVrm, setCaptureConfirmVrm] = useState('');
+  const [quickCaptureSubmitting, setQuickCaptureSubmitting] = useState(false);
   const [captureCards, setCaptureCards] = useState([]);
   const [captureCardChecks, setCaptureCardChecks] = useState({});
+  const [selectedCaptureCardIds, setSelectedCaptureCardIds] = useState([]);
+  const [captureBulkSyncing, setCaptureBulkSyncing] = useState(false);
+  const [cameraFeedRows, setCameraFeedRows] = useState([]);
+  const [cameraFeedLoading, setCameraFeedLoading] = useState(false);
+  const [cameraFeedError, setCameraFeedError] = useState('');
+  const [cameraFeedPreviewCache, setCameraFeedPreviewCache] = useState({});
+  const [cameraFeedVrmFilter, setCameraFeedVrmFilter] = useState('');
+  const [cameraFeedViewMode, setCameraFeedViewMode] = useState('table');
   const [breachStatusFilter, setBreachStatusFilter] = useState('all');
   const [convertLoading, setConvertLoading] = useState(false);
   const [convertError, setConvertError] = useState('');
@@ -1705,12 +1744,88 @@ export default function DashboardPage() {
   });
   const qrFileInputRef = useRef(null);
   const quickCaptureInputRef = useRef(null);
+
   const authReadyRef = useRef(false);
   const pcnAutoCheckSignatureRef = useRef('');
   const pcnSubmitLimitRef = useRef(pLimit(1));
   const convertPipelineLimitRef = useRef(pLimit(1));
   const syncInFlightCountRef = useRef(0);
   const syncAbortControllersRef = useRef(new Map());
+  const cameraFeedChecksRef = useRef(new Set());
+  const cameraFeedPreviewCacheRef = useRef({});
+  const cameraFeedPreviewFetchInFlightRef = useRef(new Set());
+  const quickCaptureSyncInFlightRef = useRef(new Set());
+  const captureCardsRestoredRef = useRef(false);
+
+  function resolveCameraFeedImageSrc(url) {
+    const target = String(url || '').trim();
+    if (!target) return '';
+    const cached = cameraFeedPreviewCache[target];
+    if (typeof cached === 'string' && cached && cached !== CAMERA_FEED_PREVIEW_FAILED) return cached;
+    if (cached === CAMERA_FEED_PREVIEW_FAILED) return '';
+    if (/^data:image\//i.test(target) || /^blob:/i.test(target)) return target;
+    if (/^https?:\/\//i.test(target)) return target;
+    return '';
+  }
+
+  function getCameraFeedImageLoadState(url) {
+    const target = String(url || '').trim();
+    if (!target) return 'none';
+    if (/^data:image\//i.test(target) || /^blob:/i.test(target)) return 'ready';
+    if (!/^https?:\/\//i.test(target)) return 'none';
+
+    const cached = cameraFeedPreviewCache[target];
+    if (typeof cached === 'string' && cached && cached !== CAMERA_FEED_PREVIEW_FAILED) return 'ready';
+    if (cached === CAMERA_FEED_PREVIEW_FAILED) return 'failed';
+    return 'ready';
+  }
+
+  async function ensureCameraFeedPreview(url, providedToken = '', options = {}) {
+    const target = String(url || '').trim();
+    if (!/^https?:\/\//i.test(target)) return '';
+    const forceRetry = Boolean(options?.forceRetry);
+
+    const cached = cameraFeedPreviewCacheRef.current[target];
+    if (typeof cached === 'string' && cached && cached !== CAMERA_FEED_PREVIEW_FAILED) return cached;
+    if (!forceRetry && cached === CAMERA_FEED_PREVIEW_FAILED) return '';
+    if (cameraFeedPreviewFetchInFlightRef.current.has(target)) return '';
+
+    cameraFeedPreviewFetchInFlightRef.current.add(target);
+    try {
+      let authToken = String(providedToken || '').trim();
+      if (!authToken) {
+        try {
+          authToken = await resolveAuthToken();
+        } catch (_) {
+          authToken = '';
+        }
+      }
+
+      let preview = '';
+      try {
+        preview = await fetchImagePreviewDataUrl(target, authToken);
+      } catch (error) {
+        const statusMatch = /image_fetch_(\d+)/i.exec(String(error?.message || ''));
+        const statusCode = Number(statusMatch?.[1] || 0);
+        if (statusCode === 401) {
+          authToken = await resolveAuthToken({ forceRefresh: true });
+          preview = await fetchImagePreviewDataUrl(target, authToken);
+        }
+      }
+      if (!preview) return '';
+
+      cameraFeedPreviewCacheRef.current = { ...cameraFeedPreviewCacheRef.current, [target]: preview };
+      setCameraFeedPreviewCache((current) => ({ ...current, [target]: preview }));
+      saveCameraFeedImagePreview(target, preview).catch(() => null);
+      return preview;
+    } catch (_) {
+      cameraFeedPreviewCacheRef.current = { ...cameraFeedPreviewCacheRef.current, [target]: CAMERA_FEED_PREVIEW_FAILED };
+      setCameraFeedPreviewCache((current) => ({ ...current, [target]: CAMERA_FEED_PREVIEW_FAILED }));
+      return '';
+    } finally {
+      cameraFeedPreviewFetchInFlightRef.current.delete(target);
+    }
+  }
 
   function appendSyncProgressLog(message, level = 'info') {
     const safeMessage = String(message || '').trim();
@@ -1727,6 +1842,23 @@ export default function DashboardPage() {
       const next = [...(Array.isArray(current) ? current : []), entry];
       if (next.length > 300) return next.slice(next.length - 300);
       return next;
+    });
+  }
+
+  async function fetchImagePreviewDataUrl(url, authToken = '') {
+    const target = String(url || '').trim();
+    if (!/^https?:\/\//i.test(target)) return '';
+
+    const proxyUrl = buildApiUrl(`/api/warden/proxy-image?url=${encodeURIComponent(target)}`);
+    const headers = authToken ? { Authorization: `Bearer ${authToken}` } : undefined;
+    const response = await fetchWithTimeout(proxyUrl, { method: 'GET', cache: 'no-store', headers }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+    if (!response.ok) throw new Error(`image_fetch_${response.status}`);
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('image_preview_read_failed'));
+      reader.readAsDataURL(blob);
     });
   }
 
@@ -2137,6 +2269,570 @@ export default function DashboardPage() {
     canFinalizeBreach ||
     (selectedLifecycleCode === 'SUBMITTED' && Boolean(selectedTracked?.payload?.breachId))
   );
+
+  const cameraTabCaptureCards = useMemo(() => {
+    return Array.isArray(captureCards) ? captureCards : [];
+  }, [captureCards]);
+
+  const cameraFeedFilterQuery = useMemo(
+    () => normalizeVrm(cameraFeedVrmFilter || ''),
+    [cameraFeedVrmFilter]
+  );
+
+  const filteredCameraFeedRows = useMemo(() => {
+    if (!cameraFeedFilterQuery) return cameraFeedRows;
+    return cameraFeedRows.filter((row) => normalizeVrm(row?.vrm || '').includes(cameraFeedFilterQuery));
+  }, [cameraFeedRows, cameraFeedFilterQuery]);
+
+  const cameraDisplayRows = useMemo(() => {
+    const buildCaptureSignature = (row) => [
+      normalizeVrm(row?.vrm || row?.plateText || ''),
+      String(row?.timestamp || row?.readTimestamp || row?.capturedAt || '').trim(),
+      String(row?.siteId || row?.siteName || '').trim().toLowerCase(),
+      String(row?.imgUrl || row?.imageUrl || row?.vehicleImageUrl || row?.plateImageUrl || row?.plateUrl || '').trim(),
+    ].join('|');
+
+    const localRows = (Array.isArray(cameraTabCaptureCards) ? cameraTabCaptureCards : [])
+      .filter((card) => {
+        if (!cameraFeedFilterQuery) return true;
+        return normalizeVrm(card?.plateText || '').includes(cameraFeedFilterQuery);
+      })
+      .map((card) => {
+        const cardId = String(card?.id || '').trim();
+        const status = String(card?.syncStatus || 'queued');
+        return {
+          id: `local-${cardId}`,
+          localCardId: cardId,
+          isLocalCapture: true,
+          syncStatus: status,
+          vrm: String(card?.plateText || '').trim() || 'No VRM',
+          confidence: Number(card?.plateConfidence || 0),
+          siteName: String(card?.siteName || selectedSite?.name || selectedSiteId || '').trim() || 'Site not set',
+          cameraName: 'Warden App',
+          timestamp: card?.capturedAt || '',
+          readTimestamp: card?.capturedAt || '',
+          imgUrl: String(card?.vehiclePreview || card?.cutoffImage || '').trim(),
+          plateUrl: String(card?.cutoffImage || card?.vehiclePreview || '').trim(),
+          imageUrl: String(card?.vehiclePreview || card?.cutoffImage || '').trim(),
+          vehicleImageUrl: String(card?.vehiclePreview || card?.cutoffImage || '').trim(),
+          plateImageUrl: String(card?.cutoffImage || card?.vehiclePreview || '').trim(),
+          permitStatus: '',
+          carcheckStatus: '',
+          syncError: String(card?.syncError || '').trim(),
+        };
+      });
+
+    const localSignatures = new Set(localRows.map((row) => buildCaptureSignature(row)));
+    const remoteRows = filteredCameraFeedRows
+      .map((row) => ({ ...row, isLocalCapture: false }))
+      .filter((row) => !localSignatures.has(buildCaptureSignature(row)));
+
+    return [...localRows, ...remoteRows];
+  }, [cameraTabCaptureCards, cameraFeedFilterQuery, filteredCameraFeedRows, selectedSite, selectedSiteId]);
+
+  async function runCameraFeedPermitCheck(rowId, vrm) {
+    if (!rowId || !vrm || !selectedSiteId) return;
+    const permitKey = `permit-${rowId}`;
+    if (cameraFeedChecksRef.current.has(permitKey)) return;
+    cameraFeedChecksRef.current.add(permitKey);
+
+    setCameraFeedRows((current) => current.map((row) => (
+      row.id === rowId
+        ? { ...row, permitStatus: 'checking' }
+        : row
+    )));
+
+    try {
+      const token = await resolveAuthToken();
+      const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, { token });
+      const hasAuthorization = Boolean(result?.hasAuthorization);
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, permitStatus: hasAuthorization ? 'has_permit' : 'no_permit', permitData: result }
+          : row
+      )));
+    } catch (error) {
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, permitStatus: 'error', permitError: String(error?.message || 'Permit check failed') }
+          : row
+      )));
+    } finally {
+      cameraFeedChecksRef.current.delete(permitKey);
+    }
+  }
+
+  async function runCameraFeedCarcheck(rowId, vrm) {
+    if (!rowId || !vrm) return;
+    const carcheckKey = `carcheck-${rowId}`;
+    if (cameraFeedChecksRef.current.has(carcheckKey)) return;
+    cameraFeedChecksRef.current.add(carcheckKey);
+
+    setCameraFeedRows((current) => current.map((row) => (
+      row.id === rowId
+        ? { ...row, carcheckStatus: 'checking' }
+        : row
+    )));
+
+    try {
+      const token = await resolveAuthToken();
+      const result = await fetchJson(`/api/carcheck?vrm=${encodeURIComponent(vrm)}`, { token });
+      const make = String(result?.make || '').trim();
+      const model = String(result?.model || '').trim();
+      const color = String(result?.colour || result?.color || '').trim();
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, carcheckStatus: make || model ? 'ok' : 'not_found', carcheckDetails: { make, model, color } }
+          : row
+      )));
+    } catch (error) {
+      setCameraFeedRows((current) => current.map((row) => (
+        row.id === rowId
+          ? { ...row, carcheckStatus: 'error', carcheckError: String(error?.message || 'Carcheck failed') }
+          : row
+      )));
+    } finally {
+      cameraFeedChecksRef.current.delete(carcheckKey);
+    }
+  }
+
+  async function refreshCameraFeedRows() {
+    if (!selectedSiteId) {
+      setCameraFeedRows([]);
+      setCameraFeedError('');
+      return;
+    }
+
+    setCameraFeedLoading(true);
+    setCameraFeedError('');
+    try {
+      const token = await resolveAuthToken();
+      const params = new URLSearchParams({ limit: '100', cameraType: 'Warden App', order: 'desc' });
+      params.set('site', String(selectedSite?.name || selectedSite?.displayName || selectedSiteId));
+      const data = await fetchCameraServiceJson(`/api/frontend/alarms?${params.toString()}`, { token });
+      const alarms = Array.isArray(data?.alarms) ? data.alarms : [];
+      const rows = alarms.map((alarm) => {
+        const fallbackImages = { vehicleHint: '', plateHint: '', first: '', all: [] };
+        const primaryImage = (String(alarm?.vehicleImage || alarm?.imageUrl || '').trim()) || (String(alarm?.overviewImage || '').trim());
+        const plateImage = (String(alarm?.plateImage || '').trim()) || primaryImage;
+        return {
+          id: String(alarm?.id || `${alarm?.timestamp || Date.now()}-${Math.random()}`),
+          vrm: normalizeVrm(alarm?.vrm || alarm?.registration || alarm?.plate || ''),
+          confidence: Number(alarm?.confidence || alarm?.plateConfidence || 0),
+          siteName: String(alarm?.siteName || selectedSite?.name || selectedSite?.displayName || selectedSiteId || '').trim() || 'Site not set',
+          readTimestamp: alarm?.timestamp || alarm?.metadata?.timestamp || new Date().toISOString(),
+          cameraName: String(alarm?.cameraName || 'Warden App').trim() || 'Warden App',
+          imageUrl: primaryImage,
+          vehicleImageUrl: primaryImage,
+          plateImageUrl: plateImage,
+          permitStatus: 'idle',
+          carcheckStatus: 'idle',
+          readAt: alarm?.timestamp || alarm?.metadata?.timestamp || '',
+        };
+      });
+      setCameraFeedRows(rows);
+    } catch (error) {
+      setCameraFeedRows([]);
+      setCameraFeedError(String(error?.message || 'Camera feed unavailable'));
+    } finally {
+      setCameraFeedLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    const storedMode = String(window.localStorage.getItem(WARDEN_CAMERA_FEED_VIEW_MODE_KEY) || '').trim().toLowerCase();
+    if (storedMode === 'card') setCameraFeedViewMode('card');
+    else setCameraFeedViewMode('table');
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(WARDEN_CAMERA_FEED_VIEW_MODE_KEY, cameraFeedViewMode === 'card' ? 'card' : 'table');
+    }
+  }, [cameraFeedViewMode]);
+
+  function toggleCaptureCardSelection(id) {
+    if (!id) return;
+    setSelectedCaptureCardIds((current) => (
+      current.includes(id)
+        ? current.filter((entryId) => entryId !== id)
+        : [...current, id]
+    ));
+  }
+
+  function markFailedCaptureCardsForSync() {
+    const next = (Array.isArray(cameraTabCaptureCards) ? cameraTabCaptureCards : [])
+      .filter((card) => String(card?.syncStatus || 'queued') === 'failed')
+      .map((card) => card.id)
+      .filter(Boolean);
+    setSelectedCaptureCardIds(next);
+  }
+
+  function clearCaptureCardSelection() {
+    setSelectedCaptureCardIds([]);
+  }
+
+  async function syncSelectedCaptureCards() {
+    if (captureBulkSyncing) return;
+    if (!selectedCaptureCardIds.length) {
+      setMessage('Select camera captures to sync.');
+      return;
+    }
+
+    const selectedCards = (Array.isArray(captureCards) ? captureCards : [])
+      .filter((card) => selectedCaptureCardIds.includes(card.id));
+    const syncable = selectedCards.filter((card) => String(card?.syncStatus || 'queued') === 'failed');
+
+    if (syncable.length === 0) {
+      setMessage('Only failed captures can be retried.');
+      return;
+    }
+
+    setCaptureBulkSyncing(true);
+    try {
+      const results = await Promise.allSettled(syncable.map((card) => syncQuickCaptureCard(card.id)));
+      const okCount = results.filter((result) => result.status === 'fulfilled' && result.value === true).length;
+      const failedCount = syncable.length - okCount;
+      if (failedCount > 0) {
+        setMessage(`Bulk sync complete: ${okCount} synced, ${failedCount} failed.`);
+      } else {
+        setMessage(`Bulk sync complete: ${okCount} synced.`);
+      }
+    } finally {
+      setCaptureBulkSyncing(false);
+    }
+  }
+
+  async function resolveQuickCaptureImageUrls(card, files, currentSiteId, progressHook) {
+    const safeFiles = Array.isArray(files) ? files.filter(Boolean) : [];
+    const sourceCard = card || {};
+    const vrm = normalizeVrm(sourceCard?.plateText || '');
+    const siteId = String(currentSiteId || sourceCard?.siteId || selectedSiteId || '').trim();
+    const existingRemoteImageUrls = (Array.isArray(sourceCard?.remoteImageUrls) ? sourceCard.remoteImageUrls : [])
+      .map((value) => String(value || '').trim())
+      .filter((value) => /^https?:\/\//i.test(value));
+
+    const uploadableFiles = safeFiles.filter((file) => isUploadableBlob(file?.blob || file));
+    let filesForUpload = uploadableFiles;
+
+    if (filesForUpload.length === 0) {
+      const recovered = await recoverUploadableEvidenceFilesFromCameraRaw(
+        Array.isArray(sourceCard?.cameraRawData) ? sourceCard.cameraRawData : [],
+        'entry'
+      );
+      filesForUpload = Array.isArray(recovered) ? recovered.filter((file) => isUploadableBlob(file?.blob || file)) : [];
+    }
+
+    let uploadedImageUrls = [];
+    if (filesForUpload.length > 0) {
+      try {
+        const result = await uploadEvidenceFiles(filesForUpload, vrm, siteId, {
+          phase: 'quick_capture',
+          onProgress: progressHook,
+        });
+        uploadedImageUrls = (Array.isArray(result?.images) ? result.images : [])
+          .map((value) => String(value || '').trim())
+          .filter((value) => /^https?:\/\//i.test(value));
+      } catch (uploadError) {
+        if (existingRemoteImageUrls.length === 0) {
+          throw uploadError;
+        }
+      }
+    }
+
+    if (uploadedImageUrls.length === 0) {
+      uploadedImageUrls = [...existingRemoteImageUrls];
+    }
+
+    const evidenceFilesForMapping = filesForUpload.length > 0 ? filesForUpload : safeFiles;
+    const vehicleImageUrl = (() => {
+      for (let index = 0; index < Math.min(uploadedImageUrls.length, evidenceFilesForMapping.length); index += 1) {
+        if (isPlateCutoffFileArtifact(evidenceFilesForMapping[index])) continue;
+        const candidate = uploadedImageUrls[index];
+        if (/^https?:\/\//i.test(String(candidate || ''))) return candidate;
+      }
+      return uploadedImageUrls[0] || '';
+    })();
+
+    const plateImageUrl = pickUploadedPlateImageUrl(
+      uploadedImageUrls,
+      evidenceFilesForMapping,
+      sourceCard?.cutoffImage || ''
+    ) || vehicleImageUrl;
+
+    return { uploadedImageUrls, vehicleImageUrl, plateImageUrl };
+  }
+
+  async function syncQuickCaptureCard(cardId, options = {}) {
+    const targetCardId = String(cardId || '').trim();
+    if (!targetCardId) return false;
+
+    const providedCard = options?.sourceCard;
+    const sourceCard = providedCard && String(providedCard?.id || '') === targetCardId
+      ? providedCard
+      : (Array.isArray(captureCards) ? captureCards : []).find((card) => String(card?.id || '') === targetCardId);
+    if (!sourceCard) return false;
+
+    if (String(sourceCard?.syncStatus || '') === 'syncing') {
+      return false;
+    }
+
+    const siteId = String(sourceCard?.siteId || selectedSiteId || '').trim();
+    const vrm = normalizeVrm(sourceCard?.plateText || '');
+    const files = Array.isArray(sourceCard?.files) ? sourceCard.files.filter(Boolean) : [];
+    const captureLabel = vrm || 'capture';
+    const quickTraceId = `qc-${targetCardId}-${Date.now()}`;
+    const logQuickCaptureStage = (message, level = 'info') => {
+      appendSyncProgressLog(`[Quick Capture ${captureLabel}] ${String(message || '').trim()}`, level);
+    };
+
+    setSyncProgressDialogOpen(true);
+    setSyncProgressLogs([]);
+    setSyncProgressMeta({
+      traceId: quickTraceId,
+      itemId: targetCardId,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    });
+    logQuickCaptureStage('Sync started. Validating inputs.');
+
+    if (!siteId || !vrm || files.length === 0) {
+      const missingReason = 'Missing site, VRM, or evidence image.';
+      setCaptureCards((current) => (Array.isArray(current)
+        ? current.map((card) => (
+          String(card?.id || '') === targetCardId
+            ? { ...card, syncStatus: 'failed', syncProgress: 0, syncError: missingReason }
+            : card
+        ))
+        : current));
+      setSyncProgressMeta((current) => ({
+        ...current,
+        traceId: quickTraceId,
+        itemId: targetCardId,
+        status: 'failed',
+      }));
+      logQuickCaptureStage(`Validation failed: ${missingReason}`, 'error');
+      setMessage(`Capture sync failed (${captureLabel}): ${missingReason}`);
+      return false;
+    }
+
+    setCaptureCards((current) => (Array.isArray(current)
+      ? current.map((card) => (
+        String(card?.id || '') === targetCardId
+          ? { ...card, syncStatus: 'syncing', syncProgress: 5, syncError: '' }
+          : card
+      ))
+      : current));
+    logQuickCaptureStage(`Inputs valid. Uploading ${files.length} image${files.length === 1 ? '' : 's'}.`);
+    setMessage(`Syncing capture ${captureLabel}: preparing upload...`);
+
+    try {
+      const { uploadedImageUrls, vehicleImageUrl, plateImageUrl } = await resolveQuickCaptureImageUrls(sourceCard, files, siteId, (payload = {}) => {
+        const total = Math.max(1, Number(payload?.total || 1));
+        const completed = Math.max(0, Number(payload?.completed || 0));
+        const pct = payload?.status === 'done'
+          ? 100
+          : Math.max(8, Math.min(96, Math.round((completed / total) * 92)));
+        if (payload?.status === 'uploading') {
+          logQuickCaptureStage(`Uploading image ${Math.min(completed + 1, total)}/${total}.`);
+          setMessage(`Syncing capture ${captureLabel}: uploading image ${Math.min(completed + 1, total)}/${total}...`);
+        } else if (payload?.status === 'retrying') {
+          logQuickCaptureStage(`Retrying upload for image ${Math.min(completed + 1, total)}/${total}.`);
+          setMessage(`Syncing capture ${captureLabel}: upload retry ${Math.min(completed + 1, total)}/${total}...`);
+        } else if (payload?.status === 'done') {
+          logQuickCaptureStage(`Upload complete. ${uploadedImageUrls?.length || total} remote image URL(s) ready.`);
+          setMessage(`Syncing capture ${captureLabel}: upload complete, sending to camera service...`);
+        }
+        setCaptureCards((current) => (Array.isArray(current)
+          ? current.map((card) => (
+            String(card?.id || '') === targetCardId
+              ? { ...card, syncStatus: 'syncing', syncProgress: pct, syncError: '' }
+              : card
+          ))
+          : current));
+      });
+
+      const token = await resolveAuthToken();
+      logQuickCaptureStage('Auth token resolved. Sending capture to camera service.');
+  setMessage(`Syncing capture ${captureLabel}: sending to camera service...`);
+      const captureResponse = await fetchCameraServiceJson('/api/warden/capture', {
+        method: 'POST',
+        token,
+        body: {
+          vrm,
+          timestamp: normalizeCapturedAt(sourceCard?.capturedAt) || new Date().toISOString(),
+          direction: 'entry',
+          vehicleImage: vehicleImageUrl || null,
+          plateImage: plateImageUrl || null,
+          confidence: Number(sourceCard?.plateConfidence || 0),
+          siteId,
+          siteName: String(sourceCard?.siteName || siteId || '').trim(),
+          wardenId: profile?.uid || '',
+          wardenEmail: profile?.email || '',
+          wardenName: profile?.displayName || profile?.name || (profile?.email || '').split('@')[0] || '',
+        },
+      });
+
+      const captureAccepted = Boolean(captureResponse?.accepted);
+      if (!captureAccepted) {
+        logQuickCaptureStage(`Camera service rejected capture: ${String(captureResponse?.reason || captureResponse?.error || 'unknown rejection')}.`, 'error');
+        throw new Error(String(captureResponse?.reason || captureResponse?.error || 'Camera service capture rejected'));
+      }
+
+      setCaptureCards((current) => (Array.isArray(current)
+        ? current.map((card) => (
+          String(card?.id || '') === targetCardId
+            ? {
+              ...card,
+              syncStatus: 'synced',
+              syncProgress: 100,
+              syncError: '',
+              remoteImageUrls: uploadedImageUrls,
+            }
+            : card
+        ))
+        : current));
+      setSyncProgressMeta((current) => ({
+        ...current,
+        traceId: quickTraceId,
+        itemId: targetCardId,
+        status: 'success',
+      }));
+      logQuickCaptureStage(`Capture accepted. requestId=${captureResponse?.requestId || 'n/a'} alarmId=${captureResponse?.alarmId || 'n/a'}.`, 'success');
+      setMessage(`Capture ${captureLabel} synced: alarm ${captureResponse?.alarmId || 'created'}.`);
+
+      refreshCameraFeedRows().catch(() => null);
+      return true;
+    } catch (error) {
+      const reason = String(error?.message || 'Sync failed');
+      setCaptureCards((current) => (Array.isArray(current)
+        ? current.map((card) => (
+          String(card?.id || '') === targetCardId
+            ? {
+              ...card,
+              syncStatus: 'failed',
+              syncProgress: 0,
+              syncError: reason,
+            }
+            : card
+        ))
+        : current));
+      setSyncProgressMeta((current) => ({
+        ...current,
+        traceId: quickTraceId,
+        itemId: targetCardId,
+        status: 'failed',
+      }));
+      logQuickCaptureStage(`Sync failed: ${reason}`, 'error');
+      setMessage(`Capture sync failed (${captureLabel}): ${reason}`);
+      return false;
+    }
+  }
+
+  function archiveCaptureCard(id) {
+    if (!id) return;
+    setCaptureCards((current) => (Array.isArray(current) ? current.filter((card) => card?.id !== id) : []));
+    setSelectedCaptureCardIds((current) => current.filter((entryId) => entryId !== id));
+  }
+
+  function archiveSelectedCaptureCards() {
+    if (!selectedCaptureCardIds.length) {
+      setMessage('Select captures to archive.');
+      return;
+    }
+
+    const selectedCount = selectedCaptureCardIds.length;
+    const confirmed = typeof window === 'undefined' ? true : window.confirm(`Archive ${selectedCount} selected capture${selectedCount === 1 ? '' : 's'} from camera tab queue?`);
+    if (!confirmed) return;
+
+    setCaptureCards((current) => (Array.isArray(current) ? current.filter((card) => !selectedCaptureCardIds.includes(card.id)) : []));
+    setSelectedCaptureCardIds([]);
+  }
+
+  useEffect(() => {
+    if (!selectedSiteId) {
+      setCameraFeedRows([]);
+      return;
+    }
+  }, [selectedSiteId]);
+
+  useEffect(() => {
+    if (!selectedSiteId) return;
+    captureCardsRestoredRef.current = false;
+    const stored = loadQuickCaptureCards();
+    stored.then((cards) => {
+      if (Array.isArray(cards) && cards.length) {
+        setCaptureCards(cards.map((card) => ({
+          ...card,
+          checks: card?.checks || null,
+        })));
+        const restoredChecks = {};
+        for (const card of cards) {
+          if (card?.id && card?.checks && typeof card.checks === 'object') {
+            restoredChecks[card.id] = card.checks;
+          }
+        }
+        setCaptureCardChecks(restoredChecks);
+      }
+    }).catch(() => null).finally(() => {
+      captureCardsRestoredRef.current = true;
+    });
+  }, [selectedSiteId]);
+
+  useEffect(() => {
+    if (!captureCardsRestoredRef.current) return;
+    const mergedCards = (Array.isArray(captureCards) ? captureCards : []).map((card) => ({
+      ...card,
+      checks: captureCardChecks[card.id] || card.checks || null,
+    }));
+    saveQuickCaptureCards(mergedCards).catch(() => null);
+  }, [captureCards, captureCardChecks]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!Object.keys(vehicleLookupByVrm || {}).length && !Object.keys(authorizationByVrm || {}).length) return;
+    try {
+      window.localStorage.setItem(WARDEN_GALLERY_LOOKUP_CACHE_KEY, JSON.stringify({
+        vehicleLookupByVrm,
+        authorizationByVrm,
+      }));
+    } catch (_) {
+      // Ignore cache write issues.
+    }
+  }, [vehicleLookupByVrm, authorizationByVrm]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = window.localStorage.getItem(WARDEN_GALLERY_LOOKUP_CACHE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed?.vehicleLookupByVrm && typeof parsed.vehicleLookupByVrm === 'object') {
+        setVehicleLookupByVrm(parsed.vehicleLookupByVrm);
+      }
+      if (parsed?.authorizationByVrm && typeof parsed.authorizationByVrm === 'object') {
+        setAuthorizationByVrm(parsed.authorizationByVrm);
+      }
+    } catch (_) {
+      // Ignore malformed cache.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!cameraFeedRows.length) return;
+    const urls = cameraFeedRows
+      .map((row) => row.vehicleImageUrl || row.plateImageUrl || row.imageUrl)
+      .filter((value) => /^https?:\/\//i.test(String(value || '')));
+    if (!urls.length) return;
+    loadCameraFeedImagePreviews(urls)
+      .then((previewMap) => {
+        if (Object.keys(previewMap).length > 0) {
+          setCameraFeedPreviewCache((current) => ({ ...current, ...previewMap }));
+          cameraFeedPreviewCacheRef.current = { ...cameraFeedPreviewCacheRef.current, ...previewMap };
+        }
+      })
+      .catch(() => null);
+  }, [cameraFeedRows]);
 
   useEffect(() => {
     if (!demoObservationExpired) {
@@ -2721,6 +3417,13 @@ export default function DashboardPage() {
   }, [selectedSiteId, sites]);
 
   useEffect(() => {
+    if (activeTab !== 'camera') return;
+    // Camera tab must use direct quick-capture only.
+    setCaptureStepperOpen(false);
+    setCaptureIsQuickMode(false);
+  }, [activeTab]);
+
+  useEffect(() => {
     if (selectedMobileCameraId) {
       saveStoredMobileCameraId(selectedMobileCameraId);
     }
@@ -3056,64 +3759,280 @@ export default function DashboardPage() {
     await router.replace('/login');
   }
 
+  function resetQuickCaptureFlowState() {
+    setCaptureStepperOpen(false);
+    setCaptureStepperPhase('entry');
+    setCaptureIsQuickMode(false);
+    setCaptureQuickForceScan(false);
+    setCaptureConfirmDialog(null);
+    setCaptureConfirmVrm('');
+    setQuickCaptureSubmitting(false);
+    if (quickCaptureInputRef.current) {
+      quickCaptureInputRef.current.value = '';
+    }
+  }
+
   function openCaptureDialog(phase) {
     const normalizedPhase = phase === 'closing' ? 'closing' : 'entry';
-    setCaptureIsQuickMode(false);
+    resetQuickCaptureFlowState();
     setCaptureStepperPhase(normalizedPhase);
     setCaptureStepperOpen(true);
   }
 
-  // Direct file-input capture: camera opens immediately, OCR runs per-card without wizard.
+  function launchQuickScanCapture() {
+    if (!selectedSiteId) {
+      setMessage('Select patrol site before capture.');
+      return;
+    }
+    setStepperOpen(false);
+    resetQuickCaptureFlowState();
+    setCaptureIsQuickMode(true);
+    setCaptureQuickForceScan(false); // user picks OCR/Manual inside the stepper
+    setCaptureStepperPhase('entry');
+    setCaptureStepperOpen(true);
+  }
+
+  // Direct file-input quick capture: camera opens immediately, OCR runs,
+  // then opens confirm/check dialog (no preview-first stepper UI).
   async function handleQuickCaptureInput(event) {
     const file = event.target.files?.[0];
     event.target.value = ''; // reset so same file can be retaken immediately
     if (!file) return;
 
-    const capturedAt = await getServerTimestamp();
-    file.capturedAt = capturedAt;
-    // Unique card ID — the ONLY key used to update this card; prevents any cross-capture bleed.
-    const cardId = `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const effectiveSiteId = selectedSiteId;
-    const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
+    const fallbackCapturedAt = await getServerTimestamp();
+    file.capturedAt = normalizeCapturedAt(file?.capturedAt) || fallbackCapturedAt;
 
-    setCaptureCards((prev) => [{
-      id: cardId,
+    let scan = null;
+    try {
+      scan = await scanPlateFromImage(file);
+    } catch (_) {
+      scan = null;
+    }
+
+    const capturedAt = normalizeCapturedAt(file.capturedAt) || fallbackCapturedAt;
+    const vrm = normalizeVrm(scan?.plateText || file?.detectedPlateText || '');
+
+    setCaptureConfirmVrm(vrm);
+    setCaptureConfirmDialog({
+      open: true,
+      phase: 'entry',
       capturedAt,
-      plateText: '',
-      plateConfidence: 0,
-      cutoffImage: '',
-      vehiclePreview: '',
+      siteId: String(selectedSiteId || '').trim(),
       files: [file],
-      siteId: effectiveSiteId,
-      siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId || '',
-      scanning: true,
-    }, ...prev]);
-
-    // Preview generation — scoped to cardId, cannot overwrite another card.
-    fileToDataUrl(file).then((url) => {
-      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, vehiclePreview: url } : c));
-    }).catch(() => {});
-
-    // OCR — result is keyed to cardId before any setState call.
-    scanPlateFromImage(file).then((result) => {
-      const plate = normalizeVrm(result?.plateText || '');
-      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? {
-        ...c,
-        scanning: false,
-        plateText: plate,
-        plateConfidence: Number(result?.confidence || 0),
-        cutoffImage: result?.cutoffImage || '',
-      } : c));
-      if (plate && effectiveSiteId) {
-        runCardCarcheck(cardId, plate);
-        runCardPermit(cardId, plate, effectiveSiteId);
-      }
-    }).catch(() => {
-      setCaptureCards((prev) => prev.map((c) => c.id === cardId ? { ...c, scanning: false } : c));
+      scan: {
+        plateText: vrm,
+        confidence: Number(scan?.confidence || file?.detectedPlateConfidence || 0),
+        cutoffImage: String(scan?.cutoffImage || file?.detectedPlateCutoffImage || '').trim(),
+        bbox: scan?.bbox || file?.detectedPlateBbox || null,
+      },
+      captureMode: 'scan',
+      loading: true,
+      error: '',
+      checks: {
+        loading: true,
+        carcheck: null,
+        permit: null,
+      },
     });
 
-    // Re-open camera for next vehicle after a brief pause.
-    window.setTimeout(() => quickCaptureInputRef.current?.click(), 350);
+    if (!vrm) {
+      // For manual flow we allow empty VRM (user will fill the dialog)
+      setCaptureConfirmDialog((current) => (current ? {
+        ...current,
+        loading: false,
+        error: '',
+        checks: {
+          loading: false,
+          carcheck: null,
+          permit: null,
+        },
+      } : current));
+      return;
+    }
+
+    await refreshQuickCaptureConfirmChecks(vrm, selectedSiteId);
+  }
+
+  async function refreshQuickCaptureConfirmChecks(nextVrm, nextSiteId) {
+    const vrm = normalizeVrm(nextVrm || '');
+    const siteId = String(nextSiteId || '').trim();
+    if (!vrm || !siteId) {
+      setCaptureConfirmDialog((current) => (current ? {
+        ...current,
+        loading: false,
+        error: siteId ? 'No VRM detected.' : 'Select a patrol site before submitting.',
+        checks: {
+          permit: null,
+          loading: false,
+        },
+      } : current));
+      return null;
+    }
+
+    setCaptureConfirmDialog((current) => (current ? {
+      ...current,
+      loading: true,
+      error: '',
+      checks: {
+        ...(current.checks || {}),
+        loading: true,
+      },
+    } : current));
+
+    try {
+      const result = await ensurePcnSubmissionChecks({
+        vrm,
+        siteId,
+        forceCarcheck: false,
+        openDialog: false,
+        allowNetwork: true,
+      });
+
+      setCaptureConfirmDialog((current) => (current ? {
+        ...current,
+        loading: false,
+        error: result.ok ? '' : String(result.error || 'Check failed'),
+        checks: {
+          loading: false,
+          permit: result.ok ? result.permitResult || null : null,
+        },
+      } : current));
+      return result;
+    } catch (error) {
+      const reason = String(error?.message || 'Check failed');
+      setCaptureConfirmDialog((current) => (current ? {
+        ...current,
+        loading: false,
+        error: reason,
+        checks: {
+          loading: false,
+          permit: null,
+        },
+      } : current));
+      return { ok: false, error: reason };
+    }
+  }
+
+  async function handleQuickCaptureComplete({ files = [], scan = null, captureMode = 'scan' } = {}) {
+    // Manual capture support: if captureMode==='manual' we skip OCR and open confirm dialog with empty VRM field.
+    const rawFiles = Array.isArray(files) ? files : [];
+    if (rawFiles.length === 0) {
+      setCaptureStepperOpen(false);
+      return;
+    }
+
+    // Close the capture stepper immediately to avoid a transient quick-flow
+    // frame while we resolve timestamps and prepare the VRM confirm dialog.
+    setCaptureStepperOpen(false);
+
+    const fallbackCapturedAt = await getServerTimestamp();
+    const nextFiles = rawFiles.map((file) => {
+      const capturedAt = normalizeCapturedAt(file?.capturedAt) || fallbackCapturedAt;
+      file.capturedAt = capturedAt;
+      return file;
+    });
+
+    const capturedAt = normalizeCapturedAt(nextFiles[0]?.capturedAt) || fallbackCapturedAt;
+    const vrm = normalizeVrm(scan?.plateText || nextFiles[0]?.detectedPlateText || '');
+
+    setCaptureConfirmVrm(vrm);
+    setCaptureConfirmDialog({
+      open: true,
+      phase: 'entry',
+      capturedAt,
+      siteId: String(selectedSiteId || '').trim(),
+      files: nextFiles,
+      scan: {
+        plateText: vrm,
+        confidence: Number(scan?.confidence || nextFiles[0]?.detectedPlateConfidence || 0),
+        cutoffImage: String(scan?.cutoffImage || nextFiles[0]?.detectedPlateCutoffImage || '').trim(),
+        bbox: scan?.bbox || nextFiles[0]?.detectedPlateBbox || null,
+      },
+      captureMode,
+      loading: true,
+      error: '',
+      checks: {
+        loading: true,
+        carcheck: null,
+        permit: null,
+      },
+    });
+
+    if (!vrm && captureMode !== 'manual') {
+      setCaptureConfirmDialog((current) => (current ? {
+        ...current,
+        loading: false,
+        error: 'No VRM detected. Try again.',
+        checks: {
+          loading: false,
+          carcheck: null,
+          permit: null,
+        },
+      } : current));
+      return;
+    }
+
+    await refreshQuickCaptureConfirmChecks(vrm || '', selectedSiteId);
+  }
+
+  async function handleConfirmQuickCapture() {
+    if (!captureConfirmDialog) return;
+    if (quickCaptureSubmitting) return;
+
+    const siteId = String(captureConfirmDialog.siteId || selectedSiteId || '').trim();
+    const vrm = normalizeVrm(captureConfirmVrm || captureConfirmDialog?.scan?.plateText || '');
+    const rawFiles = Array.isArray(captureConfirmDialog.files) ? captureConfirmDialog.files : [];
+
+    if (!siteId || !vrm || rawFiles.length === 0) {
+      setMessage('Select a site and enter a valid VRM before submitting.');
+      return;
+    }
+
+    const capturedAt = normalizeCapturedAt(captureConfirmDialog.capturedAt) || new Date().toISOString();
+    const effectiveSite = sites.find((site) => String(site.id) === siteId) || null;
+    const cardId = `qc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const previewUrls = await toPreviewSrcList(rawFiles);
+    const primaryPreview = String(previewUrls[0] || captureConfirmDialog?.scan?.cutoffImage || '').trim();
+
+    const card = {
+      id: cardId,
+      capturedAt,
+      plateText: vrm,
+      plateConfidence: Number(captureConfirmDialog?.scan?.confidence || 0),
+      cutoffImage: String(captureConfirmDialog?.scan?.cutoffImage || '').trim(),
+      vehiclePreview: primaryPreview,
+      files: rawFiles,
+      siteId,
+      siteName: effectiveSite?.name || effectiveSite?.displayName || siteId || '',
+      syncStatus: 'queued',
+      syncProgress: 0,
+      syncError: '',
+      remoteImageUrls: [],
+      cameraRawData: buildCameraRawRecords(rawFiles, previewUrls, {
+        phase: 'entry',
+        capturedAt,
+        source: 'WARDEN_QUICK_CAPTURE',
+      }),
+      permitResult: captureConfirmDialog?.checks?.permit || null,
+      carcheckResult: captureConfirmDialog?.checks?.carcheck || null,
+    };
+
+    setCaptureCards((prev) => [card, ...prev].slice(0, WARDEN_QUICK_CAPTURE_MAX));
+    setQuickCaptureSubmitting(true);
+    setCaptureConfirmDialog(null);
+    setSyncProgressDialogOpen(true);
+
+    await new Promise((resolve) => window.requestAnimationFrame(resolve));
+
+    try {
+      if (siteId && vrm) {
+        await syncQuickCaptureCard(cardId, { sourceCard: card });
+      }
+
+      setMessage(`Capture ${vrm} submitted.`);
+    } finally {
+      resetQuickCaptureFlowState();
+    }
   }
   async function runCardCarcheck(cardId, vrm) {
     if (!vrm) return;
@@ -3121,15 +4040,30 @@ export default function DashboardPage() {
     try {
       const token = await resolveAuthToken();
       const result = await fetchJson(`/api/carcheck?vrm=${encodeURIComponent(vrm)}`, { token });
-      const make = String(result?.make || result?.vehicle?.make || '').trim();
-      const model = String(result?.model || result?.vehicle?.model || '').trim();
-      const color = String(result?.colour || result?.color || result?.vehicle?.colour || '').trim();
+      const normalized = normalizeVehicleLookup(result, vrm);
+      const make = String(normalized?.make || normalized?.vehicle?.make || '').trim();
+      const model = String(normalized?.model || normalized?.vehicle?.model || '').trim();
+      const color = String(normalized?.color || normalized?.vehicle?.colour || '').trim();
       setCaptureCardChecks((prev) => ({
         ...prev,
         [cardId]: { ...prev[cardId], carcheckStatus: make || model ? 'ok' : 'not_found', carcheckDetails: { make, model, color } },
       }));
+      if (normalized) {
+        setVehicleLookupByVrm((current) => ({ ...current, [normalizeVrm(vrm)]: normalized }));
+        setVehicleLookup(normalized);
+      }
+      setCarcheckDialogMessage(make || model
+        ? `Carcheck complete: ${[make, model].filter(Boolean).join(' ')}.`
+        : 'Carcheck complete. No exact vehicle match returned.');
+      setCarcheckSaveNotice('');
+      setCarcheckSaveStatus('idle');
+      setCarcheckDialogOpen(true);
     } catch (_) {
       setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], carcheckStatus: 'error' } }));
+      setCarcheckDialogMessage('Carcheck unavailable');
+      setCarcheckSaveNotice('');
+      setCarcheckSaveStatus('idle');
+      setCarcheckDialogOpen(true);
     }
   }
 
@@ -3142,14 +4076,76 @@ export default function DashboardPage() {
         `/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(siteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`,
         { token }
       );
-      const has = Boolean(result?.hasAuthorization);
+      const decoratedResult = withAuthorizationMatchConfidence(result, vrm);
+      const has = Boolean(decoratedResult?.hasAuthorization);
       setCaptureCardChecks((prev) => ({
         ...prev,
-        [cardId]: { ...prev[cardId], permitStatus: has ? 'has_permit' : 'no_permit', permitData: result },
+        [cardId]: { ...prev[cardId], permitStatus: has ? 'has_permit' : 'no_permit', permitData: decoratedResult },
       }));
+      setAuthorizationByVrm((current) => ({ ...current, [normalizeVrm(vrm)]: decoratedResult }));
+      setAuthorization(decoratedResult);
+      setGalleryLookupDialog({
+        open: true,
+        vrm: normalizeVrm(vrm),
+        siteId: String(siteId || '').trim(),
+        result: decoratedResult,
+        title: has ? 'Permit matched' : 'Permit check result',
+      });
     } catch (_) {
       setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], permitStatus: 'error' } }));
+      setGalleryLookupDialog({
+        open: true,
+        vrm: normalizeVrm(vrm),
+        siteId: String(siteId || '').trim(),
+        result: null,
+        title: 'Permit check result',
+        message: 'Permit lookup failed',
+      });
     }
+  }
+
+  function openGalleryCarcheckResult({ vrm, result, status, error }) {
+    const normalized = result ? normalizeVehicleLookup(result, vrm) : null;
+    if (normalized) {
+      setVehicleLookup(normalized);
+      if (normalized?.vrm) {
+        setVehicleLookupByVrm((current) => ({ ...current, [normalizeVrm(normalized.vrm || vrm)]: normalized }));
+      } else if (vrm) {
+        setVehicleLookupByVrm((current) => ({ ...current, [normalizeVrm(vrm)]: normalized }));
+      }
+    }
+    setCarcheckSaveNotice('');
+    setCarcheckSaveStatus('idle');
+    const resolvedStatus = String(status || '').trim().toLowerCase();
+    if (resolvedStatus === 'error') {
+      setCarcheckDialogMessage(String(error || 'Carcheck lookup failed.'));
+    } else if (resolvedStatus === 'not_found') {
+      setCarcheckDialogMessage('Carcheck complete. No exact vehicle match returned.');
+    } else {
+      setCarcheckDialogMessage(normalized?.make || normalized?.model
+        ? `Carcheck complete: ${[normalized.make, normalized.model].filter(Boolean).join(' ')}.`
+        : 'Carcheck complete.');
+    }
+    setCarcheckDialogOpen(true);
+  }
+
+  function openGalleryPermitResult({ vrm, siteId, result, hasAuthorization }) {
+    const decoratedResult = result?.matchConfidence ? result : withAuthorizationMatchConfidence(result, vrm);
+    const normalizedVrm = normalizeVrm(vrm);
+    if (decoratedResult) {
+      setAuthorization(decoratedResult);
+      if (normalizedVrm) {
+        setAuthorizationByVrm((current) => ({ ...current, [normalizedVrm]: decoratedResult }));
+      }
+    }
+    setGalleryLookupDialog({
+      open: true,
+      vrm: normalizedVrm,
+      siteId: String(siteId || selectedSiteId || '').trim(),
+      result: decoratedResult,
+      title: hasAuthorization ? 'Permit matched' : 'Permit check result',
+      message: decoratedResult ? '' : 'Permit lookup unavailable',
+    });
   }
 
   function closeImageDetailDialog() {
@@ -3584,28 +4580,31 @@ export default function DashboardPage() {
       formData.append('manualVrm', vrmValue || '');
 
       let token = await resolveAuthToken();
-      let response = await fetchWithTimeout(buildApiUrl('/api/warden/uploadevidence'), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        body: formData,
-      }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+      let data;
 
-      if (response.status === 401) {
-        token = await resolveAuthToken({ forceRefresh: true });
-        response = await fetchWithTimeout(buildApiUrl('/api/warden/uploadevidence'), {
+      try {
+        data = await fetchJson('/api/warden/uploadevidence', {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
           },
           body: formData,
-        }, EVIDENCE_UPLOAD_TIMEOUT_MS);
-      }
-
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data?.error || `Fallback upload failed (${response.status})`);
+          timeoutMs: EVIDENCE_UPLOAD_TIMEOUT_MS,
+        });
+      } catch (error) {
+        if (Number(error?.status || 0) === 401) {
+          token = await resolveAuthToken({ forceRefresh: true });
+          data = await fetchJson('/api/warden/uploadevidence', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+            body: formData,
+            timeoutMs: EVIDENCE_UPLOAD_TIMEOUT_MS,
+          });
+        } else {
+          throw error;
+        }
       }
 
       return {
@@ -3645,35 +4644,38 @@ export default function DashboardPage() {
         ? `warden_evidence/${encodeURIComponent(siteId)}`
         : 'warden_evidence';
 
-      const signedEndpoint = buildApiUrl(
-        `/api/warden/uploadevidence?mode=signed-upload&folder=${signedFolder}&filename=${encodeURIComponent(fileName)}&contentType=${encodeURIComponent(contentType)}`
-      );
-
       let lastError = null;
       for (let attempt = 0; attempt <= EVIDENCE_UPLOAD_MAX_RETRIES; attempt += 1) {
         try {
           let token = await resolveAuthToken();
-          let response = await fetchWithTimeout(signedEndpoint, {
-            method: 'GET',
-            headers: {
-              Authorization: `Bearer ${token}`,
-              Accept: 'application/json',
-            },
-          }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+          let data;
 
-          if (response.status === 401) {
-            token = await resolveAuthToken({ forceRefresh: true });
-            response = await fetchWithTimeout(signedEndpoint, {
+          try {
+            data = await fetchJson(`/api/warden/uploadevidence?mode=signed-upload&folder=${signedFolder}&filename=${encodeURIComponent(fileName)}&contentType=${encodeURIComponent(contentType)}`, {
               method: 'GET',
+              token,
               headers: {
-                Authorization: `Bearer ${token}`,
                 Accept: 'application/json',
               },
-            }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+              timeoutMs: EVIDENCE_UPLOAD_TIMEOUT_MS,
+            });
+          } catch (error) {
+            if (Number(error?.status || 0) === 401) {
+              token = await resolveAuthToken({ forceRefresh: true });
+              data = await fetchJson(`/api/warden/uploadevidence?mode=signed-upload&folder=${signedFolder}&filename=${encodeURIComponent(fileName)}&contentType=${encodeURIComponent(contentType)}`, {
+                method: 'GET',
+                token,
+                headers: {
+                  Accept: 'application/json',
+                },
+                timeoutMs: EVIDENCE_UPLOAD_TIMEOUT_MS,
+              });
+            } else {
+              throw error;
+            }
           }
 
-          const data = await response.json().catch(() => ({}));
-          if (!response.ok) {
+          if (!data?.url) {
             const prefix = uploadCandidates.length > 1 ? `Image upload failed (${file?.name || 'evidence'}): ` : '';
             throw new Error(`${prefix}${data?.error || 'Failed to request signed upload URL'}`);
           }
@@ -5378,11 +6380,16 @@ export default function DashboardPage() {
         payloadBytes,
       });
 
-      // Relay entry + closing observations to camera service breach engine (fire-and-forget).
-      // Failures are intentionally swallowed so a camera-service outage never blocks PCN generation.
-      const relayCaptureEvent = (direction, timestamp, vehicleImg, plateImg) => {
-        if (!vrm || !queuedSiteId) return;
-        fetchJson('/api/warden/relay-to-camera-service', {
+      // Send entry + closing observations to camera service and require acceptance.
+      const sendCaptureEvent = async (direction, timestamp, vehicleImg, plateImg) => {
+        if (!vrm) {
+          throw new Error('Camera capture skipped: missing VRM.');
+        }
+        if (!queuedSiteId) {
+          throw new Error('Camera capture skipped: missing siteId.');
+        }
+
+        const captureResponse = await fetchCameraServiceJson('/api/warden/capture', {
           method: 'POST',
           token,
           body: {
@@ -5391,28 +6398,42 @@ export default function DashboardPage() {
             direction,
             vehicleImage: vehicleImg || null,
             plateImage: plateImg || null,
+            confidence: Number(submissionSafePayload?.detectedEntryPlateConfidence || submissionSafePayload?.detectedClosingPlateConfidence || 0),
             siteId: queuedSiteId,
             siteName: queuedSiteName,
+            wardenId: profile?.uid || '',
             // wardenEmail/wardenName let the camera service name this warden's camera meaningfully.
             wardenEmail: profile?.email || '',
             wardenName: profile?.displayName || profile?.name || (profile?.email || '').split('@')[0] || '',
           },
-        }).catch((relayErr) => {
-          console.warn(`[warden] Camera service relay (${direction}) skipped:`, relayErr?.message);
         });
+
+        if (!captureResponse?.accepted) {
+          throw new Error(String(captureResponse?.reason || captureResponse?.error || `Camera service ${direction} capture rejected`));
+        }
+
+        return captureResponse;
       };
-      relayCaptureEvent(
+
+      const entryCapture = await sendCaptureEvent(
         'entry',
         entryTime,
         entryFrame?.imageUrl || breachPayload?.detectedEntryVehicleImage || null,
         entryPlateImageUrl || null,
       );
-      relayCaptureEvent(
+      const exitCapture = await sendCaptureEvent(
         'exit',
         closingTime,
         closingFrame?.imageUrl || breachPayload?.detectedClosingVehicleImage || null,
         closingPlateImageUrl || null,
       );
+
+      syncTrace('camera_capture_events_sent', {
+        entryRequestId: entryCapture?.requestId || null,
+        exitRequestId: exitCapture?.requestId || null,
+        entryAlarmId: entryCapture?.alarmId || null,
+        exitAlarmId: exitCapture?.alarmId || null,
+      });
 
       setMessage(`Sync ${queueVrmLabel} Step 4/4: Submitting breach to backend...`);
       syncTrace('stage_update', {
@@ -6331,7 +7352,7 @@ export default function DashboardPage() {
             aria-label="Open settings"
             title="Settings"
           >
-            ⚙
+            Settings
           </button>
           <button type="button" className="header-logout-btn" onClick={handleLogout}>
             Sign out
@@ -6420,7 +7441,7 @@ export default function DashboardPage() {
           {/* Session cards */}
           {filteredBreaches.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">🚗</div>
+              <div className="empty-icon">Sessions</div>
               <p className="empty-title">No parking charges yet</p>
               <p className="empty-hint">Tap <strong>+</strong> to create a Draft Parking Charge</p>
             </div>
@@ -6459,7 +7480,6 @@ export default function DashboardPage() {
                       {item.isOpen ? (
                         <>
                           <div className="sc-timer">
-                            <span className="sc-timer-icon">⏱</span>
                             <span className="sc-timer-val">{item.requiredMinutes > 0 ? formatRemaining(item.remainingSeconds) : formatElapsed(item.observationStartTime)}</span>
                           </div>
                           {item.isPastRequired ? (
@@ -6644,21 +7664,14 @@ export default function DashboardPage() {
 
             {selectedTrackedAuthorization ? (
               <div className={`auth-result ${selectedTrackedAuthorization.hasAuthorization ? 'auth-result--ok' : 'auth-result--none'}`}>
-                <span className="auth-result-icon">{selectedTrackedAuthorization.hasAuthorization ? '✓' : '✗'}</span>
+                <span className="auth-result-icon">{selectedTrackedAuthorization.hasAuthorization ? 'Yes' : 'No'}</span>
                 <div className="auth-result-content">
                   <div className="auth-result-text">
                     {selectedTrackedAuthorization.hasAuthorization
                       ? `Authorised - ${selectedTrackedAuthorization.authorization?.type || 'permit found'}`
                       : 'No active permit or payment found'}
                   </div>
-                  {Number(selectedTrackedAuthorization?.matchConfidence?.scorePercent || 0) > 0
-                  && String(selectedTrackedAuthorization?.matchConfidence?.bestVrm || '').trim() ? (
-                    <div className="auth-match-pill" role="status" aria-label="Closest exemption match confidence">
-                      <span className="auth-match-pill-label">Closest exemption match</span>
-                      <span className="auth-match-pill-vrm">{selectedTrackedAuthorization.matchConfidence.bestVrm}</span>
-                      <span className="auth-match-pill-score">{selectedTrackedAuthorization.matchConfidence.scorePercent}%</span>
-                    </div>
-                    ) : null}
+                  <MatchConfidencePill matchConfidence={selectedTrackedAuthorization?.matchConfidence} />
                   {selectedTrackedAuthorization.authorization?.site ? (
                     <div className="auth-result-sub">{selectedTrackedAuthorization.authorization.site}</div>
                   ) : null}
@@ -6789,7 +7802,6 @@ export default function DashboardPage() {
                     className="evidence-capture-btn"
                     onClick={() => openCaptureDialog('entry')}
                   >
-                    <span className="evidence-capture-icon">📷</span>
                     <span>Capture entry</span>
                   </button>
                 )}
@@ -6858,7 +7870,6 @@ export default function DashboardPage() {
                     className="evidence-capture-btn"
                     onClick={() => openCaptureDialog('closing')}
                   >
-                    <span className="evidence-capture-icon">📷</span>
                     <span>Capture closing</span>
                   </button>
                 )}
@@ -6872,7 +7883,7 @@ export default function DashboardPage() {
             {/* Capture closing evidence */}
             {entryFiles.length > 0 && closingFiles.length === 0 ? (
               <button type="button" className="action-btn action-btn--primary" onClick={() => openCaptureDialog('closing')}>
-                📷 Capture closing evidence
+                Capture closing evidence
               </button>
             ) : null}
 
@@ -6903,7 +7914,7 @@ export default function DashboardPage() {
                       {convertLoading
                         ? (submissionProgressText || 'Submitting...')
                         : (pcnSubmissionGate.ready
-                          ? (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')
+                          ? (selectedTracked?.payload?.breachId ? 'Submit PCN to backend' : 'Sync and submit PCN')
                           : 'Checks required before submit')}
                     </button>
                   </div>
@@ -6937,7 +7948,7 @@ export default function DashboardPage() {
                   className="action-btn action-btn--secondary"
                   onClick={() => handleRestoreArchived(selectedTracked.id)}
                 >
-                  ↩ Restore from archive
+                  Restore from archive
                 </button>
                 <button
                   type="button"
@@ -6945,7 +7956,7 @@ export default function DashboardPage() {
                   style={{ marginTop: 8 }}
                   onClick={() => handleDeleteArchived(selectedTracked.id)}
                 >
-                  🗑 Delete from archive
+                  Delete from archive
                 </button>
               </>
             ) : (
@@ -6954,7 +7965,7 @@ export default function DashboardPage() {
                 className="action-btn action-btn--danger"
                 onClick={() => handleArchiveTracked(selectedTracked.id)}
               >
-                🗄 Archive session
+                Archive session
               </button>
             )}
           </div>
@@ -6994,7 +8005,7 @@ export default function DashboardPage() {
 
             {syncCandidates.length === 0 ? (
               <div className="empty-state">
-                <div className="empty-icon">✓</div>
+                <div className="empty-icon">Done</div>
                 <p className="empty-title">All synced</p>
                 <p className="empty-hint">No pending items</p>
               </div>
@@ -7059,7 +8070,6 @@ export default function DashboardPage() {
                     </div>
                     <div className="sc-right">
                       <div className="sc-timer">
-                        <span className="sc-timer-icon">⏱</span>
                         <span className="sc-timer-val">{timer.requiredMinutes > 0 ? formatRemaining(timer.remainingSeconds) : formatElapsed(timer.startsAt)}</span>
                       </div>
                       {timer.requiredMinutes > 0 ? <div className="text-muted" style={{ fontSize: 11 }}>Baseline {timer.requiredMinutes}m</div> : null}
@@ -7112,7 +8122,7 @@ export default function DashboardPage() {
             </div>
             {archivedBreaches.length === 0 ? (
               <div className="empty-state">
-                <div className="empty-icon">🗄</div>
+                <div className="empty-icon">Archive</div>
                 <p className="empty-title">No archived PCNs</p>
                 <p className="empty-hint">Submitted and archived charges will appear here.</p>
               </div>
@@ -7196,7 +8206,7 @@ export default function DashboardPage() {
 
             {mobileCamerasByAvailability.length === 0 ? (
               <div className="empty-state" style={{ padding: '20px 12px' }}>
-                <div className="empty-icon">🚐</div>
+                <div className="empty-icon">Mobile</div>
                 <p className="empty-title">No mobile cameras found</p>
                 <p className="empty-hint">Flag a camera as mobile in camera management first.</p>
               </div>
@@ -7311,7 +8321,7 @@ export default function DashboardPage() {
             </select>
           </div>
 
-          {/* ── Quick-capture: hidden file input opens camera directly ─── */}
+          {/* ── Hidden file input kept for legacy direct-capture path ─── */}
           <input
             ref={quickCaptureInputRef}
             type="file"
@@ -7323,131 +8333,30 @@ export default function DashboardPage() {
           <button
             type="button"
             className="quick-capture-cta"
-            onClick={() => quickCaptureInputRef.current?.click()}
+            onClick={launchQuickScanCapture}
           >
-            <span className="quick-capture-icon">📷</span>
             <span className="quick-capture-label">Capture vehicle</span>
           </button>
-
-          {/* ── Session capture cards ────────────────────────────── */}
-          {captureCards.length > 0 ? (
-            <div className="capture-cards-section">
-              <div className="capture-cards-header">
-                <span>This session — {captureCards.length} capture{captureCards.length !== 1 ? 's' : ''}</span>
-                <button type="button" className="capture-cards-clear" onClick={() => { setCaptureCards([]); setCaptureCardChecks({}); }}>Clear all</button>
-              </div>
-              {captureCards.map((card) => {
-                const cc = captureCardChecks[card.id] || {};
-                const draftCode = draftByVrmForCapture[normalizeVrm(card.plateText)] || null;
-                const hasPcn = draftCode === 'CONVERTED' || draftCode === 'SUBMITTED';
-                return (
-                  <div key={card.id} className={`capture-card ${cc.permitStatus === 'has_permit' ? 'capture-card--permitted' : cc.permitStatus === 'no_permit' ? 'capture-card--actionable' : ''}`}>
-                    <div className="capture-card-left">
-                      {(card.vehiclePreview || card.cutoffImage) ? (
-                        <img
-                          src={card.vehiclePreview || card.cutoffImage}
-                          alt={card.plateText || 'Capture'}
-                          className="capture-card-thumb"
-                          onClick={() => openImageDetailDialog({ src: card.vehiclePreview || card.cutoffImage, label: card.plateText || 'Capture', capturedAt: card.capturedAt })}
-                        />
-                      ) : (
-                        <div className="capture-card-thumb capture-card-thumb--empty">📷</div>
-                      )}
-                    </div>
-                    <div className="capture-card-body">
-                      <div className="capture-card-plate">
-                        {card.plateText
-                          ? <><strong>{card.plateText}</strong>{card.plateConfidence > 0 ? <span className="capture-card-conf">{card.plateConfidence}%</span> : null}</>
-                          : <span className="capture-card-noplate">No plate detected</span>}
-                      </div>
-                      <div className="capture-card-meta">
-                        <span>{formatLocalTimestamp(card.capturedAt)}</span>
-                        {card.siteName ? <span> · {card.siteName}</span> : null}
-                      </div>
-                      {/* Permit badge */}
-                      <div className="capture-card-badges">
-                        {cc.permitStatus === 'checking' && <span className="wf-badge wf-badge--grey">Checking…</span>}
-                        {cc.permitStatus === 'has_permit' && <span className="wf-badge wf-badge--amber">⚠ Permitted</span>}
-                        {cc.permitStatus === 'no_permit' && <span className="wf-badge wf-badge--green">✓ No permit</span>}
-                        {cc.permitStatus === 'error' && <span className="wf-badge wf-badge--grey">Permit error</span>}
-                        {cc.carcheckStatus === 'ok' && cc.carcheckDetails && (
-                          <span className="wf-badge wf-badge--blue">
-                            {[cc.carcheckDetails.make, cc.carcheckDetails.color].filter(Boolean).join(' ') || 'OK'}
-                          </span>
-                        )}
-                        {cc.carcheckStatus === 'not_found' && <span className="wf-badge wf-badge--grey">Not found</span>}
-                        {draftCode && !hasPcn && <span className={`wf-badge wf-badge--draft-${draftCode.toLowerCase().replace('_', '-')}`}>{draftCode.replace('_', ' ')}</span>}
-                        {hasPcn && <span className="wf-badge wf-badge--submitted">PCN issued</span>}
-                      </div>
-                      <div className="capture-card-actions">
-                        <button type="button" className="wf-btn wf-btn--check" disabled={cc.carcheckStatus === 'checking'} onClick={() => runCardCarcheck(card.id, card.plateText)}>
-                          {cc.carcheckStatus === 'checking' ? '…' : 'Carcheck'}
-                        </button>
-                        <button type="button" className="wf-btn wf-btn--check" disabled={cc.permitStatus === 'checking' || !selectedSiteId} onClick={() => runCardPermit(card.id, card.plateText, card.siteId || selectedSiteId)} title={!selectedSiteId ? 'Select a site first' : 'e-Permit check'}>
-                          {cc.permitStatus === 'checking' ? '…' : 'e-Permit'}
-                        </button>
-                        {!hasPcn ? (
-                          <button
-                            type="button"
-                            className={`wf-btn ${cc.permitStatus === 'has_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
-                            title={cc.permitStatus === 'has_permit' ? 'Vehicle has a permit — issue PCN only if another rule was breached' : 'Start Draft PCN'}
-                            onClick={async () => {
-                              if (!card.plateText) { setMessage('No plate text — enter VRM manually after creating draft.'); }
-                              const entryTime = card.capturedAt || new Date().toISOString();
-                              const vehicleDetails = cc.carcheckDetails?.make ? cc.carcheckDetails : null;
-                              const item = createQueueItem({
-                                payload: {
-                                  vrm: card.plateText || '',
-                                  siteId: card.siteId || selectedSiteId,
-                                  siteName: card.siteName || (sites.find((s) => String(s.id) === selectedSiteId)?.name) || '',
-                                  source: 'WARDEN',
-                                  breachLifecycle: 'DRAFT_OPEN',
-                                  status: 'DRAFT_OPEN',
-                                  entryCaptureMode: 'scan',
-                                  observationStartTime: entryTime,
-                                  entryCapturedAt: entryTime,
-                                  detectedEntryVehicleImage: card.vehiclePreview || '',
-                                  startVehicleImage: card.vehiclePreview || '',
-                                  detectedEntryPlateCutoffImage: card.cutoffImage || '',
-                                  detectedEntryPlateText: card.plateText || '',
-                                  detectedEntryPlateConfidence: card.plateConfidence || 0,
-                                  authorization: cc.permitData || null,
-                                  savedVehicleLookup: vehicleDetails,
-                                  vehicleDetails,
-                                  contraventionReason: contraventions[0]?.label || '',
-                                  selectedContraventionCode: contraventions[0]?.code || '',
-                                  cameraRawData: [],
-                                },
-                                files: card.files.map((f) => ({ name: f.name, type: f.type, blob: f, phase: 'entry' })),
-                              });
-                              item.status = 'draft';
-                              await saveQueueItem(item);
-                              await refreshQueue();
-                              setSelectedTrackedId(item.id);
-                              setActiveTab('tracked');
-                              handleReviewTracked(item);
-                            }}
-                          >
-                            + Draft PCN
-                          </button>
-                        ) : (
-                          <span className="wf-btn wf-btn--issued">PCN issued</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : null}
 
           {/* ── Camera service feed (already relayed to breach engine) ── */}
           <WardenCaptureFeed
             getToken={resolveAuthToken}
             selectedSiteId={selectedSiteId}
             sites={sites}
+            localRows={cameraDisplayRows.filter((row) => row.isLocalCapture)}
             queueItems={queueItems}
             contraventions={contraventions}
+            onOpenCarcheckResult={openGalleryCarcheckResult}
+            onOpenPermitResult={openGalleryPermitResult}
+            onOpenImage={({ src, label, phase, capturedAt, allowDelete }) => {
+              openImageDetailDialog({
+                src,
+                label,
+                phase,
+                capturedAt,
+                allowDelete: Boolean(allowDelete),
+              }).catch(() => null);
+            }}
             onStartDraft={async ({ vrm, vehicleImage, plateImage, timestamp, siteId, carcheckDetails, permitData }) => {
               const entryTime = timestamp || new Date().toISOString();
               const effectiveSiteId = siteId || selectedSiteId || '';
@@ -7487,160 +8396,6 @@ export default function DashboardPage() {
               setMessage(`Draft PCN started for ${vrm} from camera feed.`);
             }}
           />
-          <div className="camera-raw-panel">
-              {cameraRawFeed.length > 0 ? (
-                <div className="camera-raw-view-toggle" role="group" aria-label="Camera raw view mode">
-                  <button
-                    type="button"
-                    className={`camera-raw-view-btn ${cameraRawViewMode === 'grid' ? 'camera-raw-view-btn--active' : ''}`}
-                    onClick={() => setCameraRawViewMode('grid')}
-                  >
-                    Grid
-                  </button>
-                  <button
-                    type="button"
-                    className={`camera-raw-view-btn ${cameraRawViewMode === 'list' ? 'camera-raw-view-btn--active' : ''}`}
-                    onClick={() => setCameraRawViewMode('list')}
-                  >
-                    List
-                  </button>
-                </div>
-              ) : null}
-            {cameraRawFeed.length > 0 ? (
-              <div className="camera-raw-filters" role="region" aria-label="Camera raw filters">
-                <input
-                  type="text"
-                  className="camera-raw-search"
-                  placeholder="Search by VRM"
-                  value={cameraRawVrmQuery}
-                  onChange={(event) => setCameraRawVrmQuery(event.target.value.toUpperCase())}
-                />
-                <select
-                  className="camera-raw-site-filter"
-                  value={cameraRawSiteFilter}
-                  onChange={(event) => setCameraRawSiteFilter(event.target.value)}
-                >
-                  <option value="all">All sites</option>
-                  {cameraRawSiteOptions.map((siteName) => (
-                    <option key={siteName} value={siteName}>
-                      {siteName}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : null}
-            {filteredCameraRawFeed.length > 0 ? (
-              cameraRawViewMode === 'list' ? (
-                <div className="camera-raw-list">
-                  {filteredCameraRawFeed.map((item, index) => (
-                    <article className="camera-raw-list-item" key={item.recordKey || `camera-raw-${index}`}>
-                      {resolveCameraRawImageSrc(item) ? (
-                        <button
-                          type="button"
-                          className="camera-raw-image-btn"
-                          onClick={() => openImageDetailDialog({
-                            src: resolveCameraRawImageSrc(item),
-                            label: `${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`,
-                            phase: item?.phase === 'closing' ? 'closing' : 'entry',
-                            isMain: false,
-                            capturedAt: item?.capturedAt || '',
-                            fileName: item?.fileName || `capture_${index + 1}.jpg`,
-                            mimeType: item?.mimeType || '',
-                            sizeBytes: Number(item?.sizeBytes || 0),
-                            record: item,
-                          })}
-                        >
-                          <img
-                            src={resolveCameraRawImageSrc(item)}
-                            alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
-                            className="camera-raw-list-image"
-                          />
-                        </button>
-                      ) : (
-                        <div className="camera-raw-list-placeholder">No image</div>
-                      )}
-                      <div className="camera-raw-meta camera-raw-meta--list">
-                        <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
-                          {item?.phase === 'closing' ? 'Closing' : 'Entry'}
-                        </span>
-                        <span className="camera-raw-filename">
-                          {item?.fileName || `Capture ${index + 1}`}
-                          {item?.imageRole === 'plate_cutoff' ? ' · Plate cutout' : ' · Full vehicle'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.capturedAt ? formatCaptureTimestamp(item.capturedAt) : 'Capture time pending'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
-                        </span>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              ) : (
-                <div className="camera-raw-grid">
-                  {filteredCameraRawFeed.map((item, index) => (
-                    <article className="camera-raw-card" key={item.recordKey || `camera-raw-${index}`}>
-                      {resolveCameraRawImageSrc(item) ? (
-                        <button
-                          type="button"
-                          className="camera-raw-image-btn"
-                          onClick={() => openImageDetailDialog({
-                            src: resolveCameraRawImageSrc(item),
-                            label: `${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`,
-                            phase: item?.phase === 'closing' ? 'closing' : 'entry',
-                            isMain: false,
-                            capturedAt: item?.capturedAt || '',
-                            fileName: item?.fileName || `capture_${index + 1}.jpg`,
-                            mimeType: item?.mimeType || '',
-                            sizeBytes: Number(item?.sizeBytes || 0),
-                            record: item,
-                          })}
-                        >
-                          <img
-                            src={resolveCameraRawImageSrc(item)}
-                            alt={`${item?.phase === 'closing' ? 'Closing' : 'Entry'} raw capture ${index + 1}`}
-                            className="camera-raw-image"
-                          />
-                        </button>
-                      ) : null}
-                      <div className="camera-raw-meta">
-                        <span className={`camera-raw-phase ${item?.phase === 'closing' ? 'camera-raw-phase--closing' : 'camera-raw-phase--entry'}`}>
-                          {item?.phase === 'closing' ? 'Closing' : 'Entry'}
-                        </span>
-                        <span className="camera-raw-filename">
-                          {item?.fileName || `Capture ${index + 1}`}
-                          {item?.imageRole === 'plate_cutoff' ? ' · Plate cutout' : ' · Full vehicle'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.vrm || 'Unknown VRM'} · {item?.siteName || 'Site'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.capturedAt ? formatCaptureTimestamp(item.capturedAt) : 'Capture time pending'}
-                        </span>
-                        <span className="camera-raw-subline">
-                          {item?.uploadedUrl ? 'Synced for LOS forwarding' : 'Queued for LOS forwarding'}
-                        </span>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              )
-            ) : (
-              <div className="empty-state" style={{ padding: '24px 12px' }}>
-                <div className="empty-icon">📷</div>
-                <p className="empty-title">No camera raw captures found</p>
-                <p className="empty-hint">
-                  {cameraRawFeed.length > 0
-                    ? 'Try a different VRM or site filter.'
-                    : 'Vehicle evidence captures will auto-populate here.'}
-                </p>
-              </div>
-            )}
-          </div>
         </main>
       ) : null}
 
@@ -7651,7 +8406,6 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'camera' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('camera')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">📷</span>
           <span className="bottom-nav-label">Camera</span>
         </button>
         <button
@@ -7664,7 +8418,6 @@ export default function DashboardPage() {
             setMessage('');
           }}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🚗</span>
           <span className="bottom-nav-label">Sessions</span>
           {trackedBreaches.filter(i => ['DRAFT_OPEN', 'READY'].includes(i.lifecycle.code)).length > 0 ? (
             <span className="bottom-nav-badge">
@@ -7677,7 +8430,6 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'queue' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('queue')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">⬆</span>
           <span className="bottom-nav-label">Queue</span>
           {syncCandidates.length > 0 ? (
             <span className="bottom-nav-badge">{syncCandidates.length}</span>
@@ -7688,7 +8440,6 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'mobile' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('mobile')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🚐</span>
           <span className="bottom-nav-label">Mobile</span>
         </button>
         <button
@@ -7696,7 +8447,6 @@ export default function DashboardPage() {
           className={`bottom-nav-btn ${activeTab === 'archive' ? 'bottom-nav-btn--active' : ''}`}
           onClick={() => setActiveTab('archive')}
         >
-          <span className="bottom-nav-icon" aria-hidden="true">🗄</span>
           <span className="bottom-nav-label">Archive</span>
           {archivedBreaches.length > 0 ? (
             <span className="bottom-nav-badge">{archivedBreaches.length}</span>
@@ -7707,6 +8457,7 @@ export default function DashboardPage() {
       {syncProgressDialogOpen ? (
         <div
           className="carcheck-overlay"
+          style={{ zIndex: 1500 }}
           role="dialog"
           aria-modal="true"
           aria-label="Sync progress log"
@@ -8020,9 +8771,9 @@ export default function DashboardPage() {
         <button
           type="button"
           className="fab-new-breach"
-          onClick={() => setStepperOpen(true)}
-          aria-label="Start Draft Parking Charge"
-          title="Start Draft Parking Charge"
+          onClick={activeTab === 'camera' ? launchQuickScanCapture : () => setStepperOpen(true)}
+          aria-label={activeTab === 'camera' ? 'Start camera scan capture' : 'Start Draft Parking Charge'}
+          title={activeTab === 'camera' ? 'Start camera scan capture' : 'Start Draft Parking Charge'}
         >
           +
         </button>
@@ -8041,7 +8792,7 @@ export default function DashboardPage() {
 
       <BreachStepper
         open={captureStepperOpen}
-        onClose={() => setCaptureStepperOpen(false)}
+        onClose={resetQuickCaptureFlowState}
         onCaptureComplete={captureIsQuickMode ? handleQuickCaptureComplete : handleStepperCaptureComplete}
         sites={sites}
         contraventions={contraventions}
@@ -8049,7 +8800,180 @@ export default function DashboardPage() {
         onPlateScan={scanPlateFromImage}
         mode="capture-only"
         capturePhase={captureStepperPhase}
+        forceScanMode={false}
+        autoStartScan={false}
+        autoCompleteOnCapture={captureIsQuickMode}
+        hideCapturedPreview={false}
+        quickFlow={false}
       />
+
+      {captureConfirmDialog ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Confirm quick capture"
+          onClick={resetQuickCaptureFlowState}
+        >
+          <div
+            className={`carcheck-sheet image-detail-sheet capture-confirm-sheet ${(() => {
+              const effectiveVrm = normalizeVrm(captureConfirmVrm || captureConfirmDialog?.scan?.plateText || '');
+              const hasValidVrm = isLikelyCurrentUkVrm(effectiveVrm);
+              if (captureConfirmDialog.checks?.loading) return 'capture-confirm-sheet--checking';
+              if (captureConfirmDialog.checks?.permit?.hasAuthorization || hasValidVrm) return 'capture-confirm-sheet--permit';
+              if (captureConfirmDialog.error) return 'capture-confirm-sheet--error';
+              return 'capture-confirm-sheet--no-permit';
+            })()}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-title">Confirm quick capture</div>
+                <div className="carcheck-sheet-subtitle">
+                  {captureConfirmDialog.captureMode === 'manual'
+                    ? 'Manual mode — enter the VRM below, confirm site, then submit.'
+                    : 'OCR has been run. Confirm site and check results before submission.'}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="ghost-button stepper-close"
+                onClick={resetQuickCaptureFlowState}
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="detail-section" style={{ marginTop: 12 }}>
+              <div className="detail-section-label">VRM</div>
+              <label className="stepper-field capture-confirm-vrm-shell" style={{ marginTop: 6 }}>
+                <span className="stepper-field-label">VRM (editable)</span>
+                <input
+                  className="stepper-vrm-input"
+                  value={captureConfirmVrm}
+                  onChange={async (event) => {
+                    const nextVrm = normalizeVrm(event.target.value);
+                    setCaptureConfirmVrm(nextVrm);
+
+                    const nextSiteId = String(captureConfirmDialog?.siteId || selectedSiteId || '').trim();
+                    if (!nextSiteId) {
+                      setCaptureConfirmDialog((current) => (current ? {
+                        ...current,
+                        loading: false,
+                        error: 'Select a patrol site before submitting.',
+                        checks: {
+                          ...(current.checks || {}),
+                          loading: false,
+                          permit: null,
+                        },
+                      } : current));
+                      return;
+                    }
+
+                    // Allow empty VRM for manual capture (user will type it)
+                    if (!nextVrm && captureConfirmDialog.captureMode !== 'manual') {
+                      setCaptureConfirmDialog((current) => (current ? {
+                        ...current,
+                        loading: false,
+                        error: 'No VRM detected. Try again.',
+                        checks: {
+                          ...(current.checks || {}),
+                          loading: false,
+                          permit: null,
+                        },
+                      } : current));
+                      return;
+                    }
+
+                    setCaptureConfirmDialog((current) => (current ? {
+                      ...current,
+                      loading: false,
+                      error: '',
+                      checks: {
+                        ...(current.checks || {}),
+                        loading: false,
+                      },
+                    } : current));
+                  }}
+                  placeholder="AB12CDE"
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  spellCheck={false}
+                />
+              </label>
+            </div>
+
+            <div className="detail-section">
+              <div className="detail-section-label">Patrol site</div>
+              <select
+                className="stepper-select"
+                value={captureConfirmDialog.siteId || selectedSiteId}
+                onChange={async (event) => {
+                  const nextSiteId = event.target.value;
+                  setSelectedSiteId(nextSiteId);
+                  saveStoredSiteId(nextSiteId);
+                  setCaptureConfirmDialog((current) => (current ? {
+                    ...current,
+                    siteId: nextSiteId,
+                    loading: false,
+                    error: '',
+                    checks: {
+                      ...(current.checks || {}),
+                      loading: false,
+                    },
+                  } : current));
+                }}
+              >
+                <option value="">Select site</option>
+                {sites.map((site) => (
+                  <option key={site.id} value={site.id}>
+                    {site.displayName || site.name || site.id}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="detail-section">
+              <div className="detail-section-label">Checks</div>
+              <div className="capture-check-strip" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                <span className={`pcn-status-pill ${captureConfirmDialog.checks?.loading ? 'pcn-status-pill--warn' : 'pcn-status-pill--ok'}`}>
+                  {captureConfirmDialog.captureMode === 'manual' ? 'Manual entry' : (captureConfirmDialog.checks?.loading ? 'Checking...' : 'OCR ready')}
+                </span>
+                <span className={`pcn-status-pill ${captureConfirmDialog.checks?.permit?.hasAuthorization ? 'pcn-status-pill--ok' : 'pcn-status-pill--warn'}`}>
+                  {captureConfirmDialog.checks?.loading
+                    ? 'Permit check'
+                    : (captureConfirmDialog.checks?.permit?.hasAuthorization ? 'Permit matched' : 'No permit')}
+                </span>
+              </div>
+              {captureConfirmDialog.error ? (
+                <div className="notice notice-error" style={{ marginTop: 10 }}>
+                  {captureConfirmDialog.error}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="detail-actions" style={{ marginTop: 14 }}>
+              <button
+                type="button"
+                className="action-btn action-btn--issue"
+                onClick={handleConfirmQuickCapture}
+                disabled={quickCaptureSubmitting || captureConfirmDialog.loading || !captureConfirmDialog.siteId || !captureConfirmVrm}
+              >
+                {quickCaptureSubmitting ? 'Submitting...' : 'Submit image'}
+              </button>
+              <button
+                type="button"
+                className="action-btn action-btn--secondary"
+                onClick={async () => {
+                  await refreshQuickCaptureConfirmChecks(captureConfirmVrm || captureConfirmDialog?.scan?.plateText || '', captureConfirmDialog.siteId || selectedSiteId);
+                }}
+              >
+                Recheck
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {carcheckDialogOpen ? (
         <div
@@ -8148,6 +9072,55 @@ export default function DashboardPage() {
                       : 'Save details'}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {galleryLookupDialog?.open ? (
+        <div
+          className="carcheck-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Gallery lookup result"
+          onClick={() => setGalleryLookupDialog(null)}
+        >
+          <div className="carcheck-sheet" onClick={(event) => event.stopPropagation()}>
+            <div className="carcheck-sheet-header">
+              <div>
+                <div className="carcheck-sheet-kicker">Gallery lookup</div>
+                <div className="carcheck-sheet-title">{galleryLookupDialog.title || 'Lookup result'}</div>
+              </div>
+              <button
+                type="button"
+                className="ghost-button stepper-close"
+                onClick={() => setGalleryLookupDialog(null)}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="carcheck-sheet-body">
+              {galleryLookupDialog.message ? <div className="notice notice-info">{galleryLookupDialog.message}</div> : null}
+
+              {galleryLookupDialog.result ? (
+                <div className={`auth-result ${galleryLookupDialog.result.hasAuthorization ? 'auth-result--ok' : 'auth-result--none'}`}>
+                  <span className="auth-result-icon">{galleryLookupDialog.result.hasAuthorization ? 'Yes' : 'No'}</span>
+                  <div className="auth-result-content">
+                    <div className="auth-result-text">
+                      {galleryLookupDialog.result.hasAuthorization
+                        ? `Authorised - ${galleryLookupDialog.result.authorization?.type || 'permit found'}`
+                        : 'No active permit or payment found'}
+                    </div>
+                    <MatchConfidencePill matchConfidence={galleryLookupDialog.result.matchConfidence} />
+                    {galleryLookupDialog.result.authorization?.site ? (
+                      <div className="auth-result-sub">{galleryLookupDialog.result.authorization.site}</div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <p className="card-copy">Permit lookup failed. Badge state remains updated for this VRM.</p>
+              )}
             </div>
           </div>
         </div>
@@ -8287,7 +9260,7 @@ export default function DashboardPage() {
                 >
                   {convertLoading
                     ? 'Submitting…'
-                    : (selectedTracked?.payload?.breachId ? '📋 Submit PCN to backend' : '📋 Sync and submit PCN')}
+                    : (selectedTracked?.payload?.breachId ? 'Submit PCN to backend' : 'Sync and submit PCN')}
                 </button>
               </div>
             </div>

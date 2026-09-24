@@ -43,10 +43,9 @@ module.exports = {
   server,
   plugins: {
     CapacitorHttp: {
-      // Routes all WebView fetch/XHR through Android native HTTP.
-      // Required for CORS bypass on ldkgroup.co.uk API calls (submit, upload, sync).
-      // Firebase Auth calls to googleapis.com also work fine through native HTTP.
-      enabled: true
+      // Keep global fetch/XHR unpatched so Firebase Auth uses stable WebView networking.
+      // App API traffic still uses native HTTP explicitly through lib/api helpers.
+      enabled: false
     },
     SplashScreen: {
       launchShowDuration: 0,

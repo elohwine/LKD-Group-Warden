@@ -8,6 +8,53 @@ const CAMERA_SERVICE_BASE = (
 
 const RELAY_TIMEOUT_MS = 15000;
 
+function normalizeDirection(value) {
+  const direction = String(value ?? '').trim().toLowerCase();
+  if (direction === 'entry' || direction === 'in' || direction === 'forward') return 'entry';
+  if (direction === 'exit' || direction === 'out' || direction === 'reverse') return 'exit';
+  return 'unknown';
+}
+
+function normalizeUtcIso(value, fallback = new Date().toISOString()) {
+  if (!value) return fallback;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return fallback;
+  const normalized = parsed.toISOString();
+  return /[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`;
+}
+
+export function buildCameraServiceCapturePayload({
+  body = {},
+  wardenId = '',
+  wardenEmail = '',
+  wardenName = '',
+  deviceIp = null,
+} = {}) {
+  const vrm = String(body.vrm || body.Registration || body.registration || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+
+  const confidence = Number(
+    body.confidence ?? body.plateConfidence ?? body.Confidence ?? body.PlateConfidence ?? body.ocrConfidence ?? 0
+  );
+
+  return {
+    Registration: vrm,
+    ReadTime: normalizeUtcIso(body.timestamp || body.ReadTime || body.readTime || new Date().toISOString()),
+    Direction: normalizeDirection(body.direction || body.Direction || body.directionName),
+    PlateImage: body.plateImage || body.PlateImage || body.platePicture || body.plateUrl || null,
+    OverviewImage: body.vehicleImage || body.OverviewImage || body.overviewImage || body.vehiclePicture || body.vehicleUrl || null,
+    siteId: body.siteId || body.site_id || null,
+    site: body.site || body.siteName || body.site_name || null,
+    wardenId,
+    wardenEmail,
+    wardenName: body.wardenName || body.warden_name || wardenName,
+    deviceIp,
+    confidence: Number.isFinite(confidence) ? confidence : 0,
+  };
+}
+
 /**
  * POST /api/warden/relay-to-camera-service
  * Relays a warden ANPR capture event to the camera service breach engine.
@@ -26,7 +73,8 @@ const RELAY_TIMEOUT_MS = 15000;
  *     vehicleImage: string (URL),
  *     plateImage: string (URL),
  *     siteId: string,
- *     siteName: string
+ *     siteName: string,
+ *     confidence: number
  *   }
  */
 export default async function handler(req, res) {
@@ -74,19 +122,13 @@ export default async function handler(req, res) {
   }
 
   // ── Relay ─────────────────────────────────────────────────────────────────
-  const payload = {
-    Registration: vrm,
-    ReadTime: body.timestamp || body.ReadTime || new Date().toISOString(),
-    Direction: body.direction || body.Direction || 'unknown',
-    PlateImage: body.plateImage || body.PlateImage || null,
-    OverviewImage: body.vehicleImage || body.OverviewImage || null,
-    siteId: body.siteId || null,
-    site: body.site || body.siteName || null,
+  const payload = buildCameraServiceCapturePayload({
+    body,
     wardenId,
     wardenEmail,
     wardenName: body.wardenName || wardenName,
     deviceIp,
-  };
+  });
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), RELAY_TIMEOUT_MS);

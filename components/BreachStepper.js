@@ -184,66 +184,76 @@ async function resolveCameraCaptureTimestamp(file, fallbackIso) {
     }
 }
 
-async function stampEvidenceImage(file, { capturedAt, phase } = {}) {
+function fitHeaderFont(ctx, text, maxWidth, initialSize, minSize = 10) {
+    let size = Math.max(minSize, Math.round(initialSize));
+    while (size > minSize) {
+        ctx.font = `600 ${size}px "Roboto Mono", "Courier New", monospace`;
+        if (ctx.measureText(text).width <= maxWidth) return size;
+        size -= 1;
+    }
+    return minSize;
+}
+
+async function stampEvidenceImage(file, { capturedAt, phase, vrmText = '' } = {}) {
     if (!file || !(file.type || '').startsWith('image/')) return file;
 
     try {
         const image = await loadImageElement(file);
+        const imageWidth = image.naturalWidth || image.width;
+        const imageHeight = image.naturalHeight || image.height;
+        if (!imageWidth || !imageHeight) return file;
+
+        const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
+        const normalizedVrm = normalizeVrm(vrmText || file?.detectedPlateText || '');
+        const localCaptured = formatEvidenceLocalTimestamp(capturedAt);
+        const headerLine = normalizedVrm
+            ? `VRM ${normalizedVrm} | Captured ${localCaptured}`
+            : `VRM pending OCR | Captured ${localCaptured}`;
+
+        const headerPadX = Math.max(8, Math.floor(imageWidth * 0.01));
+        const headerPadY = Math.max(8, Math.floor(imageHeight * 0.01));
+        const maxTextWidth = Math.max(48, imageWidth - (headerPadX * 2));
+
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = 8;
+        tempCanvas.height = 8;
+        const tempCtx = tempCanvas.getContext('2d');
+        if (!tempCtx) return file;
+
+        const headerFont = fitHeaderFont(
+            tempCtx,
+            headerLine,
+            maxTextWidth,
+            isPlateCutout ? Math.max(16, Math.min(26, Math.floor(imageWidth / 38))) : Math.max(17, Math.min(27, Math.floor(imageWidth / 35))),
+            14
+        );
+
+        const measuredHeaderHeight = (headerPadY * 2) + headerFont + 2;
+        const headerHeight = Math.min(72, Math.max(32, measuredHeaderHeight));
+
         const canvas = document.createElement('canvas');
-        canvas.width = image.naturalWidth || image.width;
-        canvas.height = image.naturalHeight || image.height;
+        canvas.width = imageWidth;
+        canvas.height = imageHeight + headerHeight;
         const ctx = canvas.getContext('2d');
         if (!ctx || !canvas.width || !canvas.height) return file;
 
-        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-
-        const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
-        const stampText = formatEvidenceLocalTimestamp(capturedAt);
-        let baseFont = 3 * (isPlateCutout
-            ? Math.max(10, Math.min(14, Math.floor(canvas.width / 90)))
-            : Math.max(11, Math.min(16, Math.floor(canvas.width / 88))));
-        const marginX = Math.max(6, Math.floor(canvas.width * 0.012));
-        const marginY = Math.max(6, Math.floor(canvas.height * 0.014));
-        const maxBoxWidth = Math.max(40, canvas.width - (marginX * 2));
-        const maxBoxHeight = Math.max(20, canvas.height - (marginY * 2));
-
-        let paddingX = 0;
-        let paddingY = 0;
-        let boxWidth = 0;
-        let boxHeight = 0;
-        while (baseFont >= 10) {
-            paddingX = Math.max(8, Math.floor(baseFont * 0.45));
-            paddingY = Math.max(5, Math.floor(baseFont * 0.3));
-            ctx.font = `600 ${baseFont}px "Roboto Mono", "Courier New", monospace`;
-            const textWidth = Math.ceil(ctx.measureText(stampText).width);
-            boxWidth = textWidth + (paddingX * 2);
-            boxHeight = Math.ceil(baseFont + (paddingY * 2));
-            if (boxWidth <= maxBoxWidth && boxHeight <= maxBoxHeight) break;
-            baseFont -= 2;
-        }
-
-        const clampedBoxWidth = Math.min(maxBoxWidth, boxWidth);
-        const clampedBoxHeight = Math.min(maxBoxHeight, boxHeight);
-
-        // ANPR-style timestamp container: compact dark chip for readability.
-        ctx.fillStyle = 'rgba(5, 10, 18, 0.64)';
-        ctx.fillRect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
+        // Header band keeps metadata outside the actual captured image frame.
+        ctx.fillStyle = 'rgba(5, 10, 18, 0.92)';
+        ctx.fillRect(0, 0, imageWidth, headerHeight);
         ctx.strokeStyle = 'rgba(220, 235, 255, 0.26)';
-        ctx.lineWidth = Math.max(1, Math.floor(baseFont * 0.08));
-        ctx.strokeRect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, headerHeight - 0.5);
+        ctx.lineTo(imageWidth, headerHeight - 0.5);
+        ctx.stroke();
 
         ctx.textBaseline = 'top';
-        ctx.lineJoin = 'round';
-        ctx.strokeStyle = 'rgba(0, 0, 0, 0.82)';
-        ctx.lineWidth = Math.max(2, Math.floor(baseFont * 0.22));
-        ctx.fillStyle = '#f7fbff';
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(marginX, marginY, clampedBoxWidth, clampedBoxHeight);
-        ctx.clip();
-        ctx.strokeText(stampText, marginX + paddingX, marginY + paddingY);
-        ctx.fillText(stampText, marginX + paddingX, marginY + paddingY);
-        ctx.restore();
+        ctx.fillStyle = normalizedVrm ? '#8bd0ff' : '#e5eef9';
+        ctx.font = `700 ${headerFont}px "Roboto Mono", "Courier New", monospace`;
+        ctx.fillText(headerLine, headerPadX, headerPadY);
+
+        // Original photo is drawn below the header without any overlap.
+        ctx.drawImage(image, 0, headerHeight, imageWidth, imageHeight);
 
         const blob = await new Promise((resolve) => canvas.toBlob(resolve, file.type || 'image/jpeg', 0.92));
         if (!blob) return file;
@@ -348,6 +358,7 @@ const LIVE_MAX_SCAN_MS = 5200;
 const LIVE_REPLACEMENT_REQUIRED_FRAMES = 2;
 const LIVE_REPLACEMENT_CONFIDENCE_MARGIN = 10;
 const IMAGE_SCAN_TIMEOUT_MS = 12000;
+const LIVE_SCAN_MAX_DIMENSION = 1280;
 
 function withTimeout(promise, timeoutMs) {
     return Promise.race([
@@ -415,13 +426,19 @@ export default function BreachStepper({
     onPlateScan,
     mode = 'full',
     capturePhase = 'entry',
+    forceScanMode = false,
+    autoStartScan = false,
+    autoCompleteOnCapture = false,
+    hideCapturedPreview = false,
+    quickFlow = false,
 }) {
     const captureOnly = mode === 'capture-only';
     const evidencePhase = capturePhase === 'closing' ? 'closing' : 'entry';
     const evidenceLabel = evidencePhase === 'closing' ? 'Closing' : 'Entry';
-    const supportsManualCaptureMode = true;
+    const isQuickOcrFlow = Boolean(captureOnly && quickFlow);
+    const supportsManualCaptureMode = !forceScanMode;
     const [step, setStep] = useState(0);
-    const [captureMode, setCaptureMode] = useState(supportsManualCaptureMode ? 'scan' : 'manual');
+    const [captureMode, setCaptureMode] = useState('scan');
     const [skipCapture, setSkipCapture] = useState(false);
     const [vrm, setVrm] = useState('');
     const [capturedVrm, setCapturedVrm] = useState('');
@@ -456,7 +473,7 @@ export default function BreachStepper({
 
     const normalizeVrm = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     const stableCapturedVrm = normalizeVrm(vrm || capturedVrm || scanState.text);
-    const requiresOcrArtifacts = supportsManualCaptureMode && captureMode !== 'manual';
+    const requiresOcrArtifacts = forceScanMode || (supportsManualCaptureMode && captureMode !== 'manual');
 
     const selectedContravention = useMemo(
         () => contraventions.find((c) => c.code === contraventionCode) || contraventions[0] || {},
@@ -524,6 +541,9 @@ export default function BreachStepper({
         setTorchEnabled(false);
         setAutoNightTorchEnabled(true);
         setNote('');
+        setLiveCameraActive(false);
+        if (cameraInputRef.current) cameraInputRef.current.value = '';
+        if (galleryInputRef.current) galleryInputRef.current.value = '';
     }
 
     async function applyLiveTorchState(enabled) {
@@ -622,8 +642,14 @@ export default function BreachStepper({
 
     useEffect(() => {
         if (!open) return;
-        setCaptureMode(supportsManualCaptureMode ? 'scan' : 'manual');
-    }, [open, supportsManualCaptureMode]);
+        setCaptureMode(forceScanMode ? 'scan' : (supportsManualCaptureMode ? 'scan' : 'manual'));
+    }, [open, supportsManualCaptureMode, forceScanMode]);
+
+    useEffect(() => {
+        if (!open || !captureOnly || !autoStartScan || !requiresOcrArtifacts) return;
+        if (liveCameraActive) return;
+        startLiveCamera().catch(() => null);
+    }, [open, captureOnly, autoStartScan, requiresOcrArtifacts, liveCameraActive]);
 
     useEffect(() => {
         if (!liveCameraActive || liveEngine !== 'native-preview' || typeof document === 'undefined') return undefined;
@@ -699,6 +725,16 @@ export default function BreachStepper({
         if (!captured.length) return;
         const allowWebFallback = Boolean(options.allowWebFallback);
         const skipOcr = Boolean(options.skipOcr);
+        const shouldBuildCapturePreviews = !(captureOnly && autoCompleteOnCapture && isQuickOcrFlow);
+
+        if (!skipOcr && !initialScanResult) {
+            setScanState((prev) => ({
+                ...prev,
+                loading: true,
+                text: isQuickOcrFlow ? 'Preparing image for OCR...' : 'Scanning image for VRM...',
+                confidence: 0,
+            }));
+        }
 
         const fallbackCapturedAt = await getServerTimestamp();
         const stampedCaptured = await Promise.all(
@@ -710,15 +746,17 @@ export default function BreachStepper({
             })
         );
 
-        const resolved = await Promise.all(
-            stampedCaptured.map(async (file) => {
-                try {
-                    return await fileToDataUrl(file);
-                } catch (_) {
-                    return '';
-                }
-            })
-        );
+        const resolved = shouldBuildCapturePreviews
+            ? await Promise.all(
+                stampedCaptured.map(async (file) => {
+                    try {
+                        return await fileToDataUrl(file);
+                    } catch (_) {
+                        return '';
+                    }
+                })
+            )
+            : [];
         const newPreviews = resolved.filter(Boolean);
         const nextFiles = [...stampedCaptured];
         const nextPreviews = [...newPreviews];
@@ -726,7 +764,11 @@ export default function BreachStepper({
         let result = initialScanResult;
         if (!skipOcr && !result && captured[0]) {
             try {
-                setScanState((prev) => ({ ...prev, loading: true }));
+                setScanState((prev) => ({
+                    ...prev,
+                    loading: true,
+                    text: 'Extracting plate text...',
+                }));
                 if (mlkitReadyRef.current) {
                     result = await withTimeout(scanPlateWithMlKit(captured[0]), IMAGE_SCAN_TIMEOUT_MS);
                 }
@@ -785,11 +827,17 @@ export default function BreachStepper({
             const cutoffFile = dataUrlToFile(result.cutoffImage, `plate_cutoff_${evidencePhase}_${Date.now()}.jpg`);
             if (cutoffFile) {
                 const cutoffCapturedAt = normalizeCapturedAt(stampedCaptured?.[0]?.capturedAt) || new Date().toISOString();
-                const stampedCutoff = await stampEvidenceImage(cutoffFile, { capturedAt: cutoffCapturedAt, phase: 'plate' });
+                const stampedCutoff = await stampEvidenceImage(cutoffFile, {
+                    capturedAt: cutoffCapturedAt,
+                    phase: 'plate',
+                    vrmText: result?.plateText || '',
+                });
                 stampedCutoff.capturedAt = cutoffCapturedAt;
-                const stampedCutoffPreview = await fileToDataUrl(stampedCutoff);
+                const stampedCutoffPreview = shouldBuildCapturePreviews ? await fileToDataUrl(stampedCutoff) : '';
                 nextFiles.push(stampedCutoff);
-                nextPreviews.push(stampedCutoffPreview || result.cutoffImage);
+                if (shouldBuildCapturePreviews) {
+                    nextPreviews.push(stampedCutoffPreview || result.cutoffImage);
+                }
                 result.cutoffImage = stampedCutoffPreview || result.cutoffImage;
             }
             if (nextFiles[0]) {
@@ -797,15 +845,16 @@ export default function BreachStepper({
             }
         }
 
+        const mergedFiles = evidencePhase === 'closing' ? [...files, ...nextFiles] : [...nextFiles];
+        const mergedPreviews = evidencePhase === 'closing' ? [...previews, ...nextPreviews] : [...nextPreviews];
+
         setFiles((prev) => [...prev, ...nextFiles]);
         setPreviews((prev) => [...prev, ...nextPreviews]);
         if (nextFiles.length > 0) {
             setSkipCapture(false);
         }
 
-        const hasPairArtifacts = hasRequiredCaptureArtifacts(evidencePhase === 'closing'
-            ? [...files, ...nextFiles]
-            : nextFiles);
+        const hasPairArtifacts = hasRequiredCaptureArtifacts(mergedFiles);
         if (!hasPairArtifacts) {
             setScanState({
                 loading: false,
@@ -819,6 +868,23 @@ export default function BreachStepper({
                 confidence: 0,
             });
             return false;
+        }
+
+        if (captureOnly && autoCompleteOnCapture) {
+            onCaptureComplete?.({
+                phase: evidencePhase,
+                files: mergedFiles,
+                previews: mergedPreviews,
+                captureMode,
+                scan: {
+                    plateText: normalizeVrm(result?.plateText || stableCapturedVrm || ''),
+                    confidence: Number(result?.confidence || scanState.confidence || 0),
+                    cutoffImage: String(mergedFiles?.[0]?.detectedPlateCutoffImage || result?.cutoffImage || ''),
+                    bbox: mergedFiles?.[0]?.detectedPlateBbox || result?.bbox || null,
+                },
+            });
+            reset();
+            return true;
         }
 
         if (step === 0 && !captureOnly) {
@@ -886,13 +952,20 @@ export default function BreachStepper({
                         const height = Number(currentVideo.videoHeight || 0);
                         if (!width || !height) return;
 
-                        currentCanvas.width = width;
-                        currentCanvas.height = height;
+                        const dominantEdge = Math.max(width, height);
+                        const scale = dominantEdge > LIVE_SCAN_MAX_DIMENSION
+                            ? (LIVE_SCAN_MAX_DIMENSION / dominantEdge)
+                            : 1;
+                        const scanWidth = Math.max(1, Math.round(width * scale));
+                        const scanHeight = Math.max(1, Math.round(height * scale));
+
+                        currentCanvas.width = scanWidth;
+                        currentCanvas.height = scanHeight;
                         const ctx = currentCanvas.getContext('2d');
                         if (!ctx) return;
-                        ctx.drawImage(currentVideo, 0, 0, width, height);
+                        ctx.drawImage(currentVideo, 0, 0, scanWidth, scanHeight);
 
-                        const blob = await new Promise((resolve) => currentCanvas.toBlob(resolve, 'image/jpeg', 0.92));
+                        const blob = await new Promise((resolve) => currentCanvas.toBlob(resolve, 'image/jpeg', 0.84));
                         if (!blob) return;
 
                         frameFile = new File([blob], `live_scan_${Date.now()}.jpg`, {
@@ -1273,6 +1346,18 @@ export default function BreachStepper({
     const canAdvanceFromCapture = Boolean(files.length > 0);
     const canAdvanceFromVrm = Boolean(normalizeVrm(vrm) && hasContraventionChoice && (skipCapture || (files.length > 0 && hasCapturePair)));
     const canConfirm = Boolean(normalizeVrm(vrm) && hasContraventionChoice && (skipCapture || (files.length > 0 && hasCapturePair)));
+    const quickOcrStatusLabel = isQuickOcrFlow
+        ? (liveCameraActive
+            ? 'OCR scanner active'
+            : (scanState.loading ? 'Extracting plate text...' : 'Preparing OCR scanner...'))
+        : '';
+    const quickOcrPromptText = isQuickOcrFlow
+        ? (liveCameraActive
+            ? 'Point camera at the number plate. Capture runs automatically when lock is stable.'
+            : (scanState.loading
+                ? (scanState.text || 'Extracting plate text from captured image...')
+                : 'Launching OCR camera...'))
+        : 'Use OCR scan mode to auto-capture the plate and evidence.';
 
     if (!open) return null;
 
@@ -1422,15 +1507,17 @@ export default function BreachStepper({
                 {/* Header */}
                 <div className="stepper-header">
                     <button type="button" className="ghost-button stepper-close" onClick={handleClose}>✕</button>
-                    <h3 className="stepper-title">{captureOnly ? `${evidenceLabel} evidence capture` : 'Draft Parking Charge'}</h3>
-                    <div className="stepper-dots">
-                        {(captureOnly ? [0] : [0, 1, 2]).map((i) => (
-                            <span
-                                key={i}
-                                className={`stepper-dot ${step === i ? 'stepper-dot-active' : ''} ${step > i ? 'stepper-dot-done' : ''}`}
-                            />
-                        ))}
-                    </div>
+                    <h3 className="stepper-title">{isQuickOcrFlow ? 'Quick OCR capture' : (captureOnly ? `${evidenceLabel} evidence capture` : 'Draft Parking Charge')}</h3>
+                    {!isQuickOcrFlow ? (
+                        <div className="stepper-dots">
+                            {(captureOnly ? [0] : [0, 1, 2]).map((i) => (
+                                <span
+                                    key={i}
+                                    className={`stepper-dot ${step === i ? 'stepper-dot-active' : ''} ${step > i ? 'stepper-dot-done' : ''}`}
+                                />
+                            ))}
+                        </div>
+                    ) : null}
                 </div>
 
                 {/* Hidden file input */}
@@ -1456,8 +1543,12 @@ export default function BreachStepper({
                 {/* Step 0: Entry evidence capture first */}
                 {step === 0 ? (
                     <div className="stepper-step">
-                        <p className="stepper-step-label">Step 1 — Capture {evidenceLabel.toLowerCase()} evidence image</p>
-                        {supportsManualCaptureMode ? (
+                        {!isQuickOcrFlow ? (
+                            <p className="stepper-step-label">Step 1 — Capture {evidenceLabel.toLowerCase()} evidence image</p>
+                        ) : (
+                            <p className="stepper-step-label">{quickOcrStatusLabel}</p>
+                        )}
+                        {supportsManualCaptureMode && !isQuickOcrFlow ? (
                             <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
                                 <button
                                     type="button"
@@ -1482,7 +1573,7 @@ export default function BreachStepper({
                             </strong>
                         </div>
 
-                        {previews.length > 0 ? (
+                        {previews.length > 0 && !(captureOnly && hideCapturedPreview) && !(isQuickOcrFlow && scanState.loading) ? (
                             <div className="stepper-preview-grid">
                                 {previews.map((p, i) => (
                                     <div key={i} className="stepper-preview-tile">
@@ -1500,11 +1591,10 @@ export default function BreachStepper({
                             </div>
                         ) : (
                             <div className="stepper-capture-prompt">
-                                <span className="stepper-capture-icon">📸</span>
                                 {requiresOcrArtifacts ? (
                                     <>
-                                        <p>Use OCR scan mode to auto-capture the plate and evidence.</p>
-                                        <p className="text-muted">Switch to Manual capture tab if OCR is not suitable.</p>
+                                        <p>{quickOcrPromptText}</p>
+                                        {!isQuickOcrFlow ? <p className="text-muted">Switch to Manual capture tab if OCR is not suitable.</p> : null}
                                     </>
                                 ) : (
                                     <>
@@ -1523,7 +1613,28 @@ export default function BreachStepper({
                             </div>
                         )}
 
-                        {scanState.loading ? <div className="text-muted">Scanning image for VRM...</div> : null}
+                        {scanState.loading ? (
+                            <div
+                                style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: 12,
+                                    padding: '14px 16px',
+                                    marginTop: 10,
+                                    borderRadius: 14,
+                                    border: '1px solid rgba(255,255,255,0.10)',
+                                    background: 'rgba(13, 19, 30, 0.68)',
+                                }}
+                                role="status"
+                                aria-live="polite"
+                            >
+                                <div>
+                                    <div style={{ fontWeight: 600 }}>{scanState.text || 'Scanning image for VRM...'}</div>
+                                    <div className="text-muted">Keep the vehicle steady while OCR finishes.</div>
+                                    <progress max="100" style={{ width: '100%', marginTop: 8, height: 8 }} />
+                                </div>
+                            </div>
+                        ) : null}
                         {!scanState.loading && files.length > 0 && !hasCapturePair && evidencePhase !== 'closing' && requiresOcrArtifacts ? (
                             <div className="text-muted" style={{ color: '#ffbf47' }}>
                                 Full vehicle captured. Plate cutout missing - recapture plate to continue.
@@ -1539,7 +1650,16 @@ export default function BreachStepper({
                                         className="secondary-button"
                                         onClick={liveCameraActive ? stopLiveCamera : startLiveCamera}
                                     >
-                                        {liveCameraActive ? 'Stop scan image' : 'Scan image'}
+                                        {liveCameraActive ? 'Stop scan image' : (isQuickOcrFlow ? 'Retry OCR scan' : 'Scan image')}
+                                    </button>
+                                ) : null}
+                                {isQuickOcrFlow && !liveCameraActive ? (
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={openCamera}
+                                    >
+                                        Upload fallback image
                                     </button>
                                 ) : null}
                                 {!requiresOcrArtifacts ? (
@@ -1566,6 +1686,7 @@ export default function BreachStepper({
                                         className="primary-button"
                                         disabled={!hasCapturePair}
                                         onClick={captureOnly ? handleCaptureOnlyComplete : () => setStep(1)}
+                                        style={isQuickOcrFlow ? { display: 'none' } : undefined}
                                     >
                                         {hasCapturePair
                                             ? (captureOnly ? `Use ${evidenceLabel.toLowerCase()} evidence` : 'Next — Vehicle details →')

@@ -48,9 +48,11 @@ export default function LoginPage() {
       } else if (code.includes('invalid_credentials')) {
         setError('Email or password is incorrect.');
       } else if (code.includes('network_unavailable')) {
-        setError('Network error: cannot reach sign-in services. Check connection and retry.');
+        const diag = code.includes('|') ? code.split('|').slice(1).join(' | ') : '';
+        setError(`Network error: cannot reach sign-in services. Check connection and retry.${diag ? ` (${diag})` : ''}`);
       } else if (code.includes('role_lookup_timeout')) {
-        setError('Sign-in timed out while contacting role services. Please retry.');
+        const diag = code.includes('|') ? code.split('|').slice(1).join(' | ') : '';
+        setError(`Sign-in timed out while contacting role services. Please retry.${diag ? ` (${diag})` : ''}`);
       } else if (code.includes('role_lookup_failed')) {
         setError('Sign-in succeeded but role verification failed. Please retry shortly.');
       } else {
