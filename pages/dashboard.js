@@ -15,16 +15,28 @@ import { signOutFromWardenApp, getStoredToken, getValidToken } from '../lib/auth
 import { getContraventionOptions } from '../lib/contraventions';
 import { getCurrentLocation } from '../lib/geo';
 import { buildApiUrl } from '../lib/api';
-import { createQueueItem, deleteQueueItem, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
+import { createQueueItem, deleteQueueItem, getQueueItemById, listQueueItems, saveQueueItem, updateQueueItem } from '../lib/queue';
 import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { isLikelyCurrentUkVrm, normalizeUkVrmFromOcr, scoreUkVrmCandidate } from '../lib/ukVrmOcr.mjs';
+import {
+  PERMIT_STATUS,
+  buildPermitReviewDecision,
+  lookupAuthorizationWithNearMatch,
+  needsNearMatchDecision,
+  normalizeVrm,
+  permitBadgeStatus as permitStatusToBadge,
+  resolvePermitStatus,
+  withAuthorizationMatchConfidence,
+} from '../lib/vrmMatch.mjs';
 import { getServerTimestamp, syncWithServerTime } from '../lib/timeSync';
 import { getBillableMinutes } from '../lib/duration';
 import { buildVehicleDetailsRecord } from '../lib/vehicleDetails';
 import { isVehicleCameraCandidate } from '../lib/vehicleCameras';
 import { buildMobileCameraAssignmentPayload } from '../lib/mobileCameraAssignment';
 import {
+  collectPcnImageUrls,
   decideEvidenceSource,
+  evidenceUploadGap,
   recoverUploadableEvidenceFilesFromCameraRaw,
   resolveCameraRawImageSrc,
 } from '../lib/pcnEvidenceSync';
@@ -36,6 +48,7 @@ import LicensePlate from '../components/LicensePlate.js';
 import BreachStepper from '../components/BreachStepper';
 import PcnPreviewDialog from '../components/PcnPreviewDialog';
 import WardenCaptureFeed from '../components/WardenCaptureFeed';
+import { NearMatchConfirmSheet, PermitStatusBanner, describePermitResult } from '../components/PermitStatus';
 import { buildDemoSites, isDemoModeEnabled } from '../lib/demoMode';
 
 const WARDEN_SYNC_TRACE_TOGGLE_KEY = 'warden-sync-trace-enabled';
@@ -51,6 +64,9 @@ const EVIDENCE_UPLOAD_MAX_RETRIES = 2;
 const EVIDENCE_UPLOAD_COMPLETING_STALL_MS = 120000;
 const EVIDENCE_UPLOAD_PROGRESS_STALL_MS = 120000;
 const CAMERA_FEED_PREVIEW_FAILED = '__CAMERA_FEED_PREVIEW_FAILED__';
+const QUEUE_SYNC_UI_REFRESH_EVERY = 250;
+const QUEUE_SYNC_YIELD_EVERY = 25;
+const QUEUE_SYNC_PROGRESS_MESSAGE_EVERY = 10;
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   if (typeof fetch !== 'function') {
@@ -514,9 +530,11 @@ async function stampEvidenceImage(file, { capturedAt, phase, vrmText = '' } = {}
     const isPlateCutout = String(phase || '').toLowerCase() === 'plate';
     const normalizedVrm = normalizeVrm(vrmText || file?.detectedPlateText || '');
     const localCaptured = formatCaptureTimestamp(capturedAt);
-    const headerLine = normalizedVrm
-      ? `VRM ${normalizedVrm} | Captured ${localCaptured}`
-      : `Captured ${localCaptured}`;
+    const isPortrait = imageHeight > imageWidth;
+    const shouldStackHeader = Boolean(normalizedVrm) && (isPortrait || imageWidth < 900);
+    const headerLines = shouldStackHeader
+      ? [`VRM ${normalizedVrm}`, `Captured ${localCaptured}`]
+      : [normalizedVrm ? `VRM ${normalizedVrm} | Captured ${localCaptured}` : `Captured ${localCaptured}`];
 
     const headerPadX = Math.max(8, Math.floor(imageWidth * 0.01));
     const headerPadY = Math.max(8, Math.floor(imageHeight * 0.01));
@@ -529,15 +547,27 @@ async function stampEvidenceImage(file, { capturedAt, phase, vrmText = '' } = {}
     const tempCtx = tempCanvas.getContext('2d');
     if (!tempCtx) return file;
 
-    let headerFont = Math.max(14, Math.min(isPlateCutout ? 26 : 32, Math.floor(imageWidth / (isPlateCutout ? 38 : 28))));
-    while (headerFont > 14) {
+    const minHeaderFont = isPlateCutout ? 15 : 18;
+    let headerFont = Math.max(
+      minHeaderFont,
+      Math.min(
+        isPlateCutout ? 30 : 40,
+        Math.floor(imageWidth / (isPlateCutout ? 30 : 20))
+      )
+    );
+    while (headerFont > minHeaderFont) {
       tempCtx.font = `700 ${headerFont}px "Roboto Mono", "Courier New", monospace`;
-      if (tempCtx.measureText(headerLine).width <= maxTextWidth) break;
+      const widestLine = headerLines.reduce((widest, line) => {
+        const width = tempCtx.measureText(line).width;
+        return width > widest ? width : widest;
+      }, 0);
+      if (widestLine <= maxTextWidth) break;
       headerFont -= 1;
     }
 
-    const measuredHeaderHeight = (headerPadY * 2) + headerFont + 4;
-    const headerHeight = Math.min(88, Math.max(42, measuredHeaderHeight));
+    const lineGap = Math.max(4, Math.round(headerFont * 0.2));
+    const measuredHeaderHeight = (headerPadY * 2) + (headerFont * headerLines.length) + (lineGap * Math.max(0, headerLines.length - 1)) + 4;
+    const headerHeight = Math.min(132, Math.max(52, measuredHeaderHeight));
 
     const canvas = document.createElement('canvas');
     canvas.width = imageWidth;
@@ -558,7 +588,11 @@ async function stampEvidenceImage(file, { capturedAt, phase, vrmText = '' } = {}
     ctx.textBaseline = 'top';
     ctx.fillStyle = normalizedVrm ? '#a5e0ff' : '#e0e9f5';
     ctx.font = `700 ${headerFont}px "Roboto Mono", "Courier New", monospace`;
-    ctx.fillText(headerLine, headerPadX, headerPadY + 2);
+    let textY = headerPadY + 2;
+    headerLines.forEach((line) => {
+      ctx.fillText(line, headerPadX, textY);
+      textY += headerFont + lineGap;
+    });
 
     // Draw original image below the header (no overlay)
     ctx.drawImage(image, 0, headerHeight, imageWidth, imageHeight);
@@ -575,6 +609,25 @@ async function stampEvidenceImage(file, { capturedAt, phase, vrmText = '' } = {}
   } catch (_) {
     return file;
   }
+}
+
+function copyEvidenceFileMetadata(source, target) {
+  if (!source || !target) return target;
+  const keys = [
+    'capturedAt',
+    'detectedPlateText',
+    'detectedPlateCutoffImage',
+    'detectedPlateConfidence',
+    'detectedVehicleImage',
+  ];
+
+  keys.forEach((key) => {
+    if (source[key] !== undefined) {
+      target[key] = source[key];
+    }
+  });
+
+  return target;
 }
 
 async function toPreviewSrcList(files) {
@@ -642,162 +695,6 @@ async function resolveImageDimensions(src) {
     image.onerror = () => resolve(null);
     image.src = candidate;
   });
-}
-
-function normalizeVrm(value) {
-  return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-}
-
-const CONFUSABLE_VRM_PAIRS = new Set([
-  '0O', 'O0',
-  '1I', 'I1',
-  '1L', 'L1',
-  '2Z', 'Z2',
-  '5S', 'S5',
-  '8B', 'B8',
-]);
-
-function substitutionCost(leftChar, rightChar) {
-  if (leftChar === rightChar) return 0;
-  if (CONFUSABLE_VRM_PAIRS.has(`${leftChar}${rightChar}`)) return 0.35;
-  return 1;
-}
-
-function weightedEditDistance(left, right) {
-  const a = String(left || '');
-  const b = String(right || '');
-  const rows = a.length + 1;
-  const cols = b.length + 1;
-  const dp = Array.from({ length: rows }, () => Array(cols).fill(0));
-
-  for (let i = 0; i < rows; i += 1) dp[i][0] = i;
-  for (let j = 0; j < cols; j += 1) dp[0][j] = j;
-
-  for (let i = 1; i < rows; i += 1) {
-    for (let j = 1; j < cols; j += 1) {
-      const subCost = substitutionCost(a[i - 1], b[j - 1]);
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + subCost,
-      );
-    }
-  }
-
-  return dp[rows - 1][cols - 1];
-}
-
-function vrmSimilarityPercent(left, right) {
-  const a = normalizeVrm(left);
-  const b = normalizeVrm(right);
-  if (!a || !b) return 0;
-  const maxLen = Math.max(a.length, b.length);
-  if (maxLen === 0) return 0;
-  const distance = weightedEditDistance(a, b);
-  const similarity = Math.max(0, 1 - (distance / maxLen));
-  return Math.round(similarity * 100);
-}
-
-function collectAuthorizationVrmCandidates(payload, options = {}) {
-  const minLen = Number(options.minLen || 5);
-  const maxLen = Number(options.maxLen || 8);
-  const candidates = new Set();
-  const seen = new Set();
-  const queue = [payload];
-
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current) continue;
-
-    if (typeof current === 'string') {
-      const normalized = normalizeVrm(current);
-      if (normalized.length >= minLen && normalized.length <= maxLen) {
-        candidates.add(normalized);
-      }
-      continue;
-    }
-
-    if (Array.isArray(current)) {
-      current.forEach((item) => queue.push(item));
-      continue;
-    }
-
-    if (typeof current !== 'object') continue;
-    if (seen.has(current)) continue;
-    seen.add(current);
-
-    Object.entries(current).forEach(([key, value]) => {
-      const normalizedKey = String(key || '').toLowerCase();
-      if (typeof value === 'string' && /vrm|reg|registration|plate|vehicle/i.test(normalizedKey)) {
-        const normalizedValue = normalizeVrm(value);
-        if (normalizedValue.length >= minLen && normalizedValue.length <= maxLen) {
-          candidates.add(normalizedValue);
-        }
-      }
-
-      if (value && (typeof value === 'object' || Array.isArray(value))) {
-        queue.push(value);
-      }
-    });
-  }
-
-  return Array.from(candidates);
-}
-
-function withAuthorizationMatchConfidence(result, inputVrm) {
-  if (!result || typeof result !== 'object') return result;
-
-  const targetVrm = normalizeVrm(inputVrm);
-  if (!targetVrm) return result;
-
-  const hasAuthorization = Boolean(result?.hasAuthorization);
-  const candidateVrmsRaw = collectAuthorizationVrmCandidates(result);
-  const candidateVrms = hasAuthorization
-    ? candidateVrmsRaw
-    : candidateVrmsRaw.filter((candidate) => candidate !== targetVrm);
-  if (candidateVrms.length === 0) {
-    return {
-      ...result,
-      matchConfidence: {
-        targetVrm,
-        bestVrm: '',
-        scorePercent: 0,
-        comparedCount: 0,
-      },
-    };
-  }
-
-  let best = { vrm: '', scorePercent: 0 };
-  for (const candidate of candidateVrms) {
-    const scorePercent = vrmSimilarityPercent(targetVrm, candidate);
-    if (scorePercent > best.scorePercent) {
-      best = { vrm: candidate, scorePercent };
-    }
-  }
-
-  return {
-    ...result,
-    matchConfidence: {
-      targetVrm,
-      bestVrm: best.vrm,
-      scorePercent: Number(best.scorePercent || 0),
-      comparedCount: candidateVrms.length,
-    },
-  };
-}
-
-function MatchConfidencePill({ matchConfidence }) {
-  const score = Number(matchConfidence?.scorePercent || 0);
-  const bestVrm = String(matchConfidence?.bestVrm || '').trim();
-  if (!(score > 0 && bestVrm)) return null;
-
-  return (
-    <div className="auth-match-pill" role="status" aria-label="Closest match confidence">
-      <span className="auth-match-pill-label">Closest match</span>
-      <span className="auth-match-pill-vrm">{bestVrm}</span>
-      <span className="auth-match-pill-score">{score}%</span>
-    </div>
-  );
 }
 
 let ocrWorkerPromise = null;
@@ -1659,6 +1556,9 @@ export default function DashboardPage() {
   const [vehicleLookupByVrm, setVehicleLookupByVrm] = useState({});
   const [carcheckDialogMessage, setCarcheckDialogMessage] = useState('');
   const [galleryLookupDialog, setGalleryLookupDialog] = useState(null);
+  // Near-match review prompt: { context: 'detail' | 'quickCapture' | 'gallery', result, plateImage, draftArgs }
+  const [nearMatchPrompt, setNearMatchPrompt] = useState(null);
+  const [nearMatchBusy, setNearMatchBusy] = useState(false);
   const [carcheckSaveLoading, setCarcheckSaveLoading] = useState(false);
   const [carcheckSaveNotice, setCarcheckSaveNotice] = useState('');
   const [carcheckSaveStatus, setCarcheckSaveStatus] = useState('idle');
@@ -1747,6 +1647,7 @@ export default function DashboardPage() {
 
   const authReadyRef = useRef(false);
   const pcnAutoCheckSignatureRef = useRef('');
+  const quickCaptureRecheckTimerRef = useRef(null);
   const pcnSubmitLimitRef = useRef(pLimit(1));
   const convertPipelineLimitRef = useRef(pLimit(1));
   const syncInFlightCountRef = useRef(0);
@@ -1860,6 +1761,56 @@ export default function DashboardPage() {
       reader.onerror = () => reject(reader.error || new Error('image_preview_read_failed'));
       reader.readAsDataURL(blob);
     });
+  }
+
+  async function isReachableRemoteImageUrl(url) {
+    const target = String(url || '').trim();
+    if (!/^https?:\/\//i.test(target)) return false;
+
+    try {
+      const headResponse = await fetchWithTimeout(target, {
+        method: 'HEAD',
+        cache: 'no-store',
+      }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+
+      if (headResponse?.ok || headResponse?.type === 'opaque') {
+        return true;
+      }
+    } catch (_) {
+      // Fall through to a no-cors GET probe.
+    }
+
+    try {
+      const getResponse = await fetchWithTimeout(target, {
+        method: 'GET',
+        cache: 'no-store',
+        mode: 'no-cors',
+      }, EVIDENCE_UPLOAD_TIMEOUT_MS);
+
+      return Boolean(getResponse && (getResponse.ok || getResponse.type === 'opaque'));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function ensureRemoteImageUrlsReachable(urls) {
+    const uniqueUrls = (Array.isArray(urls) ? urls : [])
+      .map((value) => String(value || '').trim())
+      .filter((value) => /^https?:\/\//i.test(value))
+      .filter((value, index, all) => all.indexOf(value) === index);
+
+    if (uniqueUrls.length === 0) {
+      throw new Error('No uploaded image URLs were returned by the backend.');
+    }
+
+    for (const url of uniqueUrls) {
+      const reachable = await isReachableRemoteImageUrl(url);
+      if (!reachable) {
+        throw new Error('Uploaded image URL is not reachable yet. Please retry sync.');
+      }
+    }
+
+    return uniqueUrls;
   }
 
   function pushSyncTraceEntryToUi(entry) {
@@ -2316,7 +2267,8 @@ export default function DashboardPage() {
           imageUrl: String(card?.vehiclePreview || card?.cutoffImage || '').trim(),
           vehicleImageUrl: String(card?.vehiclePreview || card?.cutoffImage || '').trim(),
           plateImageUrl: String(card?.cutoffImage || card?.vehiclePreview || '').trim(),
-          permitStatus: '',
+          permitStatus: permitStatusToBadge(card?.permitResult),
+          permitData: card?.permitResult || null,
           carcheckStatus: '',
           syncError: String(card?.syncError || '').trim(),
         };
@@ -2329,38 +2281,6 @@ export default function DashboardPage() {
 
     return [...localRows, ...remoteRows];
   }, [cameraTabCaptureCards, cameraFeedFilterQuery, filteredCameraFeedRows, selectedSite, selectedSiteId]);
-
-  async function runCameraFeedPermitCheck(rowId, vrm) {
-    if (!rowId || !vrm || !selectedSiteId) return;
-    const permitKey = `permit-${rowId}`;
-    if (cameraFeedChecksRef.current.has(permitKey)) return;
-    cameraFeedChecksRef.current.add(permitKey);
-
-    setCameraFeedRows((current) => current.map((row) => (
-      row.id === rowId
-        ? { ...row, permitStatus: 'checking' }
-        : row
-    )));
-
-    try {
-      const token = await resolveAuthToken();
-      const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, { token });
-      const hasAuthorization = Boolean(result?.hasAuthorization);
-      setCameraFeedRows((current) => current.map((row) => (
-        row.id === rowId
-          ? { ...row, permitStatus: hasAuthorization ? 'has_permit' : 'no_permit', permitData: result }
-          : row
-      )));
-    } catch (error) {
-      setCameraFeedRows((current) => current.map((row) => (
-        row.id === rowId
-          ? { ...row, permitStatus: 'error', permitError: String(error?.message || 'Permit check failed') }
-          : row
-      )));
-    } finally {
-      cameraFeedChecksRef.current.delete(permitKey);
-    }
-  }
 
   async function runCameraFeedCarcheck(rowId, vrm) {
     if (!rowId || !vrm) return;
@@ -2503,6 +2423,12 @@ export default function DashboardPage() {
     }
   }
 
+  async function retryCaptureSync(cardId) {
+    const targetCardId = String(cardId || '').trim();
+    if (!targetCardId) return;
+    await syncQuickCaptureCard(targetCardId);
+  }
+
   async function resolveQuickCaptureImageUrls(card, files, currentSiteId, progressHook) {
     const safeFiles = Array.isArray(files) ? files.filter(Boolean) : [];
     const sourceCard = card || {};
@@ -2544,23 +2470,25 @@ export default function DashboardPage() {
       uploadedImageUrls = [...existingRemoteImageUrls];
     }
 
+    const verifiedImageUrls = await ensureRemoteImageUrlsReachable(uploadedImageUrls);
+
     const evidenceFilesForMapping = filesForUpload.length > 0 ? filesForUpload : safeFiles;
     const vehicleImageUrl = (() => {
-      for (let index = 0; index < Math.min(uploadedImageUrls.length, evidenceFilesForMapping.length); index += 1) {
+      for (let index = 0; index < Math.min(verifiedImageUrls.length, evidenceFilesForMapping.length); index += 1) {
         if (isPlateCutoffFileArtifact(evidenceFilesForMapping[index])) continue;
-        const candidate = uploadedImageUrls[index];
+        const candidate = verifiedImageUrls[index];
         if (/^https?:\/\//i.test(String(candidate || ''))) return candidate;
       }
-      return uploadedImageUrls[0] || '';
+      return verifiedImageUrls[0] || '';
     })();
 
     const plateImageUrl = pickUploadedPlateImageUrl(
-      uploadedImageUrls,
+      verifiedImageUrls,
       evidenceFilesForMapping,
       sourceCard?.cutoffImage || ''
     ) || vehicleImageUrl;
 
-    return { uploadedImageUrls, vehicleImageUrl, plateImageUrl };
+    return { uploadedImageUrls: verifiedImageUrls, vehicleImageUrl, plateImageUrl };
   }
 
   async function syncQuickCaptureCard(cardId, options = {}) {
@@ -2913,8 +2841,10 @@ export default function DashboardPage() {
       trackedVrm && (hasExactLookupMatch || hasLookupEvidence)
     );
     const permitChecked = Boolean(trackedVrm && selectedTrackedAuthorization && typeof selectedTrackedAuthorization === 'object');
+    const permitStatus = resolvePermitStatus(selectedTrackedAuthorization);
+    const nearMatchUnresolved = permitChecked && needsNearMatchDecision(selectedTrackedAuthorization);
 
-    let message = 'Carcheck and ePermit must both be validated before submission.';
+    let message = 'Carcheck and permit check must both be completed before submission.';
     if (!trackedVrm) {
       message = 'Recheck the VRM on the image before submitting.';
     } else if (!siteId) {
@@ -2922,11 +2852,18 @@ export default function DashboardPage() {
     } else if (!carcheckReady) {
       message = 'Carcheck returned no result. Cross-check the plate image VRM, edit VRM, then retry checks.';
     } else if (!permitChecked) {
-      message = 'E-permit check has not been run yet. Use Retry e-permit check in Draft PCN details.';
+      message = 'Permit check has not been run yet. Use Retry e-permit check in Draft PCN details.';
+    } else if (nearMatchUnresolved) {
+      const bestVrm = String(selectedTrackedAuthorization?.matchConfidence?.bestVrm || '').trim();
+      message = `Possible permit match found${bestVrm ? ` (${bestVrm})` : ''}. Review the registration before submitting.`;
+    } else if (permitStatus === PERMIT_STATUS.PERMITTED) {
+      message = 'Permit found for this site. Continue only if another parking rule was breached.';
+    } else if (permitStatus === PERMIT_STATUS.PENDING) {
+      message = 'This registration has a permit request waiting for approval. You can continue - the ticket may be cancelled later if the permit is approved.';
+    } else if (permitStatus === PERMIT_STATUS.NEAR_MATCH) {
+      message = 'You confirmed the registration. Carcheck and permit checks completed.';
     } else {
-      message = selectedTrackedAuthorization?.hasAuthorization
-        ? 'Permit matched for this site. Continue only if another parking rule was breached.'
-        : 'Carcheck and ePermit checks completed (no active permit/payment found).';
+      message = 'Carcheck and permit checks completed (no permit found).';
     }
 
     return {
@@ -2934,7 +2871,9 @@ export default function DashboardPage() {
       siteId,
       carcheckReady,
       permitChecked,
-      ready: Boolean(trackedVrm && siteId && carcheckReady && permitChecked),
+      permitStatus,
+      nearMatchUnresolved,
+      ready: Boolean(trackedVrm && siteId && carcheckReady && permitChecked && !nearMatchUnresolved),
       message,
     };
   }, [activeCarcheckLookup, selectedSiteId, selectedTracked, selectedTrackedAuthorization, selectedVrm]);
@@ -3015,9 +2954,14 @@ export default function DashboardPage() {
     const hasAuth = Boolean(auth?.hasAuthorization);
     const authType = String(auth?.authorization?.type || '').toLowerCase();
 
+    const resolvedPermitStatus = hasAuth ? PERMIT_STATUS.PERMITTED : resolvePermitStatus(auth);
     const permitStatus = hasAuth
       ? (authType.includes('permit') ? 'Matched' : 'No active permit')
-      : 'No active permit';
+      : (resolvedPermitStatus === PERMIT_STATUS.PENDING
+        ? 'Permit awaiting approval'
+        : (resolvedPermitStatus === PERMIT_STATUS.NEAR_MATCH
+          ? `Possible match ${String(auth?.matchConfidence?.bestVrm || '').trim()} - reviewed`.trim()
+          : 'No active permit'));
     const paymentStatus = hasAuth
       ? ((authType.includes('payment') || authType.includes('session') || authType.includes('pay')) ? 'Matched' : 'No active payment')
       : 'No active payment';
@@ -3760,6 +3704,10 @@ export default function DashboardPage() {
   }
 
   function resetQuickCaptureFlowState() {
+    if (quickCaptureRecheckTimerRef.current) {
+      clearTimeout(quickCaptureRecheckTimerRef.current);
+      quickCaptureRecheckTimerRef.current = null;
+    }
     setCaptureStepperOpen(false);
     setCaptureStepperPhase('entry');
     setCaptureIsQuickMode(false);
@@ -3894,7 +3842,7 @@ export default function DashboardPage() {
         error: result.ok ? '' : String(result.error || 'Check failed'),
         checks: {
           loading: false,
-          permit: result.ok ? result.permitResult || null : null,
+          permit: result.ok ? stripPermitDecision(result.permitResult) || null : null,
         },
       } : current));
       return result;
@@ -3975,7 +3923,7 @@ export default function DashboardPage() {
     await refreshQuickCaptureConfirmChecks(vrm || '', selectedSiteId);
   }
 
-  async function handleConfirmQuickCapture() {
+  async function handleConfirmQuickCapture({ permitOverride = null } = {}) {
     if (!captureConfirmDialog) return;
     if (quickCaptureSubmitting) return;
 
@@ -3985,6 +3933,17 @@ export default function DashboardPage() {
 
     if (!siteId || !vrm || rawFiles.length === 0) {
       setMessage('Select a site and enter a valid VRM before submitting.');
+      return;
+    }
+
+    const permitForSubmission = permitOverride || captureConfirmDialog?.checks?.permit || null;
+    if (permitForSubmission && needsNearMatchDecision(permitForSubmission)) {
+      setNearMatchPrompt({
+        context: 'quickCapture',
+        result: permitForSubmission,
+        plateImage: String(captureConfirmDialog?.scan?.cutoffImage || captureConfirmDialog?.previewUrl || '').trim(),
+        submitAfter: true,
+      });
       return;
     }
 
@@ -4013,7 +3972,7 @@ export default function DashboardPage() {
         capturedAt,
         source: 'WARDEN_QUICK_CAPTURE',
       }),
-      permitResult: captureConfirmDialog?.checks?.permit || null,
+      permitResult: permitForSubmission,
       carcheckResult: captureConfirmDialog?.checks?.carcheck || null,
     };
 
@@ -4071,25 +4030,18 @@ export default function DashboardPage() {
     if (!vrm || !siteId) return;
     setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], permitStatus: 'checking' } }));
     try {
-      const token = await resolveAuthToken();
-      const result = await fetchJson(
-        `/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(siteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`,
-        { token }
-      );
-      const decoratedResult = withAuthorizationMatchConfidence(result, vrm);
-      const has = Boolean(decoratedResult?.hasAuthorization);
+      const decoratedResult = await checkAuthorization(vrm, siteId);
+      const permitStatus = permitStatusToBadge(decoratedResult);
       setCaptureCardChecks((prev) => ({
         ...prev,
-        [cardId]: { ...prev[cardId], permitStatus: has ? 'has_permit' : 'no_permit', permitData: decoratedResult },
+        [cardId]: { ...prev[cardId], permitStatus, permitData: decoratedResult },
       }));
-      setAuthorizationByVrm((current) => ({ ...current, [normalizeVrm(vrm)]: decoratedResult }));
-      setAuthorization(decoratedResult);
       setGalleryLookupDialog({
         open: true,
         vrm: normalizeVrm(vrm),
         siteId: String(siteId || '').trim(),
         result: decoratedResult,
-        title: has ? 'Permit matched' : 'Permit check result',
+        title: describePermitResult(decoratedResult).shortLabel,
       });
     } catch (_) {
       setCaptureCardChecks((prev) => ({ ...prev, [cardId]: { ...prev[cardId], permitStatus: 'error' } }));
@@ -4129,23 +4081,28 @@ export default function DashboardPage() {
     setCarcheckDialogOpen(true);
   }
 
-  function openGalleryPermitResult({ vrm, siteId, result, hasAuthorization }) {
+  function openGalleryPermitResult({ vrm, siteId, result }) {
     const decoratedResult = result?.matchConfidence ? result : withAuthorizationMatchConfidence(result, vrm);
     const normalizedVrm = normalizeVrm(vrm);
-    if (decoratedResult) {
-      setAuthorization(decoratedResult);
-      if (normalizedVrm) {
-        setAuthorizationByVrm((current) => ({ ...current, [normalizedVrm]: decoratedResult }));
-      }
-    }
+    rememberAuthorizationResult(normalizedVrm, decoratedResult);
     setGalleryLookupDialog({
       open: true,
       vrm: normalizedVrm,
       siteId: String(siteId || selectedSiteId || '').trim(),
       result: decoratedResult,
-      title: hasAuthorization ? 'Permit matched' : 'Permit check result',
+      title: decoratedResult ? describePermitResult(decoratedResult).shortLabel : 'Permit check',
       message: decoratedResult ? '' : 'Permit lookup unavailable',
     });
+  }
+
+  /**
+   * Permit check for a brand-new capture/draft (camera gallery rows, draft
+   * stepper). Same lookup as everywhere else, but never inherits a near-match
+   * decision made on a different capture.
+   */
+  async function runFreshPermitCheck(vrm, siteId = '') {
+    const effectiveSiteId = String(siteId || selectedSiteId || '').trim();
+    return stripPermitDecision(await checkAuthorization(vrm, effectiveSiteId));
   }
 
   function closeImageDetailDialog() {
@@ -4237,11 +4194,27 @@ export default function DashboardPage() {
     }
 
     const fallbackCapturedAt = await getServerTimestamp();
-    const nextFiles = rawFiles.map((file) => {
+    const scanVrmText = normalizeVrm(scan?.plateText || '');
+    const nextFiles = await Promise.all(rawFiles.map(async (file) => {
       const capturedAt = normalizeCapturedAt(file?.capturedAt) || fallbackCapturedAt;
-      file.capturedAt = capturedAt;
-      return file;
-    });
+      const shouldStamp = !isPlateCutoffFileArtifact(file);
+
+      let nextFile = file;
+      if (shouldStamp) {
+        const stamped = await stampEvidenceImage(file, {
+          capturedAt,
+          phase: normalizedPhase,
+          vrmText: scanVrmText || normalizeVrm(file?.detectedPlateText || selectedVrm || ''),
+        });
+        if (stamped) {
+          nextFile = stamped;
+        }
+      }
+
+      nextFile.capturedAt = capturedAt;
+      copyEvidenceFileMetadata(file, nextFile);
+      return nextFile;
+    }));
     const capturedAt = normalizeCapturedAt(nextFiles[0]?.capturedAt) || fallbackCapturedAt;
     const nextPreviews = await toPreviewSrcList(nextFiles);
     let nextCameraRawRecords = buildCameraRawRecords(nextFiles, nextPreviews, { phase: normalizedPhase, capturedAt });
@@ -4390,7 +4363,7 @@ export default function DashboardPage() {
       }
 
       if (selectedTrackedId) {
-        const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+        const queuedItem = await getQueueItemById(selectedTrackedId);
         const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
         const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
         const preservedFiles = existingFiles.filter((file) => file?.phase !== 'entry');
@@ -4462,7 +4435,7 @@ export default function DashboardPage() {
       setMonitoringSessionStartedAt('');
 
       if (selectedTrackedId) {
-        const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+        const queuedItem = await getQueueItemById(selectedTrackedId);
         const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
         const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
         const preservedFiles = existingFiles.filter((file) => file?.phase !== 'closing');
@@ -4616,9 +4589,7 @@ export default function DashboardPage() {
     const uploadTasks = uploadCandidates.map((file, index) => limitUpload(async () => {
       const blob = file?.blob || file;
       if (!blob) {
-        completedUploads += 1;
-        emitProgress({ status: 'uploaded', current: index + 1, fileName: file?.name || '' });
-        return { index, images: [], vrm: '' };
+        throw new Error(`Photo ${index + 1} has no image data to upload.`);
       }
 
       const uploadLabel = `${index + 1}/${totalUploads}`;
@@ -4705,6 +4676,11 @@ export default function DashboardPage() {
             },
           }).promise;
 
+          const signedImageUrl = String(putResult?.url || (data?.url ? String(data.url).split('?')[0] : '') || '').trim();
+          if (!/^https?:\/\//i.test(signedImageUrl)) {
+            throw new Error(`Photo ${fileName} uploaded but no image link was returned.`);
+          }
+
           console.log(`[warden] evidence upload queue complete ${uploadLabel}`, {
             fileName,
             path: data?.path || null,
@@ -4720,14 +4696,14 @@ export default function DashboardPage() {
               index,
               fileName,
               mode: 'signed-upload',
-              url: putResult?.url || null,
+              url: signedImageUrl,
             });
           }
 
           return {
             index,
             vrm: fallbackVrm || '',
-            images: putResult?.url ? [putResult.url] : (data?.url ? [String(data.url).split('?')[0]] : []),
+            images: [signedImageUrl],
           };
         } catch (signedUploadError) {
           lastError = signedUploadError;
@@ -4770,6 +4746,13 @@ export default function DashboardPage() {
           uploaded: fallbackResult.images.length,
         });
 
+        const fallbackImages = (Array.isArray(fallbackResult.images) ? fallbackResult.images : [])
+          .map((value) => String(value || '').trim())
+          .filter((value) => /^https?:\/\//i.test(value));
+        if (fallbackImages.length === 0) {
+          throw new Error(`Photo ${fileName} uploaded but no image link was returned.`);
+        }
+
         completedUploads += 1;
         emitProgress({ status: 'uploaded', current: index + 1, fileName });
         if (syncTrace) {
@@ -4778,14 +4761,14 @@ export default function DashboardPage() {
             index,
             fileName,
             mode: 'server-fallback',
-            uploadedCount: fallbackResult.images.length,
+            uploadedCount: fallbackImages.length,
           });
         }
 
         return {
           index,
           vrm: fallbackResult.vrm || fallbackVrm || '',
-          images: fallbackResult.images,
+          images: fallbackImages,
         };
       } catch (fallbackError) {
         if (syncTrace) {
@@ -4879,18 +4862,247 @@ export default function DashboardPage() {
     }
   }
 
+  /**
+   * Single permit lookup used by every surface. Runs the primary lookup and,
+   * on a miss, probes confusable variants of the VRM so a misread plate on a
+   * permitted vehicle surfaces as a "possible permit match" instead of a clean
+   * "no permit".
+   */
+  async function fetchAuthorizationWithNearMatch(vrm, siteId) {
+    const token = await resolveAuthToken();
+    const breachTime = new Date().toISOString();
+    const lookup = (candidateVrm) => fetchJson(
+      `/api/parking/check-authorization?vrm=${encodeURIComponent(candidateVrm)}&siteId=${encodeURIComponent(siteId)}&breachTime=${encodeURIComponent(breachTime)}`,
+      { token }
+    );
+    return lookupAuthorizationWithNearMatch(vrm, lookup);
+  }
+
+  function rememberAuthorizationResult(vrm, result) {
+    if (!result) return result;
+    const normalized = normalizeVrm(vrm);
+    setAuthorization(result);
+    if (normalized) {
+      setAuthorizationByVrm((current) => ({ ...current, [normalized]: result }));
+    }
+    return result;
+  }
+
   async function checkAuthorization(nextVrm, siteIdOverride = '') {
     const vrm = normalizeVrm(nextVrm || selectedVrm);
     const effectiveSiteId = String(siteIdOverride || selectedSiteId || '').trim();
     if (!vrm || !effectiveSiteId) return null;
-    const token = await resolveAuthToken();
-    const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(effectiveSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, {
-      token
+    const previous = authorizationByVrm[vrm] || null;
+    const fresh = await fetchAuthorizationWithNearMatch(vrm, effectiveSiteId);
+    return rememberAuthorizationResult(vrm, carryOverPermitDecision(previous, fresh, vrm));
+  }
+
+  /**
+   * Keep an earlier "I checked, the registration is right" decision when a
+   * re-run finds the same possible match, so the warden is not asked twice.
+   */
+  function carryOverPermitDecision(previous, fresh, vrm) {
+    const previousDecision = previous?.permitReviewDecision || null;
+    if (!previousDecision || !fresh || typeof fresh !== 'object') return fresh;
+    if (resolvePermitStatus(fresh) !== PERMIT_STATUS.NEAR_MATCH) return fresh;
+    if (normalizeVrm(previousDecision.targetVrm) !== normalizeVrm(vrm)) return fresh;
+    if (normalizeVrm(previousDecision.nearMatchVrm) !== normalizeVrm(fresh?.matchConfidence?.bestVrm)) return fresh;
+    return { ...fresh, permitReviewDecision: previousDecision };
+  }
+
+  /**
+   * Attach the warden's near-match decision to a permit result and remember it
+   * for that VRM, so later gates (session detail, sync) see it as reviewed.
+   */
+  function recordPermitDecision(vrm, result, decision) {
+    if (!result || typeof result !== 'object') return result;
+    const decided = {
+      ...result,
+      permitReviewDecision: buildPermitReviewDecision({ result, decision, targetVrm: vrm }),
+    };
+    rememberAuthorizationResult(vrm, decided);
+    return decided;
+  }
+
+  /**
+   * A near-match decision belongs to the capture it was made on. New captures
+   * (camera tab, gallery) must ask again, so drop any carried decision.
+   */
+  function stripPermitDecision(result) {
+    if (!result || typeof result !== 'object' || !result.permitReviewDecision) return result;
+    const { permitReviewDecision: _ignored, ...rest } = result;
+    return rest;
+  }
+
+  function closeNearMatchPrompt() {
+    if (nearMatchBusy) return;
+    setNearMatchPrompt(null);
+  }
+
+  async function persistTrackedAuthorization(itemId, item, nextVrm, authorizationResult) {
+    if (!itemId) return;
+    const payload = item?.payload || {};
+    const normalized = normalizeVrm(nextVrm || payload.vrm || '');
+    await updateQueueItem(itemId, {
+      payload: {
+        ...payload,
+        vrm: normalized || payload.vrm,
+        authorization: authorizationResult || null,
+      },
+      updatedAt: new Date().toISOString(),
     });
-    const decoratedResult = withAuthorizationMatchConfidence(result, vrm);
-    setAuthorization(decoratedResult);
-    setAuthorizationByVrm((current) => ({ ...current, [vrm]: decoratedResult }));
-    return decoratedResult;
+    await refreshQueue();
+  }
+
+  async function startDraftFromGallery({ vrm, vehicleImage, plateImage, timestamp, siteId, carcheckDetails, permitData }) {
+    const entryTime = timestamp || new Date().toISOString();
+    const effectiveSiteId = siteId || selectedSiteId || '';
+    const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
+    const vehicleDetails = carcheckDetails
+      ? { make: carcheckDetails.make, model: carcheckDetails.model, color: carcheckDetails.color, yearOfManufacture: carcheckDetails.yearOfManufacture }
+      : null;
+    const item = createQueueItem({
+      payload: {
+        vrm,
+        siteId: effectiveSiteId,
+        siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId,
+        source: 'WARDEN',
+        breachLifecycle: 'DRAFT_OPEN',
+        status: 'DRAFT_OPEN',
+        entryCaptureMode: 'manual',
+        observationStartTime: entryTime,
+        entryCapturedAt: entryTime,
+        detectedEntryVehicleImage: vehicleImage || '',
+        startVehicleImage: vehicleImage || '',
+        detectedEntryPlateCutoffImage: plateImage || '',
+        authorization: permitData || null,
+        savedVehicleLookup: vehicleDetails || null,
+        vehicleDetails: vehicleDetails || null,
+        contraventionReason: contraventions[0]?.label || '',
+        selectedContraventionCode: contraventions[0]?.code || '',
+        cameraRawData: [],
+      },
+      files: [],
+    });
+    item.status = 'draft';
+    await saveQueueItem(item);
+    await refreshQueue();
+    setSelectedTrackedId(item.id);
+    setActiveTab('tracked');
+    handleReviewTracked(item);
+    setMessage(`Draft PCN started for ${vrm} from camera feed.`);
+  }
+
+  /**
+   * Gallery "+ Draft PCN": if the row's permit result is a possible match,
+   * ask the warden to review the registration before creating the draft.
+   */
+  async function handleGalleryStartDraft(args) {
+    const permitData = args?.permitData || null;
+    if (permitData && needsNearMatchDecision(permitData)) {
+      setNearMatchPrompt({
+        context: 'gallery',
+        result: permitData,
+        plateImage: args?.plateImage || '',
+        draftArgs: args,
+      });
+      return;
+    }
+    await startDraftFromGallery(args);
+  }
+
+  async function handleNearMatchUseMatched(matchedVrm) {
+    const prompt = nearMatchPrompt;
+    const nextVrm = normalizeVrm(matchedVrm);
+    if (!prompt || !nextVrm) return;
+    setNearMatchBusy(true);
+    try {
+      if (prompt.context === 'detail') {
+        const targetId = selectedTrackedId;
+        const siteId = String(selectedTracked?.payload?.siteId || selectedSiteId || '').trim();
+        setSelectedVrm(nextVrm);
+        await persistTrackedAuthorization(targetId, selectedTracked, nextVrm, null);
+        setNearMatchPrompt(null);
+        const checks = await ensurePcnSubmissionChecks({
+          vrm: nextVrm,
+          siteId,
+          forceCarcheck: true,
+          openDialog: false,
+          allowNetwork: true,
+        });
+        if (checks.ok && targetId) {
+          pcnAutoCheckSignatureRef.current = `${nextVrm}|${siteId}|entry`;
+          const refreshed = await getQueueItemById(targetId);
+          await persistTrackedAuthorization(targetId, refreshed || selectedTracked, nextVrm, checks.permitResult);
+        }
+        setDetailMessage(`Registration changed to ${nextVrm}. Checks refreshed.`);
+        return;
+      }
+
+      if (prompt.context === 'quickCapture') {
+        setCaptureConfirmVrm(nextVrm);
+        setNearMatchPrompt(null);
+        await refreshQuickCaptureConfirmChecks(nextVrm, captureConfirmDialog?.siteId || selectedSiteId);
+        return;
+      }
+
+      if (prompt.context === 'gallery') {
+        const draftArgs = prompt.draftArgs || {};
+        const siteId = String(draftArgs.siteId || selectedSiteId || '').trim();
+        let permitData = null;
+        try {
+          permitData = await checkAuthorization(nextVrm, siteId);
+        } catch (_) {
+          permitData = null;
+        }
+        setNearMatchPrompt(null);
+        await startDraftFromGallery({ ...draftArgs, vrm: nextVrm, permitData, carcheckDetails: null });
+      }
+    } catch (error) {
+      console.error('[warden] near-match switch failed', error);
+      setMessage(error?.message || 'Could not switch registration. Try again.');
+    } finally {
+      setNearMatchBusy(false);
+    }
+  }
+
+  async function handleNearMatchKeep(currentVrm) {
+    const prompt = nearMatchPrompt;
+    if (!prompt) return;
+    const vrm = normalizeVrm(currentVrm || prompt.result?.matchConfidence?.targetVrm || '');
+    setNearMatchBusy(true);
+    try {
+      const decided = recordPermitDecision(vrm, prompt.result, 'keep');
+
+      if (prompt.context === 'detail') {
+        await persistTrackedAuthorization(selectedTrackedId, selectedTracked, vrm, decided);
+        setNearMatchPrompt(null);
+        setDetailMessage(`You confirmed ${vrm} is correct. You can continue with this PCN.`);
+        return;
+      }
+
+      if (prompt.context === 'quickCapture') {
+        setCaptureConfirmDialog((current) => (current ? {
+          ...current,
+          checks: { ...(current.checks || {}), loading: false, permit: decided },
+        } : current));
+        setNearMatchPrompt(null);
+        if (prompt.submitAfter) {
+          await handleConfirmQuickCapture({ permitOverride: decided });
+        }
+        return;
+      }
+
+      if (prompt.context === 'gallery') {
+        setNearMatchPrompt(null);
+        await startDraftFromGallery({ ...(prompt.draftArgs || {}), permitData: decided });
+      }
+    } catch (error) {
+      console.error('[warden] near-match keep failed', error);
+      setMessage(error?.message || 'Could not save your choice. Try again.');
+    } finally {
+      setNearMatchBusy(false);
+    }
   }
 
   async function persistSelectedTrackedVrm() {
@@ -4966,23 +5178,29 @@ export default function DashboardPage() {
   async function handlePermitLookup() {
     setBusy(true);
     try {
-      const result = await checkAuthorization(selectedVrm);
-      if (result?.hasAuthorization) {
-        const score = Number(result?.matchConfidence?.scorePercent || 0);
-        const bestVrm = String(result?.matchConfidence?.bestVrm || '').trim();
-        if (score > 0 && bestVrm) {
-          setDetailMessage(`E-permit lookup matched an active authorisation for this site (${score}% VRM match with ${bestVrm}).`);
-        } else {
-          setDetailMessage('E-permit lookup matched an active authorisation for this site.');
+      const targetVrm = normalizeVrm(selectedVrm);
+      const result = await checkAuthorization(targetVrm);
+      if (selectedTrackedId && normalizeVrm(selectedTracked?.payload?.vrm || '') === targetVrm) {
+        await persistTrackedAuthorization(selectedTrackedId, await getQueueItemById(selectedTrackedId), targetVrm, result);
+      }
+      const status = resolvePermitStatus(result);
+      const bestVrm = String(result?.matchConfidence?.bestVrm || '').trim();
+      const score = Number(result?.matchConfidence?.scorePercent || 0);
+      if (status === PERMIT_STATUS.PERMITTED) {
+        setDetailMessage('Permit check complete: this vehicle has a permit for this site.');
+      } else if (status === PERMIT_STATUS.PENDING) {
+        setDetailMessage('Permit check complete: this registration has a permit request waiting for approval. You can continue - the ticket may be cancelled later if the permit is approved.');
+      } else if (status === PERMIT_STATUS.NEAR_MATCH) {
+        setDetailMessage(`Permit check complete: possible permit match ${bestVrm} (${score}%). Check the plate photo before submitting.`);
+        if (needsNearMatchDecision(result)) {
+          setNearMatchPrompt({
+            context: 'detail',
+            result,
+            plateImage: String(selectedTracked?.payload?.detectedEntryPlateCutoffImage || '').trim(),
+          });
         }
       } else {
-        const score = Number(result?.matchConfidence?.scorePercent || 0);
-        const bestVrm = String(result?.matchConfidence?.bestVrm || '').trim();
-        if (score > 0 && bestVrm) {
-          setDetailMessage(`E-permit lookup completed. No active authorisation matched this site. Closest exemption match: ${bestVrm} (${score}%).`);
-        } else {
-          setDetailMessage('E-permit lookup completed. No active authorisation matched this site.');
-        }
+        setDetailMessage('Permit check complete: no permit found for this vehicle at this site.');
       }
     } catch (error) {
       console.error('[warden] permit lookup failed', error);
@@ -5143,7 +5361,17 @@ export default function DashboardPage() {
       });
 
       if (checks.ok) {
-        setDetailMessage('Carcheck and e-permit checks refreshed for this draft.');
+        await persistTrackedAuthorization(selectedTrackedId, await getQueueItemById(selectedTrackedId), targetVrm, checks.permitResult);
+        if (needsNearMatchDecision(checks.permitResult)) {
+          setDetailMessage('Checks refreshed. A very similar registration has a permit here - review it before submitting.');
+          setNearMatchPrompt({
+            context: 'detail',
+            result: checks.permitResult,
+            plateImage: String(selectedTracked?.payload?.detectedEntryPlateCutoffImage || '').trim(),
+          });
+        } else {
+          setDetailMessage('Carcheck and permit checks refreshed for this draft.');
+        }
       }
     } finally {
       setBusy(false);
@@ -5200,10 +5428,17 @@ export default function DashboardPage() {
     if (!permitResult && normalizeVrm(selectedTracked?.payload?.vrm || '') === vrm) {
       permitResult = selectedTrackedAuthorization;
     }
+    const previousPermitResult = permitResult;
 
     if ((!permitResult || forceCarcheck) && allowNetwork) {
       try {
         permitResult = await checkAuthorization(vrm, siteId);
+        // The in-memory cache may not have the draft's stored decision yet
+        // (e.g. first open after a reload) - carry it over from the payload too.
+        const carried = carryOverPermitDecision(previousPermitResult, permitResult, vrm);
+        if (carried !== permitResult) {
+          permitResult = rememberAuthorizationResult(vrm, carried);
+        }
       } catch (error) {
         const message = allowNetwork
           ? (error?.message || 'E-permit check failed. Retry after confirming the VRM and site.')
@@ -5227,6 +5462,7 @@ export default function DashboardPage() {
       siteId,
       vehicleDetails,
       permitResult,
+      permitStatus: resolvePermitStatus(permitResult),
     };
   }
 
@@ -5257,6 +5493,19 @@ export default function DashboardPage() {
       if (cancelled) return;
       if (result.ok) {
         pcnAutoCheckSignatureRef.current = signature;
+        if (selectedTrackedId && normalizeVrm(selectedTracked?.payload?.vrm || '') === vrm) {
+          const latest = await getQueueItemById(selectedTrackedId);
+          if (cancelled) return;
+          await persistTrackedAuthorization(selectedTrackedId, latest || selectedTracked, vrm, result.permitResult);
+        }
+        if (needsNearMatchDecision(result.permitResult)) {
+          setDetailMessage('A very similar registration has a permit here. Review the registration before submitting.');
+          setNearMatchPrompt({
+            context: 'detail',
+            result: result.permitResult,
+            plateImage: String(selectedTracked?.payload?.detectedEntryPlateCutoffImage || '').trim(),
+          });
+        }
       } else {
         setDetailMessage('Auto-check failed after entry capture. Use Retry carcheck and Retry e-permit check in Draft PCN details.');
       }
@@ -5353,7 +5602,7 @@ export default function DashboardPage() {
     };
 
     if (targetItemId) {
-      const existing = (await listQueueItems()).find((item) => item.id === targetItemId);
+      const existing = await getQueueItemById(targetItemId);
       if (existing) {
         await syncQueueItem(targetItemId, { openPcnDialogAfterSuccess: openPcnDialogAfterSync });
         return;
@@ -5502,7 +5751,7 @@ export default function DashboardPage() {
 
     let itemId = targetItemId;
     if (targetItemId) {
-      const existing = (await listQueueItems()).find((item) => item.id === targetItemId);
+      const existing = await getQueueItemById(targetItemId);
       if (existing) {
         await saveQueueItem({
           ...existing,
@@ -5621,7 +5870,7 @@ export default function DashboardPage() {
 
     let draftId = selectedTrackedId;
     if (draftId) {
-      const existing = (await listQueueItems()).find((item) => item.id === draftId);
+      const existing = await getQueueItemById(draftId);
       if (existing) {
         await saveQueueItem({
           ...existing,
@@ -5664,7 +5913,8 @@ export default function DashboardPage() {
     note,
     scan = null,
     captureMode = 'scan',
-    skippedCapture = false
+    skippedCapture = false,
+    authorization: stepperAuthorization = null,
   }) {
     try {
       setBusy(true);
@@ -5725,7 +5975,14 @@ export default function DashboardPage() {
         cameraRawData: skipCapture
           ? []
           : buildCameraRawRecords(files, stepperPreviews, { phase: 'entry', capturedAt: entryTime, source: 'WARDEN_STEPPER' }),
+        authorization: stepperAuthorization && typeof stepperAuthorization === 'object' ? stepperAuthorization : null,
       };
+
+      // Seed the permit cache so the detail view shows the stepper's result
+      // (and any near-match decision) without a second round of lookups.
+      if (draftPayload.authorization) {
+        rememberAuthorizationResult(vrm, draftPayload.authorization);
+      }
 
       const draftFiles = files.map((file, i) => ({
         name: `entry_${i}_${Date.now()}.jpg`,
@@ -5760,23 +6017,34 @@ export default function DashboardPage() {
     openPcnDialogAfterSuccess = false,
     forceBreachCapture = false,
     forceRefreshTokenAtStart = false,
+    suppressUiRefresh = false,
+    quietMode = false,
   } = {}) {
-    const queuedItem = (await listQueueItems()).find((item) => item.id === itemId);
+    const updateSyncMessage = (text) => {
+      if (!quietMode) {
+        setMessage(text);
+      }
+    };
+
+    const queuedItem = await getQueueItemById(itemId);
     if (!queuedItem) {
       return { ok: false, error: 'Draft Parking Charge not found for sync' };
     }
 
+    const enableSyncUi = !quietMode;
     const { trace: syncTrace, traceId, enabled: traceEnabled } = createSyncTracer(itemId, {
-      onEvent: pushSyncTraceEntryToUi,
+      onEvent: enableSyncUi ? pushSyncTraceEntryToUi : null,
     });
-    setSyncProgressDialogOpen(true);
-    setSyncProgressLogs([]);
-    setSyncProgressMeta({
-      traceId,
-      itemId,
-      status: 'running',
-      startedAt: new Date().toISOString(),
-    });
+    if (enableSyncUi) {
+      setSyncProgressDialogOpen(true);
+      setSyncProgressLogs([]);
+      setSyncProgressMeta({
+        traceId,
+        itemId,
+        status: 'running',
+        startedAt: new Date().toISOString(),
+      });
+    }
     syncTrace('sync_start', {
       status: String(queuedItem?.status || ''),
       attempts: Number(queuedItem?.attempts || 0),
@@ -5793,7 +6061,7 @@ export default function DashboardPage() {
     const canForceBreachCapture = forceBreachCapture && missingBreachId;
 
     if (!lifecycle.syncable && queuedItem.status !== 'syncing' && !canForceBreachCapture) {
-      setMessage('This Parking Charge is still a draft and needs both opening and closing evidence before submission.');
+      updateSyncMessage('This Parking Charge is still a draft and needs both opening and closing evidence before submission.');
       return {
         ok: false,
         error: 'This Parking Charge is still a draft and needs both opening and closing evidence before submission.',
@@ -5802,7 +6070,9 @@ export default function DashboardPage() {
 
     try {
       await updateQueueItem(itemId, { status: 'syncing', attempts: queuedItem.attempts + 1, updatedAt: new Date().toISOString(), lastError: null });
-      await refreshQueue();
+      if (!suppressUiRefresh) {
+        await refreshQueue();
+      }
 
       const token = await resolveAuthToken({ forceRefresh: forceRefreshTokenAtStart });
       const queuedSiteId = String(queuedItem?.payload?.siteId || selectedSiteId || '').trim();
@@ -6050,13 +6320,13 @@ export default function DashboardPage() {
           step: '1/4',
           message: `Step 1/4: Uploading opening images (${entryUploadableFiles.length})`,
         });
-        setMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (0/${entryUploadableFiles.length})...`);
+        updateSyncMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (0/${entryUploadableFiles.length})...`);
       } else {
         syncTrace('stage_update', {
           step: '1/4',
           message: 'Step 1/4: Using stored opening evidence',
         });
-        setMessage(`Sync ${queueVrmLabel} Step 1/4: Using stored opening evidence...`);
+        updateSyncMessage(`Sync ${queueVrmLabel} Step 1/4: Using stored opening evidence...`);
       }
 
       let entryEvidence;
@@ -6067,7 +6337,7 @@ export default function DashboardPage() {
             syncTrace,
             onProgress: ({ status, completed, total }) => {
               if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
-              setMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (${Math.min(completed, total)}/${total})...`);
+              updateSyncMessage(`Sync ${queueVrmLabel} Step 1/4: Uploading opening images (${Math.min(completed, total)}/${total})...`);
             },
           });
         } catch (error) {
@@ -6107,11 +6377,15 @@ export default function DashboardPage() {
         };
       }
 
-      if (Number(entryEvidence?.failedCount || 0) > 0) {
-        console.warn('[warden] opening evidence partial upload', {
-          failed: entryEvidence.failedCount,
-          errors: entryEvidence.errors || [],
-        });
+      const entryGap = evidenceUploadGap({
+        uploadedImages: entryEvidence?.images,
+        failedCount: entryEvidence?.failedCount,
+        expectedCount: shouldUploadLocalEvidence ? entryUploadableFiles.length : 0,
+        fromStoredPayload: Boolean(entryEvidence?.fromStoredPayload),
+      });
+      if (entryGap.incomplete) {
+        const entryDetail = (Array.isArray(entryEvidence?.errors) ? entryEvidence.errors : []).find(Boolean) || '';
+        throw new Error(`Opening photos did not all upload (${entryGap.uploaded} of ${entryGap.expected}). Submission stopped so this parking charge is not missing photos.${entryDetail ? ` ${entryDetail}` : ''}`);
       }
 
       if (shouldUploadLocalEvidence) {
@@ -6119,13 +6393,13 @@ export default function DashboardPage() {
           step: '2/4',
           message: `Step 2/4: Uploading closing images (${closingUploadableFiles.length})`,
         });
-        setMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (0/${closingUploadableFiles.length})...`);
+        updateSyncMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (0/${closingUploadableFiles.length})...`);
       } else {
         syncTrace('stage_update', {
           step: '2/4',
           message: 'Step 2/4: Using stored closing evidence',
         });
-        setMessage(`Sync ${queueVrmLabel} Step 2/4: Using stored closing evidence...`);
+        updateSyncMessage(`Sync ${queueVrmLabel} Step 2/4: Using stored closing evidence...`);
       }
 
       let closingEvidence;
@@ -6136,7 +6410,7 @@ export default function DashboardPage() {
             syncTrace,
             onProgress: ({ status, completed, total }) => {
               if (!['starting', 'uploading', 'uploaded', 'done'].includes(status)) return;
-              setMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (${Math.min(completed, total)}/${total})...`);
+              updateSyncMessage(`Sync ${queueVrmLabel} Step 2/4: Uploading closing images (${Math.min(completed, total)}/${total})...`);
             },
           });
         } catch (error) {
@@ -6176,11 +6450,15 @@ export default function DashboardPage() {
         };
       }
 
-      if (Number(closingEvidence?.failedCount || 0) > 0) {
-        console.warn('[warden] closing evidence partial upload', {
-          failed: closingEvidence.failedCount,
-          errors: closingEvidence.errors || [],
-        });
+      const closingGap = evidenceUploadGap({
+        uploadedImages: closingEvidence?.images,
+        failedCount: closingEvidence?.failedCount,
+        expectedCount: shouldUploadLocalEvidence ? closingUploadableFiles.length : 0,
+        fromStoredPayload: Boolean(closingEvidence?.fromStoredPayload),
+      });
+      if (closingGap.incomplete) {
+        const closingDetail = (Array.isArray(closingEvidence?.errors) ? closingEvidence.errors : []).find(Boolean) || '';
+        throw new Error(`Closing photos did not all upload (${closingGap.uploaded} of ${closingGap.expected}). Submission stopped so this parking charge is not missing photos.${closingDetail ? ` ${closingDetail}` : ''}`);
       }
 
       if (!entryEvidence?.images?.length || !closingEvidence?.images?.length) {
@@ -6192,7 +6470,7 @@ export default function DashboardPage() {
         step: '3/4',
         message: 'Step 3/4: Validating permit and carcheck',
       });
-      setMessage(`Sync ${queueVrmLabel} Step 3/4: Validating permit and carcheck...`);
+      updateSyncMessage(`Sync ${queueVrmLabel} Step 3/4: Validating permit and carcheck...`);
       const submissionChecks = await ensurePcnSubmissionChecks({
         vrm,
         siteId: queuedSiteId,
@@ -6207,6 +6485,10 @@ export default function DashboardPage() {
       const authData = submissionChecks.permitResult || queuedItem?.payload?.authorization || null;
       if (!authData) {
         throw new Error('E-permit check is required before submission. Use Retry e-permit check in Draft PCN details.');
+      }
+      if (needsNearMatchDecision(authData, queuedItem?.payload?.authorization?.permitReviewDecision || null)) {
+        const nearVrm = String(authData?.matchConfidence?.bestVrm || '').trim();
+        throw new Error(`Possible permit match found${nearVrm ? ` (${nearVrm})` : ''}. Review the registration in the session details before submitting.`);
       }
       const { entryTime, closingTime } = resolveObservationWindow(queuedItem.payload || {});
       const allImages = [...(entryEvidence.images || []), ...(closingEvidence.images || [])]
@@ -6435,7 +6717,7 @@ export default function DashboardPage() {
         exitAlarmId: exitCapture?.alarmId || null,
       });
 
-      setMessage(`Sync ${queueVrmLabel} Step 4/4: Submitting breach to backend...`);
+      updateSyncMessage(`Sync ${queueVrmLabel} Step 4/4: Submitting breach to backend...`);
       syncTrace('stage_update', {
         step: '4/4',
         message: 'Step 4/4: Submitting breach to backend',
@@ -6455,12 +6737,14 @@ export default function DashboardPage() {
         vrm,
         traceId,
       });
-      setSyncProgressMeta((current) => ({
-        ...current,
-        traceId,
-        itemId,
-        status: 'success',
-      }));
+      if (enableSyncUi) {
+        setSyncProgressMeta((current) => ({
+          ...current,
+          traceId,
+          itemId,
+          status: 'success',
+        }));
+      }
       await updateQueueItem(itemId, {
         status: 'submitted',
         archived: false,
@@ -6484,11 +6768,11 @@ export default function DashboardPage() {
           setActiveTab('tracked');
           setPcnReasonInput(getPreferredReason(submittedItem?.payload));
           setConvertError('');
-          setMessage('Parking Charge submitted. Use the primary action to complete final PCN submission.');
+          updateSyncMessage('Parking Charge submitted. Use the primary action to complete final PCN submission.');
         }
       }
 
-      setMessage(`Breach submitted successfully (${breachId || vrm}). Final PCN conversion is still required.`);
+      updateSyncMessage(`Breach submitted successfully (${breachId || vrm}). Final PCN conversion is still required.`);
       setSelectedVrm('');
       setEntryFiles([]);
       setEntryPreviews([]);
@@ -6514,19 +6798,21 @@ export default function DashboardPage() {
         syncTrace('sync_cancelled', {
           reason: errorMessage,
         });
-        setSyncProgressMeta((current) => ({
-          ...current,
-          traceId,
-          itemId,
-          status: 'cancelled',
-        }));
+        if (enableSyncUi) {
+          setSyncProgressMeta((current) => ({
+            ...current,
+            traceId,
+            itemId,
+            status: 'cancelled',
+          }));
+        }
         syncAbortControllersRef.current.delete(itemId);
         await updateQueueItem(itemId, {
           status: 'queued',
           lastError: 'Sync cancelled by user',
           updatedAt: new Date().toISOString(),
         });
-        setMessage('Sync cancelled. Draft PCN retained in queue.');
+        updateSyncMessage('Sync cancelled. Draft PCN retained in queue.');
         return { ok: false, error: 'Sync cancelled by user' };
       }
 
@@ -6535,22 +6821,26 @@ export default function DashboardPage() {
         errorName,
         errorMessage,
       });
-      setSyncProgressMeta((current) => ({
-        ...current,
-        traceId,
-        itemId,
-        status: 'failed',
-      }));
+      if (enableSyncUi) {
+        setSyncProgressMeta((current) => ({
+          ...current,
+          traceId,
+          itemId,
+          status: 'failed',
+        }));
+      }
       await updateQueueItem(itemId, {
         status: 'failed',
         lastError: errorMessage,
         updatedAt: new Date().toISOString()
       });
-      setMessage(traceEnabled ? `${errorMessage} (trace: ${traceId})` : errorMessage);
+      updateSyncMessage(traceEnabled ? `${errorMessage} (trace: ${traceId})` : errorMessage);
       return { ok: false, error: errorMessage, status: errorStatus };
     } finally {
       syncAbortControllersRef.current.delete(itemId);
-      await refreshQueue();
+      if (!suppressUiRefresh) {
+        await refreshQueue();
+      }
     }
   }
 
@@ -6560,11 +6850,13 @@ export default function DashboardPage() {
       let lastResult = { ok: false, error: 'Sync failed' };
       let forceRefreshTokenAtStart = Boolean(options?.forceAuthRefreshAtStart);
       let authRetryUsed = false;
+      const suppressUiRefresh = Boolean(options?.suppressUiRefresh);
 
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         const result = await syncQueueItemInternal(itemId, {
           ...options,
           forceRefreshTokenAtStart,
+          suppressUiRefresh,
         });
         if (result?.ok) return result;
 
@@ -6578,8 +6870,12 @@ export default function DashboardPage() {
             lastError: `${lastResult?.error || 'Authentication failed'} (refreshing token and retrying...)`,
             updatedAt: new Date().toISOString(),
           });
-          await refreshQueue();
-          setMessage('Session token expired. Refreshing auth and retrying sync...');
+          if (!suppressUiRefresh) {
+            await refreshQueue();
+          }
+          if (!options?.quietMode) {
+            setMessage('Session token expired. Refreshing auth and retrying sync...');
+          }
           continue;
         }
 
@@ -6594,8 +6890,12 @@ export default function DashboardPage() {
           lastError: `${lastResult?.error || 'Sync failed'} (retry ${attempt + 1}/${maxAttempts})`,
           updatedAt: new Date().toISOString(),
         });
-        await refreshQueue();
-        setMessage(`Network unstable. Retrying sync (${attempt + 1}/${maxAttempts})...`);
+        if (!suppressUiRefresh) {
+          await refreshQueue();
+        }
+        if (!options?.quietMode) {
+          setMessage(`Network unstable. Retrying sync (${attempt + 1}/${maxAttempts})...`);
+        }
         await sleepMs(delayMs);
       }
 
@@ -6667,12 +6967,17 @@ export default function DashboardPage() {
   setSubmissionProgressText('Step 3/3: Submitting final PCN...');
         setMessage('Submitting PCN to backend...');
 
-        const images = [
-          ...(Array.isArray(workingItem?.payload?.images) ? workingItem.payload.images : []),
-          ...(Array.isArray(workingItem?.payload?.imageUrls) ? workingItem.payload.imageUrls : []),
-        ]
-          .filter((value) => typeof value === 'string' && value.length > 0)
-          .filter((value, index, all) => all.indexOf(value) === index);
+        const images = collectPcnImageUrls(workingItem?.payload || {});
+        const uploadablePhotoCount = (Array.isArray(workingItem?.files) ? workingItem.files : [])
+          .filter((file) => file?.phase === 'entry' || file?.phase === 'closing')
+          .filter((file) => isUploadableBlob(file?.blob || file))
+          .length;
+        if (images.length < 2) {
+          throw new Error('Opening and closing photos are required before this parking charge can be submitted.');
+        }
+        if (uploadablePhotoCount > images.length) {
+          throw new Error(`Only ${images.length} of ${uploadablePhotoCount} photos are saved. Sync this session again before submitting.`);
+        }
         const vehicleDetails = buildVehicleDetailsRecord(
           submissionChecks.vehicleDetails ||
           workingItem?.payload?.vehicleDetails ||
@@ -6726,6 +7031,8 @@ export default function DashboardPage() {
             siteName: workingItem?.siteName || '',
             evidence: workingItem?.payload?.evidence || {},
             images,
+            imageUrls: images,
+            cameraRawData: Array.isArray(workingItem?.payload?.cameraRawData) ? workingItem.payload.cameraRawData : [],
             vehicleDetails,
           },
         });
@@ -6772,7 +7079,12 @@ export default function DashboardPage() {
 
   async function syncQueue() {
     const items = await listQueueItems();
-    const syncableItems = items.filter((entry) => getBreachLifecycle(entry).syncable || entry.status === 'syncing');
+    const syncableItems = items
+      .filter((entry) => getBreachLifecycle(entry).syncable || entry.status === 'syncing')
+      .map((entry) => ({
+        id: entry.id,
+        status: entry.status,
+      }));
 
     if (!syncableItems.length) return;
 
@@ -6782,33 +7094,58 @@ export default function DashboardPage() {
       uploadConcurrency: IMAGE_UPLOAD_CONCURRENCY,
     });
 
-    const results = await Promise.allSettled(
-      syncableItems.map((item, index) => (async () => {
-        const syncLabel = `${index + 1}/${syncableItems.length}`;
-        console.log(`[warden] pcn sync queue start ${syncLabel}`, {
-          itemId: item?.id || null,
-          status: item?.status || null,
-        });
+    let processedCount = 0;
+    let successCount = 0;
+    let failedCount = 0;
 
-        const result = await syncQueueItem(item.id);
+    for (const item of syncableItems) {
+      const syncLabel = `${processedCount + 1}/${syncableItems.length}`;
+      console.log(`[warden] pcn sync queue start ${syncLabel}`, {
+        itemId: item?.id || null,
+        status: item?.status || null,
+      });
 
-        console.log(`[warden] pcn sync queue complete ${syncLabel}`, {
-          itemId: item?.id || null,
-          ok: Boolean(result?.ok),
-          error: result?.error || null,
-        });
+      let result;
+      try {
+        result = await syncQueueItem(item.id, { suppressUiRefresh: true, quietMode: true });
+      } catch (error) {
+        result = { ok: false, error: String(error?.message || error || 'Sync failed') };
+      }
 
-        return result;
-      })())
-    );
+      const ok = Boolean(result?.ok);
+      if (ok) successCount += 1;
+      else failedCount += 1;
+      processedCount += 1;
 
-    const failedCount = results.filter((result) => result.status === 'rejected' || !result.value?.ok).length;
+      console.log(`[warden] pcn sync queue complete ${syncLabel}`, {
+        itemId: item?.id || null,
+        ok,
+        error: result?.error || null,
+      });
+
+      if (processedCount % QUEUE_SYNC_UI_REFRESH_EVERY === 0 || processedCount === syncableItems.length) {
+        await refreshQueue();
+      }
+
+      if (processedCount % QUEUE_SYNC_YIELD_EVERY === 0) {
+        await sleepMs(0);
+      }
+
+      if (processedCount % QUEUE_SYNC_PROGRESS_MESSAGE_EVERY === 0 || processedCount === syncableItems.length) {
+        setMessage(`Queue sync progress: ${processedCount}/${syncableItems.length} processed, ${successCount} synced, ${failedCount} failed.`);
+      }
+    }
+
     console.log('[warden] queue sync complete', {
-      totalPcns: syncableItems.length,
+      totalPcns: processedCount,
+      successCount,
       failedCount,
     });
+
     if (failedCount > 0) {
-      setMessage(`Queue sync completed with ${failedCount} failed item${failedCount === 1 ? '' : 's'}.`);
+      setMessage(`Queue sync completed: ${successCount} synced, ${failedCount} failed.`);
+    } else {
+      setMessage(`Queue sync completed: ${successCount} synced.`);
     }
   }
 
@@ -7115,7 +7452,7 @@ export default function DashboardPage() {
     }
 
     try {
-      const queuedItem = (await listQueueItems()).find((item) => item.id === selectedTrackedId) || null;
+      const queuedItem = await getQueueItemById(selectedTrackedId);
       const selectedPayload = queuedItem?.payload || selectedTracked?.payload || {};
       const existingFiles = Array.isArray(queuedItem?.files) ? queuedItem.files : [];
       const phaseFiles = existingFiles.filter((file) => file?.phase === normalizedPhase);
@@ -7652,37 +7989,41 @@ export default function DashboardPage() {
             >
               Retry e-permit check
             </button>
+
+            {selectedTrackedAuthorization ? (
+              <>
+                <PermitStatusBanner result={selectedTrackedAuthorization} />
+                {pcnSubmissionGate.nearMatchUnresolved ? (
+                  <button
+                    type="button"
+                    className="action-btn action-btn--issue"
+                    disabled={busy}
+                    onClick={() => setNearMatchPrompt({
+                      context: 'detail',
+                      result: selectedTrackedAuthorization,
+                      plateImage: String(selectedTracked?.payload?.detectedEntryPlateCutoffImage || '').trim(),
+                    })}
+                    style={{ marginTop: 8 }}
+                  >
+                    Review registration
+                  </button>
+                ) : null}
+              </>
+            ) : (
+              <p className="text-muted" style={{ fontSize: 13, margin: '8px 0 0' }}>
+                No check run yet
+              </p>
+            )}
+
             <button
               type="button"
               className="action-btn action-btn--secondary"
               disabled={!selectedVrm || busy || vehicleLookupLoading}
               onClick={retryDraftChecks}
-              style={{ marginTop: 8 }}
+              style={{ marginTop: 10 }}
             >
               Retry carcheck + e-permit
             </button>
-
-            {selectedTrackedAuthorization ? (
-              <div className={`auth-result ${selectedTrackedAuthorization.hasAuthorization ? 'auth-result--ok' : 'auth-result--none'}`}>
-                <span className="auth-result-icon">{selectedTrackedAuthorization.hasAuthorization ? 'Yes' : 'No'}</span>
-                <div className="auth-result-content">
-                  <div className="auth-result-text">
-                    {selectedTrackedAuthorization.hasAuthorization
-                      ? `Authorised - ${selectedTrackedAuthorization.authorization?.type || 'permit found'}`
-                      : 'No active permit or payment found'}
-                  </div>
-                  <MatchConfidencePill matchConfidence={selectedTrackedAuthorization?.matchConfidence} />
-                  {selectedTrackedAuthorization.authorization?.site ? (
-                    <div className="auth-result-sub">{selectedTrackedAuthorization.authorization.site}</div>
-                  ) : null}
-                </div>
-              </div>
-            ) : (
-              <p className="text-muted" style={{ fontSize: 13, margin: 0 }}>
-                No check run yet
-              </p>
-            )}
-
           </div>
 
           {/* Carcheck */}
@@ -7903,6 +8244,14 @@ export default function DashboardPage() {
                       onClick={async () => {
                         if (!canProceedWithPcnActions) return;
                         await persistTrackedPcnDetails({ silent: true });
+                        if (pcnSubmissionGate.nearMatchUnresolved) {
+                          setNearMatchPrompt({
+                            context: 'detail',
+                            result: selectedTrackedAuthorization,
+                            plateImage: String(selectedTracked?.payload?.detectedEntryPlateCutoffImage || '').trim(),
+                          });
+                          return;
+                        }
                         if (!pcnSubmissionGate.ready) {
                           setDetailMessage('Checks required. Use Retry carcheck and Retry e-permit check in Draft PCN details.');
                           return;
@@ -7915,7 +8264,7 @@ export default function DashboardPage() {
                         ? (submissionProgressText || 'Submitting...')
                         : (pcnSubmissionGate.ready
                           ? (selectedTracked?.payload?.breachId ? 'Submit PCN to backend' : 'Sync and submit PCN')
-                          : 'Checks required before submit')}
+                          : (pcnSubmissionGate.nearMatchUnresolved ? 'Review registration before submit' : 'Checks required before submit'))}
                     </button>
                   </div>
                 </div>
@@ -8338,6 +8687,36 @@ export default function DashboardPage() {
             <span className="quick-capture-label">Capture vehicle</span>
           </button>
 
+          <div className="camera-feed-local-queue">
+            <button type="button" className="camera-feed-local-queue__btn" onClick={markFailedCaptureCardsForSync}>
+              Failed
+            </button>
+            <button
+              type="button"
+              className="camera-feed-local-queue__btn"
+              onClick={syncSelectedCaptureCards}
+              disabled={selectedCaptureCardIds.length === 0 || captureBulkSyncing}
+            >
+              {captureBulkSyncing ? 'Retrying…' : 'Retry failed'}
+            </button>
+            <button
+              type="button"
+              className="camera-feed-local-queue__btn"
+              onClick={clearCaptureCardSelection}
+              disabled={selectedCaptureCardIds.length === 0}
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              className="camera-feed-local-queue__btn"
+              onClick={archiveSelectedCaptureCards}
+              disabled={selectedCaptureCardIds.length === 0}
+            >
+              Archive
+            </button>
+          </div>
+
           {/* ── Camera service feed (already relayed to breach engine) ── */}
           <WardenCaptureFeed
             getToken={resolveAuthToken}
@@ -8348,6 +8727,8 @@ export default function DashboardPage() {
             contraventions={contraventions}
             onOpenCarcheckResult={openGalleryCarcheckResult}
             onOpenPermitResult={openGalleryPermitResult}
+            onRunPermitCheck={runFreshPermitCheck}
+            onRetryCaptureSync={retryCaptureSync}
             onOpenImage={({ src, label, phase, capturedAt, allowDelete }) => {
               openImageDetailDialog({
                 src,
@@ -8357,44 +8738,7 @@ export default function DashboardPage() {
                 allowDelete: Boolean(allowDelete),
               }).catch(() => null);
             }}
-            onStartDraft={async ({ vrm, vehicleImage, plateImage, timestamp, siteId, carcheckDetails, permitData }) => {
-              const entryTime = timestamp || new Date().toISOString();
-              const effectiveSiteId = siteId || selectedSiteId || '';
-              const effectiveSite = sites.find((s) => String(s.id) === effectiveSiteId) || null;
-              const vehicleDetails = carcheckDetails
-                ? { make: carcheckDetails.make, model: carcheckDetails.model, color: carcheckDetails.color, yearOfManufacture: carcheckDetails.yearOfManufacture }
-                : null;
-              const item = createQueueItem({
-                payload: {
-                  vrm,
-                  siteId: effectiveSiteId,
-                  siteName: effectiveSite?.name || effectiveSite?.displayName || effectiveSiteId,
-                  source: 'WARDEN',
-                  breachLifecycle: 'DRAFT_OPEN',
-                  status: 'DRAFT_OPEN',
-                  entryCaptureMode: 'manual',
-                  observationStartTime: entryTime,
-                  entryCapturedAt: entryTime,
-                  detectedEntryVehicleImage: vehicleImage || '',
-                  startVehicleImage: vehicleImage || '',
-                  detectedEntryPlateCutoffImage: plateImage || '',
-                  authorization: permitData || null,
-                  savedVehicleLookup: vehicleDetails || null,
-                  vehicleDetails: vehicleDetails || null,
-                  contraventionReason: contraventions[0]?.label || '',
-                  selectedContraventionCode: contraventions[0]?.code || '',
-                  cameraRawData: [],
-                },
-                files: [],
-              });
-              item.status = 'draft';
-              await saveQueueItem(item);
-              await refreshQueue();
-              setSelectedTrackedId(item.id);
-              setActiveTab('tracked');
-              handleReviewTracked(item);
-              setMessage(`Draft PCN started for ${vrm} from camera feed.`);
-            }}
+            onStartDraft={handleGalleryStartDraft}
           />
         </main>
       ) : null}
@@ -8788,6 +9132,7 @@ export default function DashboardPage() {
         contraventions={contraventions}
         selectedSiteId={selectedSiteId}
         onPlateScan={scanPlateFromImage}
+        onPermitCheck={runFreshPermitCheck}
       />
 
       <BreachStepper
@@ -8805,6 +9150,7 @@ export default function DashboardPage() {
         autoCompleteOnCapture={captureIsQuickMode}
         hideCapturedPreview={false}
         quickFlow={false}
+        onPermitCheck={runFreshPermitCheck}
       />
 
       {captureConfirmDialog ? (
@@ -8820,6 +9166,8 @@ export default function DashboardPage() {
               const effectiveVrm = normalizeVrm(captureConfirmVrm || captureConfirmDialog?.scan?.plateText || '');
               const hasValidVrm = isLikelyCurrentUkVrm(effectiveVrm);
               if (captureConfirmDialog.checks?.loading) return 'capture-confirm-sheet--checking';
+              if (resolvePermitStatus(captureConfirmDialog.checks?.permit) === PERMIT_STATUS.NEAR_MATCH) return 'capture-confirm-sheet--near';
+              if (resolvePermitStatus(captureConfirmDialog.checks?.permit) === PERMIT_STATUS.PENDING) return 'capture-confirm-sheet--pending';
               if (captureConfirmDialog.checks?.permit?.hasAuthorization || hasValidVrm) return 'capture-confirm-sheet--permit';
               if (captureConfirmDialog.error) return 'capture-confirm-sheet--error';
               return 'capture-confirm-sheet--no-permit';
@@ -8885,15 +9233,33 @@ export default function DashboardPage() {
                       return;
                     }
 
-                    setCaptureConfirmDialog((current) => (current ? {
-                      ...current,
-                      loading: false,
-                      error: '',
-                      checks: {
-                        ...(current.checks || {}),
+                    // A permit result only applies to the VRM it was checked for.
+                    setCaptureConfirmDialog((current) => {
+                      if (!current) return current;
+                      const checkedVrm = normalizeVrm(current.checks?.permit?.matchConfidence?.targetVrm || '');
+                      const permitStillValid = Boolean(checkedVrm) && checkedVrm === nextVrm;
+                      return {
+                        ...current,
                         loading: false,
-                      },
-                    } : current));
+                        error: '',
+                        checks: {
+                          ...(current.checks || {}),
+                          loading: false,
+                          permit: permitStillValid ? current.checks.permit : null,
+                        },
+                      };
+                    });
+
+                    if (quickCaptureRecheckTimerRef.current) {
+                      clearTimeout(quickCaptureRecheckTimerRef.current);
+                      quickCaptureRecheckTimerRef.current = null;
+                    }
+                    if (nextVrm.length >= 5) {
+                      quickCaptureRecheckTimerRef.current = setTimeout(() => {
+                        quickCaptureRecheckTimerRef.current = null;
+                        refreshQuickCaptureConfirmChecks(nextVrm, nextSiteId).catch(() => null);
+                      }, 700);
+                    }
                   }}
                   placeholder="AB12CDE"
                   autoCapitalize="characters"
@@ -8939,12 +9305,23 @@ export default function DashboardPage() {
                 <span className={`pcn-status-pill ${captureConfirmDialog.checks?.loading ? 'pcn-status-pill--warn' : 'pcn-status-pill--ok'}`}>
                   {captureConfirmDialog.captureMode === 'manual' ? 'Manual entry' : (captureConfirmDialog.checks?.loading ? 'Checking...' : 'OCR ready')}
                 </span>
-                <span className={`pcn-status-pill ${captureConfirmDialog.checks?.permit?.hasAuthorization ? 'pcn-status-pill--ok' : 'pcn-status-pill--warn'}`}>
-                  {captureConfirmDialog.checks?.loading
-                    ? 'Permit check'
-                    : (captureConfirmDialog.checks?.permit?.hasAuthorization ? 'Permit matched' : 'No permit')}
-                </span>
+                {(() => {
+                  const permit = captureConfirmDialog.checks?.permit || null;
+                  const status = resolvePermitStatus(permit);
+                  const pillTone = status === PERMIT_STATUS.PERMITTED
+                    ? 'pcn-status-pill--ok'
+                    : 'pcn-status-pill--warn';
+                  const label = captureConfirmDialog.checks?.loading
+                    ? 'Checking permit...'
+                    : (permit ? describePermitResult(permit).shortLabel : 'Permit not checked');
+                  return <span className={`pcn-status-pill ${pillTone}`}>{label}</span>;
+                })()}
               </div>
+              {captureConfirmDialog.checks?.permit && !captureConfirmDialog.checks?.loading ? (
+                <div style={{ marginTop: 10 }}>
+                  <PermitStatusBanner result={captureConfirmDialog.checks.permit} compact />
+                </div>
+              ) : null}
               {captureConfirmDialog.error ? (
                 <div className="notice notice-error" style={{ marginTop: 10 }}>
                   {captureConfirmDialog.error}
@@ -9104,27 +9481,24 @@ export default function DashboardPage() {
               {galleryLookupDialog.message ? <div className="notice notice-info">{galleryLookupDialog.message}</div> : null}
 
               {galleryLookupDialog.result ? (
-                <div className={`auth-result ${galleryLookupDialog.result.hasAuthorization ? 'auth-result--ok' : 'auth-result--none'}`}>
-                  <span className="auth-result-icon">{galleryLookupDialog.result.hasAuthorization ? 'Yes' : 'No'}</span>
-                  <div className="auth-result-content">
-                    <div className="auth-result-text">
-                      {galleryLookupDialog.result.hasAuthorization
-                        ? `Authorised - ${galleryLookupDialog.result.authorization?.type || 'permit found'}`
-                        : 'No active permit or payment found'}
-                    </div>
-                    <MatchConfidencePill matchConfidence={galleryLookupDialog.result.matchConfidence} />
-                    {galleryLookupDialog.result.authorization?.site ? (
-                      <div className="auth-result-sub">{galleryLookupDialog.result.authorization.site}</div>
-                    ) : null}
-                  </div>
-                </div>
+                <PermitStatusBanner result={galleryLookupDialog.result} />
               ) : (
-                <p className="card-copy">Permit lookup failed. Badge state remains updated for this VRM.</p>
+                <p className="card-copy">Permit check failed. Try again in a moment.</p>
               )}
             </div>
           </div>
         </div>
       ) : null}
+
+      <NearMatchConfirmSheet
+        open={Boolean(nearMatchPrompt)}
+        result={nearMatchPrompt?.result || null}
+        plateImage={nearMatchPrompt?.plateImage || ''}
+        busy={nearMatchBusy}
+        onUseMatched={handleNearMatchUseMatched}
+        onKeep={handleNearMatchKeep}
+        onClose={closeNearMatchPrompt}
+      />
 
       {false ? (
         <div
@@ -9292,7 +9666,9 @@ export default function DashboardPage() {
           permitStatus: pcnPreview.permitStatus || 'Not checked',
           permitWarning: selectedTrackedAuthorization?.hasAuthorization
             ? 'Active permit/payment found for this site. Continue only if another parking rule was breached, such as disabled bay misuse or another contravention.'
-            : '',
+            : (resolvePermitStatus(selectedTrackedAuthorization) === PERMIT_STATUS.PENDING
+              ? 'This registration has a permit request waiting for approval. You can continue - the ticket may be cancelled later if the permit is approved.'
+              : ''),
         }}
         onConfirm={confirmFinalize}
         onCancel={() => {

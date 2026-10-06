@@ -1,5 +1,65 @@
 import { describe, expect, test } from 'vitest';
-import { decideEvidenceSource, recoverUploadableEvidenceFilesFromCameraRaw } from '../lib/pcnEvidenceSync.js';
+import { collectPcnImageUrls, decideEvidenceSource, evidenceUploadGap, recoverUploadableEvidenceFilesFromCameraRaw } from '../lib/pcnEvidenceSync.js';
+
+describe('collectPcnImageUrls', () => {
+  test('keeps every remote photo from the request and the saved breach', () => {
+    const urls = collectPcnImageUrls(
+      {
+        images: ['https://example.com/entry-1.jpg'],
+        evidence: { exit: { imageUrl: 'https://example.com/exit-1.jpg' } },
+      },
+      {
+        imageUrls: ['https://example.com/entry-2.jpg', 'not-a-url'],
+        cameraRawData: [
+          { uploadedUrl: 'https://example.com/entry-3.jpg' },
+          { uploadedUrl: 'file:///local/only.jpg' },
+          { plateCutoffImage: 'https://example.com/plate.jpg' },
+        ],
+      },
+    );
+
+    expect(urls).toEqual([
+      'https://example.com/entry-1.jpg',
+      'https://example.com/exit-1.jpg',
+      'https://example.com/entry-2.jpg',
+      'https://example.com/entry-3.jpg',
+      'https://example.com/plate.jpg',
+    ]);
+  });
+});
+
+describe('evidenceUploadGap', () => {
+  test('flags a partial upload instead of treating it as complete', () => {
+    expect(evidenceUploadGap({
+      uploadedImages: ['https://example.com/a.jpg'],
+      failedCount: 1,
+      expectedCount: 2,
+    }).incomplete).toBe(true);
+  });
+
+  test('flags a stored-link fallback that covers fewer photos than were captured', () => {
+    expect(evidenceUploadGap({
+      uploadedImages: ['https://example.com/a.jpg'],
+      failedCount: 3,
+      expectedCount: 3,
+      fromStoredPayload: true,
+    }).incomplete).toBe(true);
+  });
+
+  test('accepts a full upload and a stored fallback that still covers every photo', () => {
+    expect(evidenceUploadGap({
+      uploadedImages: ['https://example.com/a.jpg', 'https://example.com/b.jpg'],
+      failedCount: 0,
+      expectedCount: 2,
+    }).incomplete).toBe(false);
+    expect(evidenceUploadGap({
+      uploadedImages: ['https://example.com/a.jpg', 'https://example.com/b.jpg'],
+      failedCount: 2,
+      expectedCount: 2,
+      fromStoredPayload: true,
+    }).incomplete).toBe(false);
+  });
+});
 
 describe('decideEvidenceSource', () => {
   test('prefers real local blobs over stale payload data when a fresh local pair exists', () => {

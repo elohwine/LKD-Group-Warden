@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { fetchCameraServiceJson, fetchJson } from '../lib/api';
+import { permitBadgeStatus, withAuthorizationMatchConfidence } from '../lib/vrmMatch.mjs';
 
 function nv(v) { return String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
 function fmt(v) { try { return formatLocalTimestamp(v); } catch (_) { return '–'; } }
+function permitRowClass(status, prefix) {
+  if (status === 'has_permit') return `${prefix}--permitted`;
+  if (status === 'pending_permit') return `${prefix}--pending`;
+  if (status === 'near_match') return `${prefix}--near`;
+  if (status === 'no_permit') return `${prefix}--actionable`;
+  return '';
+}
 
 function DirectionBadge({ direction }) {
   const d = String(direction || '').toLowerCase();
@@ -14,7 +22,9 @@ function DirectionBadge({ direction }) {
 function PermitBadge({ s }) {
   if (!s) return <span className="wf-badge wf-badge--grey">–</span>;
   if (s === 'checking') return <span className="wf-badge wf-badge--grey">…</span>;
-  if (s === 'has_permit') return <span className="wf-badge wf-badge--amber">Permit matched</span>;
+  if (s === 'has_permit') return <span className="wf-badge wf-badge--amber">Permit found</span>;
+  if (s === 'pending_permit') return <span className="wf-badge wf-badge--pending" title="This registration has a permit request waiting for approval. You can continue - the ticket may be cancelled later if the permit is approved.">Permit pending</span>;
+  if (s === 'near_match') return <span className="wf-badge wf-badge--near" title="A very similar registration has a permit here. Check the plate photo.">Possible permit</span>;
   if (s === 'no_permit') return <span className="wf-badge wf-badge--green">No permit</span>;
   if (s === 'error') return <span className="wf-badge wf-badge--grey">Error</span>;
   return null;
@@ -37,7 +47,9 @@ export default function WardenCaptureFeed({
   onStartDraft,
   onOpenCarcheckResult,
   onOpenPermitResult,
+  onRunPermitCheck,
   onOpenImage,
+  onRetryCaptureSync,
   showPcnActions = true,
 }) {
   const [rows, setRows] = useState([]);
@@ -115,6 +127,7 @@ export default function WardenCaptureFeed({
 
     const locals = (Array.isArray(localRows) ? localRows : []).map((row, idx) => ({
       id: row?.id || `local-${idx}`,
+      localCardId: row?.localCardId || row?.id || '',
       vrm: nv(row?.vrm || row?.plateText || ''),
       direction: row?.direction || null,
       timestamp: row?.timestamp || row?.readTimestamp || row?.capturedAt || null,
@@ -143,12 +156,19 @@ export default function WardenCaptureFeed({
     checkingRef.current.add(`p-${id}`);
     setChecks((c) => ({ ...c, [id]: { ...c[id], permitStatus: 'checking' } }));
     try {
-      const token = await getTokenRef.current();
-      const result = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, { token });
-      const has = Boolean(result?.hasAuthorization);
-      setChecks((c) => ({ ...c, [id]: { ...c[id], permitStatus: has ? 'has_permit' : 'no_permit', permitData: result } }));
+      let result = null;
+      if (typeof onRunPermitCheck === 'function') {
+        // Shared lookup from the dashboard: includes near-match (misread plate) detection.
+        result = await onRunPermitCheck(vrm, selectedSiteId);
+      } else {
+        const token = await getTokenRef.current();
+        const raw = await fetchJson(`/api/parking/check-authorization?vrm=${encodeURIComponent(vrm)}&siteId=${encodeURIComponent(selectedSiteId)}&breachTime=${encodeURIComponent(new Date().toISOString())}`, { token });
+        result = withAuthorizationMatchConfidence(raw, vrm);
+      }
+      const permitStatus = permitBadgeStatus(result) || 'error';
+      setChecks((c) => ({ ...c, [id]: { ...c[id], permitStatus, permitData: result } }));
       if (!mergedRows.find((row) => row.id === id)?.isLocalCapture) {
-        onOpenPermitResult?.({ vrm, siteId: selectedSiteId, result, hasAuthorization: has });
+        onOpenPermitResult?.({ vrm, siteId: selectedSiteId, result, hasAuthorization: Boolean(result?.hasAuthorization) });
       }
     } catch (_) {
       setChecks((c) => ({ ...c, [id]: { ...c[id], permitStatus: 'error' } }));
@@ -247,7 +267,7 @@ export default function WardenCaptureFeed({
             const draftCode = draftByVrm[row.vrm] || null;
             const hasPcn = draftCode === 'CONVERTED' || draftCode === 'SUBMITTED';
             return (
-              <article key={row.id} className={`wf-card ${cc.permitStatus === 'has_permit' ? 'wf-card--permitted' : cc.permitStatus === 'no_permit' ? 'wf-card--actionable' : ''}`}>
+              <article key={row.id} className={`wf-card ${permitRowClass(cc.permitStatus, 'wf-card')}`}>
                 <div className="wf-card-media">
                   <div className="wf-card-media-grid">
                     {resolveVehicleImage(row) ? (
@@ -286,6 +306,16 @@ export default function WardenCaptureFeed({
                     </div>
                   ) : null}
                   <div className="wf-action-row">
+                    {row.isLocalCapture && row.syncStatus === 'failed' ? (
+                      <button
+                        type="button"
+                        className="wf-btn wf-btn--retry"
+                        onClick={() => onRetryCaptureSync?.(row.localCardId || row.id)}
+                        title="Retry this capture sync"
+                      >
+                        Retry sync
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       className="wf-btn wf-btn--check"
@@ -305,7 +335,7 @@ export default function WardenCaptureFeed({
                       {cc.permitStatus === 'checking' ? 'Checking e-permit...' : 'e-Permit'}
                     </button>
                     {showPcnActions && !hasPcn && (
-                      <button type="button" className={`wf-btn ${cc.permitStatus === 'has_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
+                      <button type="button" className={`wf-btn ${cc.permitStatus === 'has_permit' || cc.permitStatus === 'near_match' || cc.permitStatus === 'pending_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
                         onClick={() => onStartDraft?.({
                           vrm: row.vrm,
                           vehicleImage: resolveVehicleImage(row),
@@ -351,7 +381,7 @@ export default function WardenCaptureFeed({
                 const draftCode = draftByVrm[row.vrm] || null;
                 const hasPcn = draftCode === 'CONVERTED' || draftCode === 'SUBMITTED';
                 return (
-                  <tr key={row.id} className={`wf-tr ${cc.permitStatus === 'has_permit' ? 'wf-tr--permitted' : cc.permitStatus === 'no_permit' ? 'wf-tr--actionable' : ''}`}>
+                  <tr key={row.id} className={`wf-tr ${permitRowClass(cc.permitStatus, 'wf-tr')}`}>
                     <td className="wf-td wf-td-img">
                       {resolveVehicleImage(row) ? (
                         <button type="button" className="wf-thumb-btn" onClick={() => openRowImage(row, 'vehicle')} title="Open vehicle image">
@@ -379,6 +409,16 @@ export default function WardenCaptureFeed({
                             {row.syncStatus === 'syncing' ? ` ${Math.max(0, Math.min(100, Math.round(Number(row.syncProgress || 0))))}%` : ''}
                           </span>
                         ) : null}
+                        {row.isLocalCapture && row.syncStatus === 'failed' ? (
+                          <button
+                            type="button"
+                            className="wf-btn wf-btn--retry"
+                            onClick={() => onRetryCaptureSync?.(row.localCardId || row.id)}
+                            title="Retry this capture sync"
+                          >
+                            Retry
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           className="wf-btn wf-btn--check"
@@ -398,7 +438,7 @@ export default function WardenCaptureFeed({
                           {cc.permitStatus === 'checking' ? 'Checking...' : 'Permit'}
                         </button>
                         {showPcnActions && !hasPcn && (
-                          <button type="button" className={`wf-btn ${cc.permitStatus === 'has_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
+                          <button type="button" className={`wf-btn ${cc.permitStatus === 'has_permit' || cc.permitStatus === 'near_match' || cc.permitStatus === 'pending_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
                             onClick={() => onStartDraft?.({
                               vrm: row.vrm,
                               vehicleImage: resolveVehicleImage(row),

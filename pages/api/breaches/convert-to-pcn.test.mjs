@@ -199,6 +199,68 @@ describe('POST /api/breaches/convert-to-pcn', () => {
     expect(pcnWritePayload.selectedContraventionCode).toBe('01');
     expect(pcnWritePayload.contraventionCode).toBe('01');
     expect(pcnWritePayload.contraventionReason).toBe('Parked in restricted bay');
+    expect(pcnWritePayload.images).toEqual(['https://example.com/a.jpg', 'https://example.com/b.jpg']);
+    expect(pcnWritePayload.imageUrls).toEqual(['https://example.com/a.jpg', 'https://example.com/b.jpg']);
+  });
+
+  it('keeps photos already stored on the breach when the request list is shorter', async () => {
+    mockBreachRef.get.mockResolvedValueOnce({
+      exists: true,
+      data: () => ({
+        vrm: 'AB12CDE',
+        siteId: 'site-1',
+        images: ['https://example.com/a.jpg', 'https://example.com/b.jpg', 'https://example.com/c.jpg'],
+        evidence: {
+          entry: { imageUrl: 'https://example.com/a.jpg' },
+          exit: { imageUrl: 'https://example.com/b.jpg' },
+        },
+      }),
+    });
+
+    const req = mockRequest({
+      body: {
+        images: ['https://example.com/a.jpg'],
+        imageUrls: [],
+      },
+    });
+    const res = mockResponse();
+
+    await handler(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    const pcnWritePayload = mockPcnsCollection.add.mock.calls[0][0];
+    expect(pcnWritePayload.images).toEqual([
+      'https://example.com/a.jpg',
+      'https://example.com/b.jpg',
+      'https://example.com/c.jpg',
+    ]);
+  });
+
+  it('rejects a parking charge that does not include opening and closing photos', async () => {
+    mockBreachRef.get.mockResolvedValueOnce({
+      exists: true,
+      data: () => ({
+        vrm: 'AB12CDE',
+        siteId: 'site-1',
+      }),
+    });
+
+    const req = mockRequest({
+      body: {
+        images: [],
+        imageUrls: [],
+        evidence: {},
+      },
+    });
+    const res = mockResponse();
+
+    await handler(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'Opening and closing photos are required before this parking charge can be submitted.',
+    });
+    expect(mockPcnsCollection.add).not.toHaveBeenCalled();
   });
 
   it('uses conversion timestamp as fallback when breach has no explicit timing', async () => {

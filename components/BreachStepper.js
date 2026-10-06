@@ -5,6 +5,8 @@ import { formatLocalTimestamp } from '../lib/ukTimestamp';
 import { isMlKitReady, scanPlateWithMlKit } from '../lib/mlkitLpr';
 import { canUseNativeCameraPreview, captureNativeCameraSample, setNativeCameraTorchEnabled, startNativeCameraPreview, stopNativeCameraPreview } from '../lib/nativeCameraPreview';
 import { getServerTimestamp } from '../lib/timeSync';
+import { buildPermitReviewDecision, hasPendingPermit, needsNearMatchDecision } from '../lib/vrmMatch.mjs';
+import { NearMatchConfirmSheet, PermitStatusBanner } from './PermitStatus';
 
 function fileToDataUrl(file) {
     return new Promise((resolve, reject) => {
@@ -431,6 +433,7 @@ export default function BreachStepper({
     autoCompleteOnCapture = false,
     hideCapturedPreview = false,
     quickFlow = false,
+    onPermitCheck = null,
 }) {
     const captureOnly = mode === 'capture-only';
     const evidencePhase = capturePhase === 'closing' ? 'closing' : 'entry';
@@ -455,6 +458,11 @@ export default function BreachStepper({
     const [torchEnabled, setTorchEnabled] = useState(false);
     const [autoNightTorchEnabled, setAutoNightTorchEnabled] = useState(true);
     const [note, setNote] = useState('');
+    // Permit check for the VRM being drafted: { loading, vrm, result, error }
+    const [permitCheck, setPermitCheck] = useState({ loading: false, vrm: '', result: null, error: '' });
+    const [permitDecision, setPermitDecision] = useState(null);
+    const [nearMatchOpen, setNearMatchOpen] = useState(false);
+    const permitRequestRef = useRef(0);
     const cameraInputRef = useRef(null);
     const galleryInputRef = useRef(null);
     const liveVideoRef = useRef(null);
@@ -541,6 +549,10 @@ export default function BreachStepper({
         setTorchEnabled(false);
         setAutoNightTorchEnabled(true);
         setNote('');
+        permitRequestRef.current += 1;
+        setPermitCheck({ loading: false, vrm: '', result: null, error: '' });
+        setPermitDecision(null);
+        setNearMatchOpen(false);
         setLiveCameraActive(false);
         if (cameraInputRef.current) cameraInputRef.current.value = '';
         if (galleryInputRef.current) galleryInputRef.current.value = '';
@@ -1237,17 +1249,45 @@ export default function BreachStepper({
         }
     }
 
-    function handleConfirm() {
-        if (!vrm || (!skipCapture && (files.length === 0 || !hasRequiredCaptureArtifacts(files)))) {
-            setScanState({
-                loading: false,
-                text: requiresOcrArtifacts
-                    ? 'Capture needs full vehicle, plate cutout, and VRM text.'
-                    : 'Capture at least 1 entry image, then enter VRM manually.',
-                confidence: 0,
-            });
-            return;
+    const permitCheckAvailable = Boolean(!captureOnly && typeof onPermitCheck === 'function' && defaultSiteId);
+    const permitResultForVrm = permitCheck.result && permitCheck.vrm === normalizeVrm(vrm) ? permitCheck.result : null;
+    const permitDecisionForVrm = permitDecision && permitDecision.targetVrm === normalizeVrm(vrm) ? permitDecision : null;
+    const permitNeedsReview = Boolean(permitResultForVrm && needsNearMatchDecision(permitResultForVrm, permitDecisionForVrm));
+
+    /**
+     * Run the shared permit lookup (includes misread-plate detection) for the
+     * VRM being drafted. Safe to call repeatedly; stale responses are ignored.
+     */
+    async function runStepperPermitCheck(targetVrm, { force = false } = {}) {
+        const normalized = normalizeVrm(targetVrm);
+        if (!permitCheckAvailable || !normalized || normalized.length < 5) return null;
+        if (!force && permitCheck.vrm === normalized && (permitCheck.loading || permitCheck.result)) {
+            return permitCheck.result;
         }
+        const requestId = permitRequestRef.current + 1;
+        permitRequestRef.current = requestId;
+        setPermitCheck({ loading: true, vrm: normalized, result: null, error: '' });
+        try {
+            const result = await onPermitCheck(normalized, defaultSiteId);
+            if (permitRequestRef.current !== requestId) return null;
+            setPermitCheck({ loading: false, vrm: normalized, result: result || null, error: result ? '' : 'Permit check returned no result.' });
+            return result || null;
+        } catch (error) {
+            if (permitRequestRef.current !== requestId) return null;
+            setPermitCheck({ loading: false, vrm: normalized, result: null, error: String(error?.message || 'Permit check failed. You can retry on the next step.') });
+            return null;
+        }
+    }
+
+    function buildAuthorizationForDraft(resultOverride = null, decisionOverride = null) {
+        const result = resultOverride || permitResultForVrm;
+        if (!result) return null;
+        const decision = decisionOverride || permitDecisionForVrm;
+        return decision ? { ...result, permitReviewDecision: decision } : result;
+    }
+
+    function completeDraft({ authorizationOverride = null } = {}) {
+        const authorization = authorizationOverride || buildAuthorizationForDraft();
         onComplete?.({
             vrm: normalizeVrm(vrm),
             siteId: defaultSiteId,
@@ -1265,8 +1305,49 @@ export default function BreachStepper({
             captureMode,
             skippedCapture: skipCapture,
             note,
+            authorization,
+            permitReviewDecision: authorization?.permitReviewDecision || null,
         });
         reset();
+    }
+
+    function handleConfirm() {
+        if (!vrm || (!skipCapture && (files.length === 0 || !hasRequiredCaptureArtifacts(files)))) {
+            setScanState({
+                loading: false,
+                text: requiresOcrArtifacts
+                    ? 'Capture needs full vehicle, plate cutout, and VRM text.'
+                    : 'Capture at least 1 entry image, then enter VRM manually.',
+                confidence: 0,
+            });
+            return;
+        }
+        if (permitNeedsReview) {
+            setNearMatchOpen(true);
+            return;
+        }
+        completeDraft();
+    }
+
+    async function handleNearMatchUseMatched(matchedVrm) {
+        const nextVrm = normalizeVrm(matchedVrm);
+        if (!nextVrm) return;
+        setNearMatchOpen(false);
+        setPermitDecision(null);
+        setVrm(nextVrm);
+        setCapturedVrm(nextVrm);
+        await runStepperPermitCheck(nextVrm, { force: true });
+    }
+
+    function handleNearMatchKeep() {
+        if (!permitResultForVrm) {
+            setNearMatchOpen(false);
+            return;
+        }
+        const decision = buildPermitReviewDecision({ result: permitResultForVrm, decision: 'keep', targetVrm: normalizeVrm(vrm) });
+        setPermitDecision(decision);
+        setNearMatchOpen(false);
+        completeDraft({ authorizationOverride: buildAuthorizationForDraft(permitResultForVrm, decision) });
     }
 
     function handleCaptureOnlyComplete() {
@@ -1710,10 +1791,20 @@ export default function BreachStepper({
                                 className="stepper-vrm-input"
                                 value={vrm}
                                 onChange={(e) => setVrm(normalizeVrm(e.target.value))}
+                                onBlur={() => { runStepperPermitCheck(vrm).catch(() => null); }}
                                 placeholder="AB12CDE"
                                 autoFocus
                             />
                         </label>
+                        {permitCheckAvailable && (permitCheck.loading || permitResultForVrm) ? (
+                            <div style={{ marginBottom: 10 }}>
+                                {permitCheck.loading && permitCheck.vrm === normalizeVrm(vrm) ? (
+                                    <span className="pcn-status-pill pcn-status-pill--warn">Checking permit...</span>
+                                ) : (
+                                    <PermitStatusBanner result={permitResultForVrm} decision={permitDecisionForVrm} compact />
+                                )}
+                            </div>
+                        ) : null}
 
                         <label className="stepper-field">
                             <span className="stepper-field-label">Contravention</span>
@@ -1744,7 +1835,10 @@ export default function BreachStepper({
                                 <button
                                     type="button"
                                     className="primary-button"
-                                    onClick={() => setStep(2)}
+                                    onClick={() => {
+                                        setStep(2);
+                                        runStepperPermitCheck(vrm).catch(() => null);
+                                    }}
                                     disabled={!canAdvanceFromVrm}
                                 >
                                     {canAdvanceFromVrm
@@ -1782,6 +1876,18 @@ export default function BreachStepper({
                                 <span className="stepper-summary-label">Entry evidence</span>
                                 <span className="stepper-summary-val">{files.length} image{files.length !== 1 ? 's' : ''}</span>
                             </div>
+                            {permitCheckAvailable ? (
+                                <div className="stepper-summary-row">
+                                    <span className="stepper-summary-label">Permit</span>
+                                    <span className="stepper-summary-val">
+                                        {permitCheck.loading && permitCheck.vrm === normalizeVrm(vrm)
+                                            ? 'Checking...'
+                                            : (permitResultForVrm
+                                                ? (permitNeedsReview ? 'Needs review' : (permitResultForVrm.hasAuthorization ? 'Permit found' : (hasPendingPermit(permitResultForVrm) ? 'Permit pending' : (permitDecisionForVrm ? 'Reviewed' : 'No permit'))))
+                                                : (permitCheck.error ? 'Check failed' : 'Not checked'))}
+                                    </span>
+                                </div>
+                            ) : null}
                             {previews.length > 0 ? (
                                 <div className="stepper-preview-grid stepper-preview-grid--compact">
                                     {previews.slice(0, 3).map((p, i) => (
@@ -1801,6 +1907,36 @@ export default function BreachStepper({
                             ) : null}
                         </div>
 
+                        {permitCheckAvailable ? (
+                            <div className="stepper-permit-panel" style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+                                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                                    <button
+                                        type="button"
+                                        className="ghost-button"
+                                        disabled={permitCheck.loading}
+                                        onClick={() => { runStepperPermitCheck(vrm, { force: true }).catch(() => null); }}
+                                    >
+                                        {permitCheck.loading ? 'Checking permit...' : (permitResultForVrm ? 'Check permit again' : 'Check permit')}
+                                    </button>
+                                    {permitNeedsReview ? (
+                                        <button
+                                            type="button"
+                                            className="ghost-button"
+                                            onClick={() => setNearMatchOpen(true)}
+                                        >
+                                            Review registration
+                                        </button>
+                                    ) : null}
+                                </div>
+                                {permitResultForVrm && !permitCheck.loading ? (
+                                    <PermitStatusBanner result={permitResultForVrm} decision={permitDecisionForVrm} />
+                                ) : null}
+                                {!permitResultForVrm && !permitCheck.loading && permitCheck.error ? (
+                                    <div className="notice notice-error">{permitCheck.error}</div>
+                                ) : null}
+                            </div>
+                        ) : null}
+
                         {note ? (
                             <div className="text-muted" style={{ marginTop: 6 }}>
                                 <strong>Notes:</strong> {note}
@@ -1812,12 +1948,24 @@ export default function BreachStepper({
                             <button
                                 type="button"
                                 className="primary-button stepper-confirm-btn"
-                                disabled={!canConfirm}
+                                disabled={!canConfirm || permitCheck.loading}
                                 onClick={handleConfirm}
                             >
-                                {'Create Parking Charge'}
+                                {permitCheck.loading
+                                    ? 'Checking permit...'
+                                    : (permitNeedsReview ? 'Review registration to continue' : 'Create Parking Charge')}
                             </button>
                         </div>
+
+                        <NearMatchConfirmSheet
+                            open={nearMatchOpen && Boolean(permitResultForVrm)}
+                            result={permitResultForVrm}
+                            plateImage={String(files?.[0]?.detectedPlateCutoffImage || previews?.[0] || '').trim()}
+                            busy={permitCheck.loading}
+                            onUseMatched={handleNearMatchUseMatched}
+                            onKeep={handleNearMatchKeep}
+                            onClose={() => setNearMatchOpen(false)}
+                        />
                     </div>
                 ) : null}
             </div>

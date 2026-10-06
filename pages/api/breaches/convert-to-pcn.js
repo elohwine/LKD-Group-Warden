@@ -4,6 +4,7 @@ import normalizeVrm from '../../../lib/normalizeVrm.mjs';
 import { getUkDateTimeParts } from '../../../lib/ukTimestamp';
 import { getBillableMinutesFromMilliseconds } from '../../../lib/duration';
 import { buildVehicleDetailsRecord } from '../../../lib/vehicleDetails';
+import { collectPcnImageUrls } from '../../../lib/pcnEvidenceSync';
 
 function buildPcnNumber(vrm) {
   const safeVrm = normalizeVrm(vrm || '').slice(0, 6) || 'WARDEN';
@@ -162,6 +163,7 @@ export default async function handler(req, res) {
       evidence,
       images,
       imageUrls,
+      cameraRawData,
       vehicleDetails,
       selectedContraventionCode,
       contraventionCode,
@@ -216,9 +218,27 @@ export default async function handler(req, res) {
     const observedStartUk = getUkDateTimeParts(safeObservedStart);
     const observedEndUk = getUkDateTimeParts(safeObservedEnd);
     const finalPcnNumber = buildPcnNumber(vrmValue);
-    const mergedImages = [...(Array.isArray(images) ? images : []), ...(Array.isArray(imageUrls) ? imageUrls : [])]
-      .filter((value) => typeof value === 'string' && value.length > 0)
-      .filter((value, index, all) => all.indexOf(value) === index);
+    const mergedImages = collectPcnImageUrls(
+      {
+        images,
+        imageUrls,
+        evidence,
+        cameraRawData,
+        detectedEntryVehicleImage: body?.detectedEntryVehicleImage,
+        detectedClosingVehicleImage: body?.detectedClosingVehicleImage,
+        detectedEntryPlateCutoffImage: body?.detectedEntryPlateCutoffImage,
+        detectedClosingPlateCutoffImage: body?.detectedClosingPlateCutoffImage,
+        startVehicleImage: body?.startVehicleImage,
+        sessionEvidence: body?.sessionEvidence,
+        closingEvidence: body?.closingEvidence,
+      },
+      breachData,
+    );
+    if (mergedImages.length < 2) {
+      return res.status(400).json({
+        error: 'Opening and closing photos are required before this parking charge can be submitted.',
+      });
+    }
     const resolvedVehicleDetails = buildVehicleDetailsRecord(
       vehicleDetails || breachData?.vehicleDetails || breachData?.savedVehicleLookup || null,
       vrmValue
@@ -304,6 +324,8 @@ export default async function handler(req, res) {
       reason: contraventionSnapshot.reason,
       pcnId: pcnRef.id,
       pcnNumber: finalPcnNumber,
+      images: mergedImages,
+      imageUrls: mergedImages,
       updatedAt: Timestamp.fromDate(now),
       updatedBy: actorId,
       updatedByEmail: actorEmail,
@@ -315,6 +337,7 @@ export default async function handler(req, res) {
       pcnId: pcnRef.id,
       pcnNumber: finalPcnNumber,
       amount: amountValue,
+      imageCount: mergedImages.length,
       sameDayWarnings: null,
     });
   } catch (error) {
