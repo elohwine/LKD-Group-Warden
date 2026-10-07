@@ -1270,6 +1270,9 @@ export default function BreachStepper({
         try {
             const result = await onPermitCheck(normalized, defaultSiteId);
             if (permitRequestRef.current !== requestId) return null;
+            // #region agent log
+            fetch('http://127.0.0.1:7816/ingest/d49109f6-c502-46e9-b8e2-2c14a52f8d97',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f2c557'},body:JSON.stringify({sessionId:'f2c557',runId:'pre-fix',hypothesisId:'B',location:'BreachStepper.js:runStepperPermitCheck',message:'stepper permit check result',data:{vrm:normalized,hasAuthorization:Boolean(result?.hasAuthorization),nearMatch:Boolean(result?.nearMatch),bestVrm:result?.matchConfidence?.bestVrm||'',scorePercent:result?.matchConfidence?.scorePercent||0,needsReview:needsNearMatchDecision(result)},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
             setPermitCheck({ loading: false, vrm: normalized, result: result || null, error: result ? '' : 'Permit check returned no result.' });
             return result || null;
         } catch (error) {
@@ -1323,6 +1326,9 @@ export default function BreachStepper({
             return;
         }
         if (permitNeedsReview) {
+            // #region agent log
+            fetch('http://127.0.0.1:7816/ingest/d49109f6-c502-46e9-b8e2-2c14a52f8d97',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f2c557'},body:JSON.stringify({sessionId:'f2c557',runId:'pre-fix',hypothesisId:'E',location:'BreachStepper.js:handleConfirm',message:'create blocked until registration is reviewed',data:{vrm:normalizeVrm(vrm),bestVrm:permitResultForVrm?.matchConfidence?.bestVrm||'',scorePercent:permitResultForVrm?.matchConfidence?.scorePercent||0},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
             setNearMatchOpen(true);
             return;
         }

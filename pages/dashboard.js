@@ -3507,6 +3507,9 @@ export default function DashboardPage() {
     const data = await fetchJson('/api/sites?forceAdmin=true', { token });
     const nextSites = Array.isArray(data?.sites) ? data.sites : [];
     const activeSites = nextSites.filter((site) => site.active !== false && site.isActive !== false);
+    // #region agent log
+    fetch('http://127.0.0.1:7816/ingest/d49109f6-c502-46e9-b8e2-2c14a52f8d97',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f2c557'},body:JSON.stringify({sessionId:'f2c557',runId:'pre-fix',hypothesisId:'F',location:'dashboard.js:loadSites',message:'patrol site payload shape',data:{isArray:Array.isArray(data),keys:data&&typeof data==='object'?Object.keys(data).slice(0,12):[],sitesLength:nextSites.length,activeLength:activeSites.length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     setSites(activeSites);
   }
 
