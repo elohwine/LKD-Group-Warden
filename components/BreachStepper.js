@@ -210,7 +210,7 @@ async function stampEvidenceImage(file, { capturedAt, phase, vrmText = '' } = {}
         const localCaptured = formatEvidenceLocalTimestamp(capturedAt);
         const headerLine = normalizedVrm
             ? `VRM ${normalizedVrm} | Captured ${localCaptured}`
-            : `VRM pending OCR | Captured ${localCaptured}`;
+            : `Registration pending | Captured ${localCaptured}`;
 
         const headerPadX = Math.max(8, Math.floor(imageWidth * 0.01));
         const headerPadY = Math.max(8, Math.floor(imageHeight * 0.01));
@@ -463,6 +463,7 @@ export default function BreachStepper({
     const [permitDecision, setPermitDecision] = useState(null);
     const [nearMatchOpen, setNearMatchOpen] = useState(false);
     const permitRequestRef = useRef(0);
+    const captureInFlightRef = useRef(false);
     const cameraInputRef = useRef(null);
     const galleryInputRef = useRef(null);
     const liveVideoRef = useRef(null);
@@ -735,9 +736,18 @@ export default function BreachStepper({
 
     async function appendCapturedFiles(captured, initialScanResult = null, options = {}) {
         if (!captured.length) return;
+        if (captureInFlightRef.current) return false;
+        captureInFlightRef.current = true;
+        const captureStartedAt = Date.now();
         const allowWebFallback = Boolean(options.allowWebFallback);
         const skipOcr = Boolean(options.skipOcr);
         const shouldBuildCapturePreviews = !(captureOnly && autoCompleteOnCapture && isQuickOcrFlow);
+
+        setScanState({
+            loading: true,
+            text: skipOcr ? 'Saving photo...' : 'Reading the plate...',
+            confidence: 0,
+        });
 
         if (!skipOcr && !initialScanResult) {
             setScanState((prev) => ({
@@ -774,7 +784,9 @@ export default function BreachStepper({
         const nextPreviews = [...newPreviews];
 
         let result = initialScanResult;
+        let ocrRan = false;
         if (!skipOcr && !result && captured[0]) {
+            ocrRan = true;
             try {
                 setScanState((prev) => ({
                     ...prev,
@@ -867,7 +879,13 @@ export default function BreachStepper({
         }
 
         const hasPairArtifacts = hasRequiredCaptureArtifacts(mergedFiles);
-        if (!hasPairArtifacts) {
+        const hasVehicleImage = mergedFiles.some((file) => !isPlateCutoffFileArtifact(file));
+        const canFinishQuickCapture = Boolean(captureOnly && autoCompleteOnCapture && hasVehicleImage);
+        // #region agent log
+        fetch('http://127.0.0.1:7816/ingest/d49109f6-c502-46e9-b8e2-2c14a52f8d97',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f2c557'},body:JSON.stringify({sessionId:'f2c557',runId:'camera-flow-fix',hypothesisId:'H2',location:'BreachStepper.js:appendCapturedFiles',message:'camera image processed',data:{skipOcr,ocrRan,elapsedMs:Date.now()-captureStartedAt,hasPair:hasPairArtifacts,canFinishQuickCapture,autoComplete:Boolean(captureOnly&&autoCompleteOnCapture),captureMode,fileCount:mergedFiles.length},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        if (!hasPairArtifacts && !canFinishQuickCapture) {
+            captureInFlightRef.current = false;
             setScanState({
                 loading: false,
                 text: evidencePhase === 'closing'
@@ -882,7 +900,8 @@ export default function BreachStepper({
             return false;
         }
 
-        if (captureOnly && autoCompleteOnCapture) {
+        if (canFinishQuickCapture) {
+            captureInFlightRef.current = false;
             onCaptureComplete?.({
                 phase: evidencePhase,
                 files: mergedFiles,
@@ -903,12 +922,17 @@ export default function BreachStepper({
             setTimeout(() => setStep(1), 150);
         }
 
+        captureInFlightRef.current = false;
         return true;
     }
 
     async function handleFileCapture(event) {
         const captured = Array.from(event.target.files || []);
+        const inputKind = event.target?.getAttribute?.('capture') ? 'camera' : 'gallery';
         event.target.value = '';
+        // #region agent log
+        fetch('http://127.0.0.1:7816/ingest/d49109f6-c502-46e9-b8e2-2c14a52f8d97',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f2c557'},body:JSON.stringify({sessionId:'f2c557',runId:'camera-flow-fix',hypothesisId:'H1',location:'BreachStepper.js:handleFileCapture',message:'camera file selected',data:{fileCount:captured.length,captureMode,skipOcr:!requiresOcrArtifacts,inputKind,autoCompleteOnCapture:Boolean(autoCompleteOnCapture),inFlight:captureInFlightRef.current},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         if (!captured.length) return;
         await appendCapturedFiles(captured, null, {
             allowWebFallback: !Capacitor.isNativePlatform(),

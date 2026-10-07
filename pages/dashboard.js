@@ -3808,15 +3808,20 @@ export default function DashboardPage() {
     const vrm = normalizeVrm(nextVrm || '');
     const siteId = String(nextSiteId || '').trim();
     if (!vrm || !siteId) {
-      setCaptureConfirmDialog((current) => (current ? {
-        ...current,
-        loading: false,
-        error: siteId ? 'No VRM detected.' : 'Select a patrol site before submitting.',
-        checks: {
-          permit: null,
+      setCaptureConfirmDialog((current) => {
+        if (!current) return current;
+        const waitingForTypedVrm = !vrm && current.captureMode === 'manual' && Boolean(siteId);
+        return {
+          ...current,
           loading: false,
-        },
-      } : current));
+          error: waitingForTypedVrm ? '' : (siteId ? 'No VRM detected.' : 'Select a patrol site before submitting.'),
+          checks: {
+            ...(current.checks || {}),
+            permit: null,
+            loading: false,
+          },
+        };
+      });
       return null;
     }
 
@@ -3848,6 +3853,9 @@ export default function DashboardPage() {
           permit: result.ok ? stripPermitDecision(result.permitResult) || null : null,
         },
       } : current));
+      // #region agent log
+      fetch('http://127.0.0.1:7816/ingest/d49109f6-c502-46e9-b8e2-2c14a52f8d97',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f2c557'},body:JSON.stringify({sessionId:'f2c557',runId:'camera-flow',hypothesisId:'H5',location:'dashboard.js:refreshQuickCaptureConfirmChecks',message:'camera confirm permit check',data:{ok:Boolean(result.ok),nearMatch:Boolean(result.permitResult?.nearMatch),bestVrm:result.permitResult?.matchConfidence?.bestVrm||'',scorePercent:result.permitResult?.matchConfidence?.scorePercent||0,error:result.ok?'':String(result.error||'').slice(0,140)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       return result;
     } catch (error) {
       const reason = String(error?.message || 'Check failed');
@@ -3913,7 +3921,7 @@ export default function DashboardPage() {
       setCaptureConfirmDialog((current) => (current ? {
         ...current,
         loading: false,
-        error: 'No VRM detected. Try again.',
+        error: 'Plate was not read. Type the registration below.',
         checks: {
           loading: false,
           carcheck: null,
@@ -7672,7 +7680,7 @@ export default function DashboardPage() {
           ) : currentScreen === 'archive' ? (
             <span>Archive</span>
           ) : currentScreen === 'mobile' ? (
-            <span>Mobile Cameras</span>
+            <span>Vehicle cameras</span>
           ) : currentScreen === 'camera' ? (
             <span>Camera</span>
           ) : (
@@ -7755,24 +7763,6 @@ export default function DashboardPage() {
               {sites.map(site => (
                 <option key={site.id} value={site.id}>
                   {site.displayName || site.name || site.id}
-                </option>
-              ))}
-            </select>
-          ) : null}
-
-          {mobileCameras.length > 0 ? (
-            <select
-              className="site-filter-select site-filter-select--home"
-              value={selectedMobileCameraId}
-              onChange={async (event) => {
-                await handleLinkSelectedMobileCamera(event.target.value);
-              }}
-              style={{ marginTop: 8 }}
-            >
-              <option value="">No vehicle camera linked (warden-only)</option>
-              {mobileCamerasByAvailability.map((camera) => (
-                <option key={camera.id} value={camera.id}>
-                  {(camera.available ? 'Available' : 'Offline')} - {camera.name || camera.id}
                 </option>
               ))}
             </select>
@@ -8536,7 +8526,7 @@ export default function DashboardPage() {
       {currentScreen === 'mobile' ? (
         <main className="screen-body">
           <div className="detail-section">
-            <div className="detail-section-label">Mobile cameras</div>
+            <div className="detail-section-label">Vehicle cameras</div>
 
             <div className="settings-row settings-row--stacked" style={{ marginBottom: 14 }}>
               <span className="settings-row-label">Linked vehicle camera for this shift</span>
@@ -8558,9 +8548,9 @@ export default function DashboardPage() {
 
             {mobileCamerasByAvailability.length === 0 ? (
               <div className="empty-state" style={{ padding: '20px 12px' }}>
-                <div className="empty-icon">Mobile</div>
-                <p className="empty-title">No mobile cameras found</p>
-                <p className="empty-hint">Flag a camera as mobile in camera management first.</p>
+                <div className="empty-icon">Cameras</div>
+                <p className="empty-title">No vehicle cameras yet</p>
+                <p className="empty-hint">Vehicle cameras show up here. Warden phones stay off this list.</p>
               </div>
             ) : (
               <div className="sessions-list">
