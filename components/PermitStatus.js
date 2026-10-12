@@ -1,4 +1,11 @@
-import { PERMIT_STATUS, needsNearMatchDecision, resolvePermitStatus } from '../lib/vrmMatch.mjs';
+import { PERMIT_STATUS, hasPermitCreatedAfterEntry, needsNearMatchDecision, permitMinutesAfterEntry, resolvePermitStatus } from '../lib/vrmMatch.mjs';
+
+/** "6 minutes" / "under a minute" / "a short time" */
+function describeDelay(minutes) {
+  if (minutes === null || minutes === undefined) return 'a short time';
+  if (minutes < 1) return 'under a minute';
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
 
 export function MatchConfidencePill({ matchConfidence }) {
   const score = Number(matchConfidence?.scorePercent || 0);
@@ -25,6 +32,24 @@ export function describePermitResult(result) {
   const status = resolvePermitStatus(result);
   const bestVrm = String(result?.matchConfidence?.bestVrm || '').trim();
   const score = Number(result?.matchConfidence?.scorePercent || 0);
+  // Permit (or request) registered AFTER the entry photo: it may read as valid
+  // now, but the driver most likely took it on arrival. Flag it for review.
+  if ((status === PERMIT_STATUS.PERMITTED || status === PERMIT_STATUS.PENDING) && hasPermitCreatedAfterEntry(result)) {
+    const delay = describeDelay(permitMinutesAfterEntry(result));
+    const isPending = status === PERMIT_STATUS.PENDING;
+    const source = String(result?.permitCreatedAfterEntry?.source || '').toLowerCase();
+    const where = source.includes('kiosk') ? ' at the kiosk' : '';
+    return {
+      status,
+      tone: 'pending',
+      icon: '!',
+      title: isPending
+        ? `Permit requested ${delay} after your entry photo`
+        : `Permit found - registered ${delay} after your entry photo`,
+      detail: `${isPending ? 'A permit request' : 'A permit'} for this registration was registered${where} ${delay} after you first photographed the vehicle, so it was most likely taken on arrival and may not cover the start of the stay. Review the permit and photo times before issuing.`,
+      shortLabel: 'Permit just taken',
+    };
+  }
   if (status === PERMIT_STATUS.PERMITTED) {
     const type = String(result?.authorization?.type || '').trim();
     return {

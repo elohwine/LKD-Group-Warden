@@ -7,7 +7,7 @@ function nv(v) { return String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 function fmt(v) { try { return formatLocalTimestamp(v); } catch (_) { return '–'; } }
 function permitRowClass(status, prefix) {
   if (status === 'has_permit') return `${prefix}--permitted`;
-  if (status === 'pending_permit') return `${prefix}--pending`;
+  if (status === 'pending_permit' || status === 'permit_just_taken') return `${prefix}--pending`;
   if (status === 'near_match') return `${prefix}--near`;
   if (status === 'no_permit') return `${prefix}--actionable`;
   return '';
@@ -24,6 +24,7 @@ function PermitBadge({ s }) {
   if (s === 'checking') return <span className="wf-badge wf-badge--grey">…</span>;
   if (s === 'has_permit') return <span className="wf-badge wf-badge--amber">Permit found</span>;
   if (s === 'pending_permit') return <span className="wf-badge wf-badge--pending" title="This registration has a permit request waiting for approval. You can continue - the ticket may be cancelled later if the permit is approved.">Permit pending</span>;
+  if (s === 'permit_just_taken') return <span className="wf-badge wf-badge--pending" title="A permit was registered after this vehicle's entry photo - most likely taken on arrival. Review the permit and photo times before issuing.">Permit just taken</span>;
   if (s === 'near_match') return <span className="wf-badge wf-badge--near" title="A very similar registration has a permit here. Check the plate photo.">Possible permit</span>;
   if (s === 'no_permit') return <span className="wf-badge wf-badge--green">No permit</span>;
   if (s === 'error') return <span className="wf-badge wf-badge--grey">Error</span>;
@@ -335,7 +336,7 @@ export default function WardenCaptureFeed({
                       {cc.permitStatus === 'checking' ? 'Checking e-permit...' : 'e-Permit'}
                     </button>
                     {showPcnActions && !hasPcn && (
-                      <button type="button" className={`wf-btn ${cc.permitStatus === 'has_permit' || cc.permitStatus === 'near_match' || cc.permitStatus === 'pending_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
+                      <button type="button" className={`wf-btn ${['has_permit', 'near_match', 'pending_permit', 'permit_just_taken'].includes(cc.permitStatus) ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
                         onClick={() => onStartDraft?.({
                           vrm: row.vrm,
                           vehicleImage: resolveVehicleImage(row),
@@ -438,7 +439,7 @@ export default function WardenCaptureFeed({
                           {cc.permitStatus === 'checking' ? 'Checking...' : 'Permit'}
                         </button>
                         {showPcnActions && !hasPcn && (
-                          <button type="button" className={`wf-btn ${cc.permitStatus === 'has_permit' || cc.permitStatus === 'near_match' || cc.permitStatus === 'pending_permit' ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
+                          <button type="button" className={`wf-btn ${['has_permit', 'near_match', 'pending_permit', 'permit_just_taken'].includes(cc.permitStatus) ? 'wf-btn--draft-muted' : 'wf-btn--draft-active'}`}
                             onClick={() => onStartDraft?.({
                               vrm: row.vrm,
                               vehicleImage: resolveVehicleImage(row),

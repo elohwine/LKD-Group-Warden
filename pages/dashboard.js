@@ -21,10 +21,12 @@ import { isLikelyCurrentUkVrm, normalizeUkVrmFromOcr, scoreUkVrmCandidate } from
 import {
   PERMIT_STATUS,
   buildPermitReviewDecision,
+  hasPermitCreatedAfterEntry,
   lookupAuthorizationWithNearMatch,
   needsNearMatchDecision,
   normalizeVrm,
   permitBadgeStatus as permitStatusToBadge,
+  permitMinutesAfterEntry,
   resolvePermitStatus,
   withAuthorizationMatchConfidence,
 } from '../lib/vrmMatch.mjs';
@@ -2856,6 +2858,10 @@ export default function DashboardPage() {
     } else if (nearMatchUnresolved) {
       const bestVrm = String(selectedTrackedAuthorization?.matchConfidence?.bestVrm || '').trim();
       message = `Possible permit match found${bestVrm ? ` (${bestVrm})` : ''}. Review the registration before submitting.`;
+    } else if ((permitStatus === PERMIT_STATUS.PERMITTED || permitStatus === PERMIT_STATUS.PENDING) && hasPermitCreatedAfterEntry(selectedTrackedAuthorization)) {
+      const minutes = permitMinutesAfterEntry(selectedTrackedAuthorization);
+      const delay = minutes === null ? 'a short time' : (minutes < 1 ? 'under a minute' : `${minutes} min`);
+      message = `A permit was registered ${delay} after your entry photo - likely taken on arrival. Review the permit and photo times before issuing.`;
     } else if (permitStatus === PERMIT_STATUS.PERMITTED) {
       message = 'Permit found for this site. Continue only if another parking rule was breached.';
     } else if (permitStatus === PERMIT_STATUS.PENDING) {
@@ -4879,14 +4885,36 @@ export default function DashboardPage() {
    * permitted vehicle surfaces as a "possible permit match" instead of a clean
    * "no permit".
    */
-  async function fetchAuthorizationWithNearMatch(vrm, siteId) {
+  async function fetchAuthorizationWithNearMatch(vrm, siteId, entryTime = '') {
     const token = await resolveAuthToken();
     const breachTime = new Date().toISOString();
+    // entryTime = the entry / first-observation photo. The server uses it to flag
+    // a permit that was registered after the vehicle was first photographed.
+    const entryParam = entryTime ? `&entryTime=${encodeURIComponent(entryTime)}` : '';
     const lookup = (candidateVrm) => fetchJson(
-      `/api/parking/check-authorization?vrm=${encodeURIComponent(candidateVrm)}&siteId=${encodeURIComponent(siteId)}&breachTime=${encodeURIComponent(breachTime)}`,
+      `/api/parking/check-authorization?vrm=${encodeURIComponent(candidateVrm)}&siteId=${encodeURIComponent(siteId)}&breachTime=${encodeURIComponent(breachTime)}${entryParam}`,
       { token }
     );
     return lookupAuthorizationWithNearMatch(vrm, lookup);
+  }
+
+  /**
+   * Entry photo time for the vehicle being checked: the live capture's entry
+   * timestamp, else the tracked draft's observation start. Empty when unknown
+   * (e.g. a gallery lookup with no entry photo), in which case no flag is raised.
+   */
+  function resolveEntryTimeForPermitCheck(vrm) {
+    const normalized = normalizeVrm(vrm || '');
+    const trackedVrm = normalizeVrm(selectedTracked?.payload?.vrm || '');
+    const trackedMatches = Boolean(normalized) && trackedVrm === normalized;
+    const payload = trackedMatches ? (selectedTracked?.payload || {}) : {};
+    return String(
+      entryCapturedAt
+      || payload.entryCapturedAt
+      || payload.observationStartTime
+      || monitoringSessionStartedAt
+      || ''
+    ).trim();
   }
 
   function rememberAuthorizationResult(vrm, result) {
@@ -4899,12 +4927,13 @@ export default function DashboardPage() {
     return result;
   }
 
-  async function checkAuthorization(nextVrm, siteIdOverride = '') {
+  async function checkAuthorization(nextVrm, siteIdOverride = '', entryTimeOverride = null) {
     const vrm = normalizeVrm(nextVrm || selectedVrm);
     const effectiveSiteId = String(siteIdOverride || selectedSiteId || '').trim();
     if (!vrm || !effectiveSiteId) return null;
     const previous = authorizationByVrm[vrm] || null;
-    const fresh = await fetchAuthorizationWithNearMatch(vrm, effectiveSiteId);
+    const entryTime = entryTimeOverride !== null ? String(entryTimeOverride || '') : resolveEntryTimeForPermitCheck(vrm);
+    const fresh = await fetchAuthorizationWithNearMatch(vrm, effectiveSiteId, entryTime);
     return rememberAuthorizationResult(vrm, carryOverPermitDecision(previous, fresh, vrm));
   }
 
